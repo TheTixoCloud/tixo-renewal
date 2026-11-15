@@ -289,6 +289,20 @@ def detect_renewal_candidates(conn: sqlite3.Connection, node_id: str = None,
             })
             continue
 
+        # PERMANENT BUSINESS RULE (owner-confirmed): unlimited-bandwidth VPS are reported
+        # distinctly, never as a generic FROZEN_FOR_REVIEW, so an operator can immediately
+        # tell "needs manual handling, permanently, by design" apart from "temporarily
+        # unresolved, will clear on its own." Virtualizor's own convention: bandwidth<=0 means
+        # unlimited (see policy_integration.preview_renewal's matching, authoritative check on
+        # the actual write path -- this is the read-only reporting counterpart).
+        if to_decimal(curr_q) <= 0:
+            results.append({
+                "vpsid": vpsid, "status": "MANUAL_ONLY_UNLIMITED",
+                "reason": f"bandwidth={curr_q} GB (<=0, Virtualizor's unlimited representation) "
+                          f"-- permanently excluded from automatic renewal, handle manually",
+            })
+            continue
+
         created_epoch = verified_epochs[vpsid]
         ev = Event(
             type="USAGE_DROP_REVIEW", identity=Identity(vpsid=vpsid, created=str(created_epoch)),

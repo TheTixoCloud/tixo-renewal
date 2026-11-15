@@ -88,6 +88,41 @@ def test_single_snapshot_is_missing_pre_reset_snapshot(db):
     assert "missing-pre-reset-snapshot" in r["reason"]
 
 
+# 3b. PERMANENT BUSINESS RULE: unlimited-bandwidth VPS reported distinctly, never generic
+# FROZEN_FOR_REVIEW (so operators/alerts don't treat a permanent-by-design exclusion as a
+# transient problem needing a nag). Matches the authoritative write-path check in
+# policy_integration.preview_renewal.
+
+def test_unlimited_quota_reported_as_manual_only_not_frozen(db):
+    created_epoch = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    t1 = datetime(2026, 10, 15, 9, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 10, 15, 9, 30, tzinfo=timezone.utc)
+    sm.ingest_poll(db, [row(6, created_epoch, 0, 100)], iso(t1))
+    sm.ingest_poll(db, [row(6, created_epoch, 0, 150)], iso(t2))
+    results = sm.detect_renewal_candidates(db)
+    r = [x for x in results if x["vpsid"] == 6][0]
+    assert r["status"] == "MANUAL_ONLY_UNLIMITED"
+    assert r["status"] != "FROZEN_FOR_REVIEW"
+
+
+def test_unlimited_quota_never_generates_a_stale_review_alert(db):
+    """alerts.py must never nag about a permanently-by-design manual-only VPS the way it
+    would for a genuinely stuck FROZEN_FOR_REVIEW entry."""
+    import alerts
+    created_epoch = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    t1 = datetime(2026, 10, 15, 9, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 10, 15, 9, 30, tzinfo=timezone.utc)
+    sm.ingest_poll(db, [row(6, created_epoch, 0, 100)], iso(t1))
+    sm.ingest_poll(db, [row(6, created_epoch, 0, 150)], iso(t2))
+    results = sm.detect_renewal_candidates(db)
+    # now=t2 isolates this from the unrelated POLLING_STALLED alert (which only fires because
+    # these fixture timestamps are far in the past relative to the real wall clock) -- the
+    # actual thing under test is that MANUAL_ONLY_UNLIMITED never triggers the FROZEN_FOR_REVIEW
+    # stale-review nag path in compute_alerts()'s per-detection loop.
+    alert_list = alerts.compute_alerts(db, results, now=t2)
+    assert not any(a["vpsid"] == 6 for a in alert_list)
+
+
 def test_large_gap_between_snapshots_is_flagged_missing_pre_reset(db):
     now = datetime.now(timezone.utc)
     sm.ingest_poll(db, [row(5, 1700000000, 1000, 900)], iso(now - timedelta(hours=10)))

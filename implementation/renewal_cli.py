@@ -308,8 +308,10 @@ def cmd_status(args):
         detections = sm.detect_renewal_candidates(conn, node_id=node.node_id, policy_config=policy_config)
         pending = [d for d in detections if d["status"] == "PLAUSIBLE_RESET_CANDIDATE_NEEDS_HUMAN_CONFIRMATION"]
         frozen = [d for d in detections if d["status"] == "FROZEN_FOR_REVIEW"]
+        manual_unlimited = [d for d in detections if d["status"] == "MANUAL_ONLY_UNLIMITED"]
         print(f"  Plausible candidates awaiting operator confirmation: {len(pending)}")
         print(f"  Frozen-for-review entries: {len(frozen)}")
+        print(f"  Manual-only (unlimited bandwidth, permanently excluded): {len(manual_unlimited)}")
         write_blocked = not os.path.exists(WRITE_APPROVAL_MARKER)
         print(f"  Write capability: {'BLOCKED (no approval marker)' if write_blocked else 'APPROVED -- apply command enabled'}")
         conn.close()

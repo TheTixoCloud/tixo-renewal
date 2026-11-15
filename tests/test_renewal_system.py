@@ -508,6 +508,50 @@ def test_apply_due_applies_only_policy_eligible_vps(cli_env, monkeypatch):
     conn.close()
 
 
+def test_apply_due_never_writes_to_unlimited_quota_vps_even_with_auto_renewal_enabled(cli_env, monkeypatch):
+    """PERMANENT BUSINESS RULE (owner-confirmed), full end-to-end proof through the real
+    apply_due() code path -- not just the preview_renewal() unit test. This is the actual
+    dangerous gap that existed: a quota-unchanged(<=0)-but-usage-dropped pattern on an
+    unlimited VPS, with auto_renewal_enabled=True, must never reach writer_mod.apply_renewal.
+    The HTTP mock fails the test immediately if it is ever called."""
+    renewal_cli.cmd_install(argparse_namespace())
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    open(renewal_cli.WRITE_APPROVAL_MARKER, "w").write("approved")
+
+    import credentials as creds_mod
+    creds_path = creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, "test-node")
+    creds_mod.store_credentials(creds_path, "https://example.invalid", "k", "p")
+
+    policy_path = renewal_cli._policy_config_path()
+    data = json.loads(open(policy_path).read())
+    data["global_defaults"]["auto_renewal_enabled"] = True  # the dangerous configuration
+    open(policy_path, "w").write(json.dumps(data))
+
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+    monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: datetime(2026, 10, 15, 9, 31, tzinfo=timezone.utc).isoformat())
+    monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+        {"vpsid": 99, "created_epoch": created_epoch, "quota_gb": Decimal("0"), "used_gb": Decimal("900")}])
+    renewal_cli.cmd_dry_run(argparse_namespace())
+    monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: datetime(2026, 10, 15, 10, 1, tzinfo=timezone.utc).isoformat())
+    monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+        {"vpsid": 99, "created_epoch": created_epoch, "quota_gb": Decimal("0"), "used_gb": Decimal("1")}])
+    renewal_cli.cmd_dry_run(argparse_namespace())
+
+    import writer as writer_mod
+    monkeypatch.setattr(writer_mod, "call_managevps_api",
+                         lambda *a, **k: pytest.fail("must never write to an unlimited-quota VPS"))
+    import local_source as ls
+    monkeypatch.setattr(ls, "fetch_single_vps_quota",
+                         lambda vpsid: pytest.fail("must never even read-verify an unlimited-quota VPS for a write"))
+
+    rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
+    db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
+    conn = sqlite3.connect(db_path)
+    op = conn.execute("SELECT status FROM operations WHERE vpsid=99").fetchone()
+    assert op is None  # no operation of any kind was ever started for this vpsid
+    conn.close()
+
+
 # ---------- _renewal_baseline_for_vpsid: the exact bug class found above, locked in ------------
 
 def test_renewal_baseline_uses_pre_drop_snapshot_not_post_drop(cli_env):

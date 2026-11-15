@@ -43,7 +43,30 @@ def preview_renewal(policy_config: pol.PolicyConfig, node_id: str, vpsid: int,
                      verified_created_epoch: Optional[int], node_first_poll_at: Optional[str],
                      old_quota: Decimal, old_used: Decimal, event_ts: str) -> dict:
     """Pure computation, no I/O, no side effects. Returns a dict describing exactly what WOULD
-    happen, with full provenance, never applying anything."""
+    happen, with full provenance, never applying anything.
+
+    PERMANENT BUSINESS RULE (owner-confirmed): a VPS with unlimited bandwidth must NEVER be
+    auto-renewed -- checked FIRST, unconditionally, before policy resolution/exclusion/
+    eligibility, so it can never be bypassed by any policy.json state (including
+    auto_renewal_enabled=true at any scope). Virtualizor's own convention is `bandwidth<=0`
+    means unlimited (confirmed empirically against real production data -- every known
+    unlimited VPS on ir1 has bandwidth=0; this is also what engine.py's
+    reset-detection already treats as "unlimited or invalid quota", kept consistent here).
+    This is the one real gap this check closes: engine.py's CarryoverEngine (used by
+    dry-run/status reporting) already refused to propose anything for quota<=0, but
+    apply_due()'s actual write path went through _renewal_baseline_for_vpsid() + this
+    function directly and had NO such guard -- a quota-unchanged-but-usage-dropped pattern on
+    an unlimited VPS (e.g. Virtualizor's own usage-counter accounting resetting it) could
+    previously have been auto-applied as a real quota WRITE, converting an unlimited VPS to a
+    limited one. That could never actually be exercised live (auto_renewal_enabled is still
+    globally false), but it was a real, reachable code path, not a hypothetical."""
+    if old_quota is not None and old_quota <= 0:
+        return {"vpsid": vpsid, "status": "MANUAL_ONLY_UNLIMITED", "policy_source": None,
+                "detail": f"bandwidth={old_quota} GB (<=0, Virtualizor's unlimited "
+                          f"representation) -- permanently excluded from automatic renewal; "
+                          f"must be handled manually regardless of policy or "
+                          f"auto_renewal_enabled"}
+
     p = pol.resolve_policy(policy_config, node_id, vpsid)
 
     if p.excluded:

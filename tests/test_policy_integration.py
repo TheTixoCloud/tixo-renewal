@@ -141,3 +141,74 @@ def test_carryover_cap_in_preview(tmp_path):
                                  iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
     assert result["proposed_new_quota_gb"] == "600"  # 500 cap + 100 grant
     assert result["carryover_cap_gb"] == "500"
+
+
+# 8. PERMANENT BUSINESS RULE: unlimited-bandwidth VPS must NEVER be auto-renewed -----------------
+# Owner-confirmed policy. Critical safety regression: previously apply_due()'s actual write
+# path (via this exact function) had NO guard against quota<=0 at all -- only the separate
+# dry-run/status reporting engine did. A quota-unchanged-but-usage-dropped pattern on an
+# unlimited VPS, with auto_renewal_enabled=True, would have been computed as a normal
+# PLAUSIBLE_RENEWAL_CANDIDATE and could have been auto-applied as a real quota WRITE,
+# converting an unlimited VPS to a limited one.
+
+def test_unlimited_quota_is_manual_only_even_with_auto_renewal_enabled_and_on_anniversary(tmp_path):
+    cfg = make_config(tmp_path, auto_renewal_enabled=True)  # the dangerous configuration
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("0"), Decimal("900"),  # unlimited (quota<=0), usage dropped
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))  # exactly on anniversary
+    assert result["status"] == "MANUAL_ONLY_UNLIMITED"
+    assert "proposed_new_quota_gb" not in result  # formula must never even be computed
+
+
+def test_negative_quota_treated_same_as_unlimited_manual_only(tmp_path):
+    """Defensive: a corrupt/negative value must fail the same safe way, never be treated as
+    some huge carryover."""
+    cfg = make_config(tmp_path, auto_renewal_enabled=True)
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("-5"), Decimal("1"),
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert result["status"] == "MANUAL_ONLY_UNLIMITED"
+
+
+def test_unlimited_check_runs_before_policy_excluded_check_and_before_eligibility(tmp_path):
+    """The unlimited check must be unconditional -- it must trigger even for a VPS with no
+    verified creation epoch at all (which would otherwise fail closed as FROZEN_FOR_REVIEW for
+    a totally different reason) and regardless of any excluded flag."""
+    cfg = make_config(tmp_path, auto_renewal_enabled=True)
+    result = pi.preview_renewal(cfg, "hostA", 1, None, None,
+                                 Decimal("0"), Decimal("0"), iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert result["status"] == "MANUAL_ONLY_UNLIMITED"
+
+
+def test_plan_change_limited_to_unlimited_switches_to_manual_only(tmp_path):
+    """A VPS that WAS limited and becomes unlimited (plan change) must flip to
+    MANUAL_ONLY_UNLIMITED on the very next evaluation -- no stale state, no special-casing of
+    specific vpsids required, since the check is purely dynamic on the current quota value."""
+    cfg = make_config(tmp_path, auto_renewal_enabled=True)
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    before = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("1000"), Decimal("900"),
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert before["status"] == "PLAUSIBLE_RENEWAL_CANDIDATE"
+    after = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                Decimal("0"), Decimal("900"),  # plan changed to unlimited
+                                iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert after["status"] == "MANUAL_ONLY_UNLIMITED"
+
+
+def test_plan_change_unlimited_to_limited_restores_normal_eligibility(tmp_path):
+    """The reverse transition: once a plan change makes the VPS limited again, it must be
+    evaluated normally again -- no permanent/sticky exclusion left over from having been
+    unlimited before."""
+    cfg = make_config(tmp_path, auto_renewal_enabled=True)
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    while_unlimited = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                          Decimal("0"), Decimal("0"),
+                                          iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert while_unlimited["status"] == "MANUAL_ONLY_UNLIMITED"
+    after_replan = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                       Decimal("1000"), Decimal("900"),
+                                       iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert after_replan["status"] == "PLAUSIBLE_RENEWAL_CANDIDATE"
