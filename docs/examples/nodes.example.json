@@ -1,0 +1,11 @@
+{
+  "nodes": [
+    {
+      "node_id": "example-host-a",
+      "mode": "local",
+      "ssh_host": "",
+      "ssh_key": "",
+      "db_filename": "example-host-a.sqlite3"
+    }
+  ]
+}

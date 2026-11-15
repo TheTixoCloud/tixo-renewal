@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run test suite
+        run: python3 -m pytest tests/ -v
+
+      - name: Build deployable package (dependency-free check)
+        run: |
+          cd deploy
+          chmod +x build_package.sh install.sh uninstall.sh
+          ./build_package.sh
+
+      - name: Import-check the built package in isolation (no dev-server modules on path)
+        run: |
+          mkdir -p /tmp/ci-dep-check
+          tar -xzf deploy/tixo-renewal-package.tar.gz -C /tmp/ci-dep-check
+          PYTHONPATH=/tmp/ci-dep-check/lib python3 -c "
+          import sys
+          sys.path.insert(0, '/tmp/ci-dep-check/bin')
+          import renewal_cli
+          import writer, local_source, policy, policy_integration, nodes, backup, alerts, shadow_monitor, engine, models, storage, credentials
+          print('package imports cleanly with stdlib only')
+          "
+
+      - name: Simulated install (never touches a real server)
+        run: |
+          rm -rf /tmp/ci-install-sim
+          mkdir -p /tmp/ci-install-sim
+          cp -r /tmp/ci-dep-check/* /tmp/ci-install-sim/
+          cp deploy/install.sh deploy/uninstall.sh /tmp/ci-install-sim/
+          cd /tmp/ci-install-sim
+          TIXO_RENEWAL_INSTALL_DIR=/tmp/ci-install-sim/opt bash install.sh
+          test -f /tmp/ci-install-sim/opt/renewal-config/policy.json
+          test -f /tmp/ci-install-sim/opt/systemd/virt-renewal-monitor.service
+          grep -q "Environment=PYTHONPATH=" /tmp/ci-install-sim/opt/systemd/virt-renewal-monitor.service

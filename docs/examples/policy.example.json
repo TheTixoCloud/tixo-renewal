@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "global_defaults": {
+    "initial_allocation_gb": "100",
+    "monthly_grant_gb": "100",
+    "carryover_enabled": true,
+    "carryover_cap_gb": null,
+    "billing_anchor": "verified_creation",
+    "auto_renewal_enabled": false
+  },
+  "host_overrides": {
+    "example-host-a": {
+      "monthly_grant_gb": "100",
+      "carryover_enabled": true
+    },
+    "example-host-b": {
+      "monthly_grant_gb": "500",
+      "carryover_enabled": true
+    },
+    "example-host-c": {
+      "monthly_grant_gb": "0",
+      "carryover_enabled": false
+    }
+  },
+  "vps_overrides": {
+    "example-host-a:1234": {
+      "monthly_grant_gb": "1000",
+      "carryover_cap_gb": "5000",
+      "auto_renewal_enabled": false
+    },
+    "example-host-a:5678": {
+      "excluded": true
+    }
+  }
+}
