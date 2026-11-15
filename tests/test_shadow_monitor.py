@@ -140,6 +140,52 @@ def test_usage_drop_on_verified_anniversary_is_plausible_candidate(db):
     assert db.execute("SELECT COUNT(*) FROM renewal_checkpoints WHERE vpsid=8").fetchone()[0] == 1
 
 
+# 6b. REGRESSION: dry-run/status's reported proposed quota must match what apply-due would
+# actually write, under a non-default per-VPS/per-host policy monthly_grant_gb. Previously
+# detect_renewal_candidates() always used the engine's fixed 100GB reference formula with no
+# way to reflect policy.json at all, so an operator checking dry-run before enabling
+# auto_renewal_enabled with a custom monthly base would see a silently wrong number. ---------
+
+def test_proposed_quota_without_policy_uses_fixed_100gb_reference(db):
+    """Unchanged default behavior when no policy_config is supplied (e.g. replay.py's
+    historical/audit-only usage, which has no policy concept at all)."""
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+    t1 = datetime(2026, 10, 15, 9, 59, tzinfo=timezone.utc)
+    t2 = datetime(2026, 10, 15, 10, 1, tzinfo=timezone.utc)
+    sm.ingest_poll(db, [row(8, created_epoch, 1000, 900)], iso(t1))
+    sm.ingest_poll(db, [row(8, created_epoch, 1000, 1)], iso(t2))
+    results = sm.detect_renewal_candidates(db)
+    r = [x for x in results if x["vpsid"] == 8][0]
+    assert r["proposed_new_quota_gb"] == "200"  # remaining(100) + fixed 100GB reference
+    assert r.get("policy_resolved") is not True
+
+
+def test_proposed_quota_with_policy_reflects_custom_monthly_base_not_fixed_100(db):
+    """The real fix: with node_id+policy_config, the reported number must equal what
+    apply_due()/policy_integration.preview_renewal() would actually write -- not the engine's
+    fixed-100GB reference value -- when a VPS-level override sets a different monthly base."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "implementation"))
+    import policy as pol
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+    t1 = datetime(2026, 10, 15, 9, 59, tzinfo=timezone.utc)
+    t2 = datetime(2026, 10, 15, 10, 1, tzinfo=timezone.utc)
+    sm.ingest_poll(db, [row(8, created_epoch, 1000, 900)], iso(t1))
+    sm.ingest_poll(db, [row(8, created_epoch, 1000, 1)], iso(t2))
+
+    global_ov = pol.PolicyOverride(initial_allocation_gb=Decimal("100"), monthly_grant_gb=Decimal("100"),
+                                    carryover_enabled=True, billing_anchor="verified_creation",
+                                    auto_renewal_enabled=False)
+    vps_ov = pol.PolicyOverride(monthly_grant_gb=Decimal("500"))
+    cfg = pol.PolicyConfig(schema_version=1, global_defaults=global_ov, host_overrides={},
+                            vps_overrides={"node1:8": vps_ov})
+
+    results = sm.detect_renewal_candidates(db, node_id="node1", policy_config=cfg)
+    r = [x for x in results if x["vpsid"] == 8][0]
+    assert r["proposed_new_quota_gb"] == "600"  # remaining(100) + policy-resolved 500GB, NOT 200
+    assert r["policy_resolved"] is True
+    assert "policy_note" in r  # flagged because it differs from the fixed-100GB reference
+
+
 # 7. Restart durability: never mistake a restarted monitor for a new renewal ----------------------
 
 def test_restart_does_not_duplicate_or_forget_a_flagged_renewal(tmp_path):

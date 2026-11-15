@@ -221,7 +221,8 @@ def _persist_granted_period(conn: sqlite3.Connection, period_key: str, vpsid: in
     conn.execute("COMMIT")
 
 
-def detect_renewal_candidates(conn: sqlite3.Connection) -> list[dict]:
+def detect_renewal_candidates(conn: sqlite3.Connection, node_id: str = None,
+                               policy_config=None) -> list[dict]:
     """For every vpsid with at least two snapshots, build a synthetic USAGE_DROP_REVIEW-style
     Event from the two most recent snapshots and feed it through the EXISTING, unmodified
     CarryoverEngine -- same fail-closed formula, same calendar-anniversary eligibility check,
@@ -231,7 +232,17 @@ def detect_renewal_candidates(conn: sqlite3.Connection) -> list[dict]:
     than the expected poll interval) and flag it, (2) detect an unverified/conflicted identity
     and flag it, (3) hand everything else to the engine and map every non-actionable outcome
     to FROZEN_FOR_REVIEW in the report, per the explicit task requirement.
-    """
+
+    node_id/policy_config: when BOTH are given, the reported `proposed_new_quota_gb` for a
+    PLAUSIBLE candidate is recomputed via the operator's actual resolved policy (per-VPS/
+    per-host monthly_grant_gb/carryover overrides), not the engine's fixed 100GB reference
+    formula -- this is a real fix, not cosmetic: apply_due() already uses
+    policy_integration.preview_renewal() (policy-aware) to decide what it actually writes, but
+    this reporting path previously always showed the fixed-100GB number regardless of policy,
+    which would silently mislead an operator checking dry-run/status before enabling
+    auto_renewal_enabled with a non-default monthly base. Without both args, behavior is
+    unchanged (same fixed-100GB reference value as before -- used for historical/audit
+    contexts that have no policy config at all, e.g. replay.py)."""
     vpsids = [r[0] for r in conn.execute("SELECT DISTINCT vpsid FROM snapshots")]
     granted_periods = _load_granted_periods(conn)
     verified_epochs = {
@@ -289,10 +300,24 @@ def detect_renewal_candidates(conn: sqlite3.Connection) -> list[dict]:
 
     for p in engine.get_proposals():
         if p.kind == "MONTHLY_RENEWAL" and p.status == "READY_FOR_HUMAN_APPLICATION":
+            proposed = p.proposed_new_quota_gb
+            policy_resolved = False
+            policy_note = None
+            if node_id is not None and policy_config is not None:
+                import policy as _pol  # local import: shadow_monitor must stay importable
+                resolved = _pol.resolve_policy(policy_config, node_id, p.vpsid)
+                proposed = _pol.compute_renewal_quota(resolved, p.old_quota_gb, p.old_used_gb)
+                policy_resolved = True
+                if proposed != p.proposed_new_quota_gb:
+                    policy_note = (f"policy-resolved monthly_grant_gb={resolved.monthly_grant_gb} "
+                                    f"differs from the fixed 100GB reference formula "
+                                    f"({p.proposed_new_quota_gb} GB) -- this value, not that one, "
+                                    f"is what apply-due would actually write")
             results.append({
                 "vpsid": p.vpsid, "status": "PLAUSIBLE_RESET_CANDIDATE_NEEDS_HUMAN_CONFIRMATION",
-                "reason": p.reasons[0], "proposed_new_quota_gb": str(p.proposed_new_quota_gb),
-                "renewal_period_key": p.renewal_period_key,
+                "reason": p.reasons[0], "proposed_new_quota_gb": str(proposed),
+                "renewal_period_key": p.renewal_period_key, "policy_resolved": policy_resolved,
+                **({"policy_note": policy_note} if policy_note else {}),
             })
             if p.renewal_period_key:
                 period_index = renewal_period_index(verified_epochs[p.vpsid], p.reset_after_ts)
@@ -364,6 +389,11 @@ def print_report(conn: sqlite3.Connection, detections: list[dict]):
     print("\n--- Detection results ---")
     for d in detections:
         print(f"  vpsid={d['vpsid']:<4} status={d['status']:<45} reason={d.get('reason', '')}")
+        if d.get("proposed_new_quota_gb") is not None:
+            print(f"      proposed_new_quota_gb={d['proposed_new_quota_gb']} "
+                  f"(policy-resolved: {'yes' if d.get('policy_resolved') else 'no -- fixed 100GB reference'})")
+        if d.get("policy_note"):
+            print(f"      NOTE: {d['policy_note']}")
 
 
 # ---------- CLI ----------

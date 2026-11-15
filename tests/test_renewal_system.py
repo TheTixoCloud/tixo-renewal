@@ -188,6 +188,29 @@ def test_install_is_idempotent_and_creates_expected_layout(cli_env):
     assert os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-monitor.timer"))
 
 
+def test_status_uses_this_installs_node_config_path_not_module_default(cli_env, monkeypatch):
+    """REGRESSION: cmd_status previously called nodes_mod.load_nodes() with NO path argument,
+    which binds to nodes.py's own module-level DEFAULT_CONFIG_PATH (resolved at import time
+    relative to nodes.py's own file location) instead of this install's (possibly test-
+    patched or host-local) CONFIG_DIR -- unlike every other subcommand, which already goes
+    through _node_config_path(). The cli_env fixture's fake_load_nodes ignores its `path` arg
+    entirely, which is exactly how this went undetected -- so this test inspects the actual
+    argument passed, not just the returned node list."""
+    renewal_cli.cmd_install(argparse_namespace())
+    calls = []
+
+    def spy_load_nodes(path=None):
+        calls.append(path)
+        return [nodes_mod.NodeConfig("test-node", "root@203.0.113.1", "~/.ssh/fake", "test-node.sqlite3")]
+
+    monkeypatch.setattr(renewal_cli.nodes_mod, "load_nodes", spy_load_nodes)
+    renewal_cli.cmd_status(argparse_namespace())
+    assert calls, "cmd_status never called load_nodes"
+    assert calls[0] == renewal_cli._node_config_path(), (
+        f"cmd_status called load_nodes with {calls[0]!r}, expected the install's own "
+        f"_node_config_path() {renewal_cli._node_config_path()!r}")
+
+
 def test_install_honors_monthly_base_env_var(cli_env, monkeypatch):
     """TIXO_RENEWAL_MONTHLY_BASE_GB lets an operator configure the monthly base AT install
     time instead of hand-editing policy.json afterward."""

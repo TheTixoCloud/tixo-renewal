@@ -280,7 +280,18 @@ def cmd_preview(args):
 # ---------- status ----------
 
 def cmd_status(args):
-    for node in nodes_mod.load_nodes():
+    # Regression fix: this previously called nodes_mod.load_nodes() with NO path, which binds
+    # to nodes.py's own module-level default (the DEV workspace's renewal-config/nodes.json),
+    # NOT this install's (possibly test-patched or host-local) CONFIG_DIR -- every other
+    # subcommand already goes through _node_config_path() for exactly this reason. Had zero
+    # test coverage, so this silently diverged undetected.
+    policy_config = None
+    if os.path.exists(_policy_config_path()):
+        try:
+            policy_config = pol.load_policy_config(_policy_config_path())
+        except pol.PolicyValidationError:
+            policy_config = None  # status must never crash on a malformed policy file
+    for node in nodes_mod.load_nodes(_node_config_path()):
         print(f"=== Node: {node.node_id} ({node.ssh_host}) ===")
         db_path = node.db_path(STATE_DIR)
         if not os.path.exists(db_path):
@@ -294,7 +305,7 @@ def cmd_status(args):
         print(f"  Identities tracked: {conn.execute('SELECT COUNT(*) FROM identities').fetchone()[0]}")
         print(f"  Identity conflicts: {conn.execute('SELECT COUNT(*) FROM identity_conflicts').fetchone()[0]}")
         print(f"  Renewal periods on record: {conn.execute('SELECT COUNT(*) FROM renewal_checkpoints').fetchone()[0]}")
-        detections = sm.detect_renewal_candidates(conn)
+        detections = sm.detect_renewal_candidates(conn, node_id=node.node_id, policy_config=policy_config)
         pending = [d for d in detections if d["status"] == "PLAUSIBLE_RESET_CANDIDATE_NEEDS_HUMAN_CONFIRMATION"]
         frozen = [d for d in detections if d["status"] == "FROZEN_FOR_REVIEW"]
         print(f"  Plausible candidates awaiting operator confirmation: {len(pending)}")
@@ -318,6 +329,12 @@ def _fetch_rows_for_node(node):
 
 
 def cmd_dry_run(args):
+    policy_config = None
+    if os.path.exists(_policy_config_path()):
+        try:
+            policy_config = pol.load_policy_config(_policy_config_path())
+        except pol.PolicyValidationError:
+            policy_config = None  # dry-run must never crash on a malformed policy file
     for node in nodes_mod.load_nodes(_node_config_path()):
         label = node.ssh_host if node.mode == "ssh" else "this host, local DB"
         print(f"=== Dry-run poll: {node.node_id} ({label}) [READ-ONLY] ===")
@@ -331,7 +348,7 @@ def cmd_dry_run(args):
         as_of = sm.utcnow_iso()
         result = sm.ingest_poll(conn, rows, as_of)
         print(f"  Ingested {result['rows_ingested']} rows ({len(result['identity_conflicts'])} identity conflicts)")
-        detections = sm.detect_renewal_candidates(conn)
+        detections = sm.detect_renewal_candidates(conn, node_id=node.node_id, policy_config=policy_config)
         sm.print_report(conn, detections)
         node_alerts = alerts.compute_alerts(conn, detections)
         print()
