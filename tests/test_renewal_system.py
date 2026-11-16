@@ -633,6 +633,98 @@ def test_apply_due_applies_only_policy_eligible_vps(cli_env, monkeypatch):
     conn.close()
 
 
+def test_apply_due_one_vps_exception_does_not_block_other_eligible_vps(cli_env, monkeypatch):
+    """v1.2 CRITICAL reliability fix: a real end-to-end proof that an exception processing
+    vpsid 42 (simulated network error) never aborts the batch -- vpsid 43's independently
+    eligible renewal must still be applied in the SAME run."""
+    renewal_cli.cmd_install(argparse_namespace())
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    open(renewal_cli.WRITE_APPROVAL_MARKER, "w").write("approved")
+    import credentials as creds_mod
+    creds_mod.store_credentials(
+        creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, "test-node"),
+        "https://example.invalid", "k", "p")
+    policy_path = renewal_cli._policy_config_path()
+    data = json.loads(open(policy_path).read())
+    data["global_defaults"]["auto_renewal_enabled"] = True
+    open(policy_path, "w").write(json.dumps(data))
+
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+    monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: datetime(2026, 10, 15, 9, 31, tzinfo=timezone.utc).isoformat())
+    monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+        {"vpsid": 42, "created_epoch": created_epoch, "quota_gb": Decimal("1000"), "used_gb": Decimal("900")},
+        {"vpsid": 43, "created_epoch": created_epoch, "quota_gb": Decimal("1000"), "used_gb": Decimal("900")}])
+    renewal_cli.cmd_dry_run(argparse_namespace())
+    monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: datetime(2026, 10, 15, 10, 1, tzinfo=timezone.utc).isoformat())
+    monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+        {"vpsid": 42, "created_epoch": created_epoch, "quota_gb": Decimal("1000"), "used_gb": Decimal("1")},
+        {"vpsid": 43, "created_epoch": created_epoch, "quota_gb": Decimal("1000"), "used_gb": Decimal("1")}])
+    renewal_cli.cmd_dry_run(argparse_namespace())
+
+    import writer as writer_mod, time as time_mod, local_source as ls
+    monkeypatch.setattr(writer_mod, "call_managevps_api", lambda *a, **k: {"raw": "ok"})
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    reads43 = iter([Decimal("1"), Decimal("200"), Decimal("200")])
+
+    def flaky_quota_read(vpsid):
+        if vpsid == 42:
+            raise ConnectionError("simulated transient network error for vpsid 42")
+        return next(reads43)
+    monkeypatch.setattr(ls, "fetch_single_vps_quota", flaky_quota_read)
+
+    rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
+    db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
+    conn = sqlite3.connect(db_path)
+    op43 = conn.execute("SELECT status FROM operations WHERE vpsid=43").fetchone()
+    assert op43 is not None and op43[0] == "APPLIED"  # unaffected by vpsid 42's failure
+    conn.close()
+
+
+def test_apply_due_retries_deferred_locked_vps_using_original_quota_not_recomputed(cli_env, monkeypatch):
+    """Full end-to-end proof that apply_due checks for a pending backup-lock deferral BEFORE
+    computing a fresh baseline, and that the retry reuses the original stored quota."""
+    renewal_cli.cmd_install(argparse_namespace())
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    open(renewal_cli.WRITE_APPROVAL_MARKER, "w").write("approved")
+    import credentials as creds_mod
+    creds_mod.store_credentials(
+        creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, "test-node"),
+        "https://example.invalid", "k", "p")
+
+    db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
+    import shadow_monitor as sm_mod, writer as writer_mod
+    conn = sm_mod.open_db(db_path)
+    # apply_due iterates the `identities` table, not `operations` -- seed an identity so
+    # vpsid 77 is actually visited by the loop (a real monitor poll would do this naturally).
+    sm_mod.ingest_poll(conn, [{"vpsid": 77, "created_epoch": int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp()),
+                                "quota_gb": Decimal("321"), "used_gb": Decimal("0")}],
+                        datetime(2026, 10, 15, tzinfo=timezone.utc).isoformat())
+    creds = writer_mod.ApiCredentials(base_url="https://example.invalid", api_key="k", api_pass="p")
+    # Pre-seed a DEFERRED_LOCKED operation, as if a previous run hit a backup lock.
+    writer_mod.apply_renewal(
+        conn, "test-node", 77, "77|period|1", Decimal("321"), creds,
+        renewal_cli.WRITE_APPROVAL_MARKER, confirm=True,
+        read_live_quota_fn=lambda v: Decimal("999"),
+        http_post=lambda *a, **k: '{"done": 0, "error": "backup in progress"}',
+        write_cooldown_seconds=0)
+    conn.close()
+
+    import time as time_mod, local_source as ls
+    monkeypatch.setattr(writer_mod, "call_managevps_api", lambda *a, **k: {"raw": "ok"})
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    # If apply_due recomputed instead of reusing 321, it would never reach these reads at all
+    # (no fresh snapshot pair exists for vpsid 77 in this test) -- reaching APPLIED with 321
+    # proves the original value was reused.
+    reads = iter([Decimal("999"), Decimal("321"), Decimal("321")])
+    monkeypatch.setattr(ls, "fetch_single_vps_quota", lambda v: next(reads))
+
+    rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
+    conn = sqlite3.connect(db_path)
+    row = conn.execute("SELECT status, requested_new_quota_gb, retry_count FROM operations WHERE vpsid=77").fetchone()
+    assert row == ("APPLIED", "321", 1)
+    conn.close()
+
+
 def test_apply_due_never_writes_to_unlimited_quota_vps_even_with_auto_renewal_enabled(cli_env, monkeypatch):
     """PERMANENT BUSINESS RULE (owner-confirmed), full end-to-end proof through the real
     apply_due() code path -- not just the preview_renewal() unit test. This is the actual

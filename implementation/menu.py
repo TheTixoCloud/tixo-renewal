@@ -19,6 +19,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -30,6 +31,65 @@ import renewal_cli
 import shadow_monitor as sm
 
 GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/TheTixoCloud/tixo-renewal/releases/latest"
+DEFAULT_DISPLAY_TZ = "Asia/Tehran"
+
+
+# ---------- timezone DISPLAY only -- never touches the host's actual system timezone --------
+
+def display_settings_path(config_dir: str) -> str:
+    return os.path.join(config_dir, "display-settings.json")
+
+
+def load_display_tz(config_dir: str) -> str:
+    """Display-only setting, stored separately from policy.json (which is schema-validated
+    business-rule config) -- never affects the host's actual timezone, never written to by
+    anything except the menu's own timezone-configuration action."""
+    import json
+    path = display_settings_path(config_dir)
+    if not os.path.exists(path):
+        return DEFAULT_DISPLAY_TZ
+    try:
+        return json.loads(Path(path).read_text()).get("display_tz", DEFAULT_DISPLAY_TZ)
+    except (ValueError, OSError):
+        return DEFAULT_DISPLAY_TZ
+
+
+def validate_timezone_name(name: str) -> str:
+    """Raises ValueError for anything zoneinfo can't resolve -- never persists an invalid
+    name. stdlib only (Python 3.9+'s zoneinfo), no third-party dependency."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    name = name.strip()
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        raise ValueError(f"not a valid IANA timezone name: {name!r} ({e})")
+    return name
+
+
+def save_display_tz(config_dir: str, tz_name: str) -> None:
+    validated = validate_timezone_name(tz_name)
+    import json
+    path = display_settings_path(config_dir)
+    Path(config_dir).mkdir(parents=True, exist_ok=True)
+    tmp = path + ".tmp"
+    Path(tmp).write_text(json.dumps({"display_tz": validated}, indent=2) + "\n")
+    os.replace(tmp, path)
+
+
+def format_local_time(iso_utc_str: str, tz_name: str = DEFAULT_DISPLAY_TZ) -> str:
+    """Pure display conversion -- the stored timestamp (always UTC ISO-8601 throughout this
+    project) is never altered, only how it's PRINTED. Falls back to the raw UTC string if the
+    timezone name or the stored timestamp is malformed, rather than raising in a dashboard
+    render (never let a display bug crash the menu)."""
+    from zoneinfo import ZoneInfo
+    try:
+        dt = datetime.fromisoformat(iso_utc_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(ZoneInfo(tz_name))
+        return f"{local.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+    except Exception:
+        return f"{iso_utc_str} (UTC)"
 
 
 # ---------- terminal/color helpers (pure, testable) -----------------------------------------
@@ -172,12 +232,26 @@ def collect_dashboard_data(config_dir: str, state_dir: str) -> dict:
             ops_unresolved = conn.execute(
                 "SELECT COUNT(*) FROM operations WHERE status IN ('IN_PROGRESS','UNKNOWN_NEEDS_VERIFICATION')"
             ).fetchone()[0]
+            deferred_rows = conn.execute(
+                "SELECT vpsid, period_key, retry_count, created_at FROM operations "
+                "WHERE status='DEFERRED_LOCKED' ORDER BY created_at DESC"
+            ).fetchall()
+            expired_rows = conn.execute(
+                "SELECT vpsid, period_key FROM operations WHERE status='DEFERRED_EXPIRED_NEEDS_REVIEW'"
+            ).fetchall()
+            failed_rows = conn.execute(
+                "SELECT vpsid, period_key, status FROM operations WHERE status IN "
+                "('API_REPORTED_ERROR','UNKNOWN_NEEDS_VERIFICATION') ORDER BY created_at DESC LIMIT 20"
+            ).fetchall()
             conn.close()
             per_node[n.node_id] = {
                 "initialized": True,
                 "last_poll_at": checkpoint[0] if checkpoint else None,
                 "operations_total": ops_total,
                 "operations_unresolved": ops_unresolved,
+                "deferred": deferred_rows,
+                "deferred_expired": expired_rows,
+                "failed_or_uncertain": failed_rows,
             }
         data["per_node"] = per_node
     except Exception as e:
@@ -186,7 +260,7 @@ def collect_dashboard_data(config_dir: str, state_dir: str) -> dict:
     return data
 
 
-def render_dashboard(data: dict, style: Style) -> str:
+def render_dashboard(data: dict, style: Style, display_tz: str = "UTC") -> str:
     lines = [f"{style.BOLD}{style.CYAN}=== Tixo Renewal Dashboard ==={style.RESET}"]
     if data.get("policy_ok"):
         gift = data["monthly_grant_gb"]
@@ -203,9 +277,27 @@ def render_dashboard(data: dict, style: Style) -> str:
         if not info.get("initialized"):
             lines.append(f"    {style.YELLOW}not initialized yet -- run install/dry-run first{style.RESET}")
             continue
-        lines.append(f"    Last poll: {info.get('last_poll_at') or 'never'}")
+        last_poll = info.get("last_poll_at")
+        lines.append(f"    Last poll: {format_local_time(last_poll, display_tz) if last_poll else 'never'}")
         lines.append(f"    Operations: {info['operations_total']} total, "
                       f"{info['operations_unresolved']} unresolved")
+        deferred = info.get("deferred") or []
+        if deferred:
+            lines.append(f"    {style.YELLOW}Deferred (backup/restore/migration lock, will "
+                          f"retry automatically):{style.RESET}")
+            for vpsid, period_key, retry_count, created_at in deferred:
+                lines.append(f"      vpsid={vpsid} period={period_key} retries={retry_count} "
+                              f"since={format_local_time(created_at, display_tz)}")
+        expired = info.get("deferred_expired") or []
+        if expired:
+            lines.append(f"    {style.RED}Deferred past max age -- needs operator review:{style.RESET}")
+            for vpsid, period_key in expired:
+                lines.append(f"      vpsid={vpsid} period={period_key}")
+        failed = info.get("failed_or_uncertain") or []
+        if failed:
+            lines.append(f"    {style.RED}Failed/uncertain (never auto-retried):{style.RESET}")
+            for vpsid, period_key, status in failed[:5]:
+                lines.append(f"      vpsid={vpsid} period={period_key} status={status}")
     lines.append(f"\n  {style.BOLD}Timers:{style.RESET}")
     for unit, status in data.get("timers", {}).items():
         active = status["active"]
@@ -229,7 +321,20 @@ def action_install():
 
 def action_dashboard(style: Style):
     data = collect_dashboard_data(renewal_cli.CONFIG_DIR, renewal_cli.STATE_DIR)
-    print(render_dashboard(data, style))
+    tz = load_display_tz(renewal_cli.CONFIG_DIR)
+    print(render_dashboard(data, style, display_tz=tz))
+
+
+def action_configure_timezone():
+    current = load_display_tz(renewal_cli.CONFIG_DIR)
+    raw = input(f"Display timezone (IANA name, e.g. Asia/Tehran) [{current}]: ").strip() or current
+    try:
+        save_display_tz(renewal_cli.CONFIG_DIR, raw)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+    print(f"Display timezone set to {raw}. This only affects how times are SHOWN in this "
+          f"menu -- the host's actual system timezone is never changed.")
 
 
 def action_configure_gift():
@@ -362,10 +467,11 @@ def action_uninstall():
 MENU_ITEMS = [
     ("Install / Initial Setup", action_install),
     ("Dashboard", None),  # needs style, wired specially below
-    ("Configure Virtualizor API credentials", lambda: renewal_cli.cmd_store_credentials(
+    ("Configure/rotate Virtualizor API credentials", lambda: renewal_cli.cmd_store_credentials(
         argparse.Namespace(node=input("Node id: ").strip() or "self"))),
     ("Configure monthly gift (GB, 0 is valid)", action_configure_gift),
     ("Configure monitor/apply/notifier intervals", action_configure_intervals),
+    ("Configure display timezone (default Asia/Tehran)", action_configure_timezone),
     ("Enable automatic renewal", lambda: action_toggle_auto_renewal(True)),
     ("Disable automatic renewal", lambda: action_toggle_auto_renewal(False)),
     ("View logs and renewal history", action_view_logs),

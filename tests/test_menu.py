@@ -205,3 +205,84 @@ def test_main_version_flag_prints_and_exits(monkeypatch, capsys):
 def test_run_menu_refuses_when_not_interactive(monkeypatch):
     monkeypatch.setattr(menu, "is_interactive", lambda: False)
     assert menu.run_menu() == 1
+
+
+# ---------- v1.2: display-only timezone (never touches host system timezone) --------------
+
+def test_validate_timezone_name_accepts_valid_iana_name():
+    assert menu.validate_timezone_name("Asia/Tehran") == "Asia/Tehran"
+    assert menu.validate_timezone_name(" UTC ") == "UTC"
+
+
+def test_validate_timezone_name_rejects_garbage():
+    with pytest.raises(ValueError):
+        menu.validate_timezone_name("Not/A/Real/Zone")
+
+
+def test_save_and_load_display_tz_roundtrip(tmp_path):
+    config_dir = str(tmp_path)
+    menu.save_display_tz(config_dir, "Asia/Tehran")
+    assert menu.load_display_tz(config_dir) == "Asia/Tehran"
+
+
+def test_load_display_tz_defaults_to_asia_tehran_when_unset(tmp_path):
+    assert menu.load_display_tz(str(tmp_path)) == "Asia/Tehran"
+
+
+def test_save_display_tz_rejects_invalid_and_does_not_persist(tmp_path):
+    config_dir = str(tmp_path)
+    with pytest.raises(ValueError):
+        menu.save_display_tz(config_dir, "Nonsense/Zone")
+    assert not os.path.exists(menu.display_settings_path(config_dir))
+
+
+def test_format_local_time_converts_utc_to_tehran():
+    # 2026-01-01T00:00:00 UTC -> Asia/Tehran is UTC+3:30 -> 03:30 local, same calendar day.
+    out = menu.format_local_time("2026-01-01T00:00:00+00:00", "Asia/Tehran")
+    assert "03:30:00" in out
+    assert "2026-01-01" in out
+
+
+def test_format_local_time_handles_naive_timestamp_as_utc():
+    out = menu.format_local_time("2026-01-01T00:00:00", "UTC")
+    assert "2026-01-01 00:00:00" in out
+
+
+def test_format_local_time_never_raises_on_garbage_falls_back_to_raw():
+    out = menu.format_local_time("not-a-timestamp", "Asia/Tehran")
+    assert "not-a-timestamp" in out
+
+
+def test_format_local_time_timezone_boundary_crosses_calendar_day():
+    """A known tricky case: a UTC time late in the day crosses into the NEXT calendar day in
+    a positive-offset timezone -- must be handled correctly, not just offset-blind."""
+    out = menu.format_local_time("2026-06-30T21:00:00+00:00", "Asia/Tehran")
+    assert "2026-07-01" in out  # 21:00 UTC + 3:30 = 00:30 the next day
+    assert "00:30:00" in out
+
+
+# ---------- dashboard surfaces deferred/expired/failed operations --------------------------
+
+def test_render_dashboard_shows_deferred_locked_entries():
+    data = {"policy_ok": True, "monthly_grant_gb": "100", "auto_renewal_enabled": True,
+            "write_approved": True, "timers": {},
+            "per_node": {"self": {"initialized": True, "last_poll_at": None,
+                                   "operations_total": 1, "operations_unresolved": 0,
+                                   "deferred": [(55, "55|x|1", 2, "2026-01-01T00:00:00+00:00")],
+                                   "deferred_expired": [], "failed_or_uncertain": []}}}
+    out = menu.render_dashboard(data, menu.Style(enabled=False))
+    assert "vpsid=55" in out
+    assert "retries=2" in out
+
+
+def test_render_dashboard_shows_expired_and_failed_entries():
+    data = {"policy_ok": True, "monthly_grant_gb": "100", "auto_renewal_enabled": True,
+            "write_approved": True, "timers": {},
+            "per_node": {"self": {"initialized": True, "last_poll_at": None,
+                                   "operations_total": 2, "operations_unresolved": 0,
+                                   "deferred": [], "deferred_expired": [(60, "60|x|1")],
+                                   "failed_or_uncertain": [(61, "61|x|1", "API_REPORTED_ERROR")]}}}
+    out = menu.render_dashboard(data, menu.Style(enabled=False))
+    assert "vpsid=60" in out
+    assert "vpsid=61" in out
+    assert "API_REPORTED_ERROR" in out

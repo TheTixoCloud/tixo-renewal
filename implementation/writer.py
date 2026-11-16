@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import time
 import urllib.parse
 import urllib.request
@@ -104,6 +105,15 @@ def is_write_approved(approval_marker_path: str) -> bool:
 
 def ensure_operations_schema(conn) -> None:
     conn.executescript(OPERATIONS_SCHEMA)
+    # Idempotent migration for upgrades from v1.1 and earlier, whose operations table has no
+    # retry_count column -- SQLite has no "ADD COLUMN IF NOT EXISTS", so the duplicate-column
+    # error is the normal, expected outcome on every run after the first and is swallowed
+    # deliberately. Never touches existing rows' other data; new rows default to 0.
+    try:
+        conn.execute("ALTER TABLE operations ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
 
 
 def find_any_prior_operation(conn, node_id: str, vpsid: int, period_key: str):
@@ -150,6 +160,43 @@ def find_recent_operation_for_vpsid(conn, node_id: str, vpsid: int):
     return conn.execute(
         "SELECT operation_id, period_key, status, updated_at FROM operations "
         "WHERE node_id=? AND vpsid=? ORDER BY updated_at DESC LIMIT 1",
+        (node_id, vpsid),
+    ).fetchone()
+
+
+# Substrings matched case-insensitively against Virtualizor's own `error` field text to
+# recognize a write rejected because the VPS is temporarily locked (backup/restore/migration
+# in progress). IMPORTANT, STATED HONESTLY: this list is based on Virtualizor's general,
+# documented/community-observed error-message conventions for rejected admin actions -- it
+# has NOT been empirically confirmed against a real locked VPS on ir1 (doing so would require
+# deliberately triggering a real backup against a real customer VPS purely to observe the
+# error text, which this project will not do). If a real locked-VPS error message is ever
+# observed in production, update this list to match it exactly and note the evidence here.
+LOCK_ERROR_SUBSTRINGS = ("backup", "lock", "in progress", "migrat", "restor", "busy")
+
+DEFAULT_MAX_DEFERRAL_HOURS = 72
+
+
+def classify_api_error_text(error_text) -> str:
+    """Given Virtualizor's own `error` field (any type -- never assume str), returns
+    'DEFERRED_LOCKED' if it looks like a temporary VPS lock (backup/restore/migration),
+    else the generic 'API_REPORTED_ERROR'. Never used to decide between success/failure on
+    its own -- callers still require the live read-back to ever reach APPLIED."""
+    text = str(error_text).lower()
+    if any(s in text for s in LOCK_ERROR_SUBSTRINGS):
+        return "DEFERRED_LOCKED"
+    return "API_REPORTED_ERROR"
+
+
+def find_deferred_operation_for_vpsid(conn, node_id: str, vpsid: int):
+    """Returns the most recent DEFERRED_LOCKED operation for this (node, vpsid), across any
+    period_key -- a locked VPS may not show a fresh reset pattern on the exact period it was
+    first deferred for while still locked, so apply_due checks this BEFORE computing a new
+    baseline, not just for the one specific period that was active at deferral time."""
+    return conn.execute(
+        "SELECT operation_id, period_key, requested_new_quota_gb, created_at, retry_count "
+        "FROM operations WHERE node_id=? AND vpsid=? AND status='DEFERRED_LOCKED' "
+        "ORDER BY created_at DESC LIMIT 1",
         (node_id, vpsid),
     ).fetchone()
 
@@ -473,9 +520,21 @@ def apply_renewal(conn, node_id: str, vpsid: int, period_key: str, new_quota_gb,
 
     operation_id = f"{node_id}:{vpsid}:{period_key}:{int(time.time())}"
     record_operation_start(conn, operation_id, node_id, vpsid, period_key, new_quota_gb)
+    return _execute_write_and_verify(conn, operation_id, vpsid, new_quota_gb, creds, http_post,
+                                      confirm_read_delay_seconds, sleep_fn, read_live_quota_fn)
 
+
+def _execute_write_and_verify(conn, operation_id: str, vpsid: int, new_quota_gb: Decimal,
+                               creds: ApiCredentials, http_post, confirm_read_delay_seconds: float,
+                               sleep_fn, read_live_quota_fn) -> dict:
+    """The actual API-call-and-verify tail, shared by apply_renewal() (fresh operation) and
+    retry_deferred_renewal() (resuming an existing DEFERRED_LOCKED operation) -- exactly one
+    implementation of the fail-closed/false-success/lock-classification logic, never two
+    copies that could silently drift apart. The caller is responsible for all pre-checks
+    (structural gates, dedup, cooldown, age limits) and for having already called
+    record_operation_start (or equivalent) for `operation_id`."""
     try:
-        live_before = read_live_quota_fn(vpsid)
+        read_live_quota_fn(vpsid)  # pre-write read: surfaces an unreachable host immediately
     except Exception as e:
         record_operation_result(conn, operation_id, "UNKNOWN_NEEDS_VERIFICATION",
                                  api_response=f"pre-write read failed: {e}")
@@ -499,9 +558,13 @@ def apply_renewal(conn, node_id: str, vpsid: int, period_key: str, new_quota_gb,
     # live read-back checks below rather than being trusted by itself.
     parsed = api_result.get("parsed") if isinstance(api_result, dict) else None
     if isinstance(parsed, dict) and parsed.get("error"):
-        record_operation_result(conn, operation_id, "API_REPORTED_ERROR",
+        # Classify BEFORE recording -- a temporary lock (backup/restore/migration) is a
+        # distinct, expected, retryable outcome, never conflated with a generic rejection
+        # (bad vpsid, permission error, etc.), which stays terminal until an operator acts.
+        status = classify_api_error_text(parsed.get("error"))
+        record_operation_result(conn, operation_id, status,
                                  api_response=f"API explicitly reported an error: {api_result}")
-        return {"status": "API_REPORTED_ERROR", "operation_id": operation_id}
+        return {"status": status, "operation_id": operation_id}
 
     try:
         live_after = read_live_quota_fn(vpsid)
@@ -546,3 +609,48 @@ def apply_renewal(conn, node_id: str, vpsid: int, period_key: str, new_quota_gb,
     record_operation_result(conn, operation_id, "APPLIED", api_response=str(api_result),
                              verified_after_quota_gb=live_after)
     return {"status": "APPLIED", "operation_id": operation_id, "verified_after_quota_gb": live_after}
+
+
+def retry_deferred_renewal(conn, node_id: str, vpsid: int, creds: ApiCredentials,
+                            approval_marker_path: str, read_live_quota_fn, http_post=None,
+                            max_deferral_hours: float = DEFAULT_MAX_DEFERRAL_HOURS,
+                            confirm_read_delay_seconds: float = CONFIRM_READ_DELAY_SECONDS,
+                            sleep_fn=time.sleep, now_fn=lambda: datetime.now(timezone.utc)) -> dict:
+    """Retries an existing DEFERRED_LOCKED operation for this (node, vpsid) -- never
+    recomputes the target quota (that would risk using an already-reset USED value if the
+    lock cleared because the VPS's OWN renewal cycle also just turned over), always reuses
+    the ORIGINAL requested_new_quota_gb stored at deferral time. Bounded by
+    max_deferral_hours: past that age, stops retrying automatically and marks the operation
+    DEFERRED_EXPIRED_NEEDS_REVIEW instead -- never retries forever, and never silently drops
+    it either. No-op (returns NO_DEFERRED_OPERATION) if nothing is actually deferred.
+
+    SAME structural write-approval gate as apply_renewal -- this function must never be
+    reachable just because an operation happens to already exist; WRITE_APPROVED is
+    re-checked every single call, exactly like a fresh apply."""
+    if not is_write_approved(approval_marker_path):
+        raise WriteBlockedError(f"write not approved: {approval_marker_path} does not exist")
+    ensure_operations_schema(conn)
+    row = find_deferred_operation_for_vpsid(conn, node_id, vpsid)
+    if row is None:
+        return {"status": "NO_DEFERRED_OPERATION"}
+    operation_id, period_key, requested_quota_str, created_at, retry_count = row
+    age_hours = (now_fn() - datetime.fromisoformat(created_at)).total_seconds() / 3600.0
+    if age_hours > max_deferral_hours:
+        record_operation_result(conn, operation_id, "DEFERRED_EXPIRED_NEEDS_REVIEW",
+                                 api_response=f"deferred {age_hours:.1f}h, exceeds "
+                                              f"max_deferral_hours={max_deferral_hours} -- "
+                                              f"stopped automatic retry, needs operator review")
+        return {"status": "DEFERRED_EXPIRED_NEEDS_REVIEW", "operation_id": operation_id,
+                "period_key": period_key, "age_hours": age_hours}
+
+    conn.execute("BEGIN")
+    conn.execute("UPDATE operations SET retry_count = retry_count + 1, updated_at = ? "
+                 "WHERE operation_id = ?", (now_fn().isoformat(), operation_id))
+    conn.execute("COMMIT")
+
+    new_quota_gb = policy_mod.round_quota_for_virtualizor(Decimal(requested_quota_str))
+    result = _execute_write_and_verify(conn, operation_id, vpsid, new_quota_gb, creds, http_post,
+                                        confirm_read_delay_seconds, sleep_fn, read_live_quota_fn)
+    result["period_key"] = period_key
+    result["retry_count"] = retry_count + 1
+    return result

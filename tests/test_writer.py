@@ -852,3 +852,114 @@ def test_invalid_credentials_via_401_not_misclassified_even_with_json_looking_bo
     fetch = detailed('{"servers": [], "stats": {}}', status=401)
     result = w.probe_api_reachability(CREDS, http_get_detailed=fetch)
     assert result["confidence"] == "CREDENTIALS_LIKELY_INVALID"
+
+
+# 12. v1.2: backup/restore/migration lock classification + bounded deferred retry. Honestly
+# inference-based (see LOCK_ERROR_SUBSTRINGS docstring) -- never empirically triggered
+# against a real locked customer VPS; verified here purely via mocked API responses.
+
+def test_classify_api_error_text_recognizes_lock_phrases():
+    for phrase in ("VPS is locked for backup", "Backup in progress", "restore running",
+                   "migration in progress", "VPS busy"):
+        assert w.classify_api_error_text(phrase) == "DEFERRED_LOCKED"
+
+
+def test_classify_api_error_text_generic_error_is_not_deferred():
+    assert w.classify_api_error_text("Invalid API Key") == "API_REPORTED_ERROR"
+    assert w.classify_api_error_text("VPS does not exist") == "API_REPORTED_ERROR"
+
+
+def test_apply_renewal_locked_vps_response_persists_deferred_locked(conn, tmp_path):
+    marker = approved_marker(tmp_path)
+    result = w.apply_renewal(
+        conn, "self", 55, "55|period|1", Decimal("500"), CREDS, marker, confirm=True,
+        read_live_quota_fn=lambda v: Decimal("100"),
+        http_post=lambda *a, **k: '{"done": 0, "error": "VPS is currently locked: backup in progress"}',
+        write_cooldown_seconds=0)
+    assert result["status"] == "DEFERRED_LOCKED"
+    row = conn.execute("SELECT status, retry_count FROM operations WHERE operation_id=?",
+                        (result["operation_id"],)).fetchone()
+    assert row == ("DEFERRED_LOCKED", 0)
+
+
+def test_retry_deferred_renewal_no_op_when_nothing_deferred(conn, tmp_path):
+    marker = approved_marker(tmp_path)
+    result = w.retry_deferred_renewal(conn, "self", 999, CREDS, marker,
+                                       read_live_quota_fn=lambda v: pytest.fail("unreachable"))
+    assert result == {"status": "NO_DEFERRED_OPERATION"}
+
+
+def test_retry_deferred_renewal_succeeds_when_lock_cleared_uses_original_quota(conn, tmp_path):
+    """CRITICAL: the retry must reuse the ORIGINALLY computed quota (500), never recompute
+    from whatever USED looks like now -- even though read_live_quota_fn below would return a
+    very different 'current' value if it were (mis-)used as a basis for a fresh calculation."""
+    marker = approved_marker(tmp_path)
+    w.apply_renewal(conn, "self", 55, "55|period|1", Decimal("500"), CREDS, marker, confirm=True,
+                     read_live_quota_fn=lambda v: Decimal("100"),
+                     http_post=lambda *a, **k: '{"done": 0, "error": "backup in progress"}',
+                     write_cooldown_seconds=0)
+
+    reads = iter([Decimal("100"), Decimal("500"), Decimal("500")])  # pre, post, confirm
+    result = w.retry_deferred_renewal(
+        conn, "self", 55, CREDS, marker, read_live_quota_fn=lambda v: next(reads),
+        http_post=lambda *a, **k: '{"done": 1}', sleep_fn=lambda s: None)
+    assert result["status"] == "APPLIED"
+    assert result["verified_after_quota_gb"] == Decimal("500")
+    assert result["retry_count"] == 1
+    row = conn.execute("SELECT status, retry_count, requested_new_quota_gb FROM operations "
+                        "WHERE vpsid=55").fetchone()
+    assert row == ("APPLIED", 1, "500")
+
+
+def test_retry_deferred_renewal_still_locked_stays_deferred_and_increments_retry_count(conn, tmp_path):
+    marker = approved_marker(tmp_path)
+    w.apply_renewal(conn, "self", 55, "55|period|1", Decimal("500"), CREDS, marker, confirm=True,
+                     read_live_quota_fn=lambda v: Decimal("100"),
+                     http_post=lambda *a, **k: '{"done": 0, "error": "backup in progress"}',
+                     write_cooldown_seconds=0)
+    result = w.retry_deferred_renewal(
+        conn, "self", 55, CREDS, marker, read_live_quota_fn=lambda v: Decimal("100"),
+        http_post=lambda *a, **k: '{"done": 0, "error": "backup still in progress"}')
+    assert result["status"] == "DEFERRED_LOCKED"
+    assert result["retry_count"] == 1
+    row = conn.execute("SELECT retry_count FROM operations WHERE vpsid=55").fetchone()
+    assert row[0] == 1
+
+
+def test_retry_deferred_renewal_expires_after_max_deferral_hours_without_calling_api(conn, tmp_path):
+    marker = approved_marker(tmp_path)
+    w.apply_renewal(conn, "self", 55, "55|period|1", Decimal("500"), CREDS, marker, confirm=True,
+                     read_live_quota_fn=lambda v: Decimal("100"),
+                     http_post=lambda *a, **k: '{"done": 0, "error": "backup in progress"}',
+                     write_cooldown_seconds=0)
+    from datetime import datetime as _dt, timedelta, timezone as _tz
+    later = _dt.now(_tz.utc) + timedelta(hours=100)
+    result = w.retry_deferred_renewal(
+        conn, "self", 55, CREDS, marker,
+        read_live_quota_fn=lambda v: pytest.fail("must not call the API past max_deferral_hours"),
+        http_post=lambda *a, **k: pytest.fail("must not call the API past max_deferral_hours"),
+        max_deferral_hours=72, now_fn=lambda: later)
+    assert result["status"] == "DEFERRED_EXPIRED_NEEDS_REVIEW"
+    row = conn.execute("SELECT status FROM operations WHERE vpsid=55").fetchone()
+    assert row[0] == "DEFERRED_EXPIRED_NEEDS_REVIEW"
+
+
+def test_retry_deferred_renewal_requires_write_approved(conn, tmp_path):
+    marker = approved_marker(tmp_path)
+    w.apply_renewal(conn, "self", 55, "55|period|1", Decimal("500"), CREDS, marker, confirm=True,
+                     read_live_quota_fn=lambda v: Decimal("100"),
+                     http_post=lambda *a, **k: '{"done": 0, "error": "backup in progress"}',
+                     write_cooldown_seconds=0)
+    never_created = str(tmp_path / "WRITE_APPROVED_NEVER_CREATED")
+    with pytest.raises(w.WriteBlockedError):
+        w.retry_deferred_renewal(conn, "self", 55, CREDS, never_created,
+                                  read_live_quota_fn=lambda v: pytest.fail("unreachable"))
+
+
+def test_ensure_operations_schema_migration_is_idempotent(conn):
+    """The ALTER TABLE ADD COLUMN migration must be safe to run on a brand-new table too
+    (cli_env fixture already called it once via the conn fixture) and safe to call again."""
+    w.ensure_operations_schema(conn)
+    w.ensure_operations_schema(conn)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(operations)").fetchall()]
+    assert "retry_count" in cols

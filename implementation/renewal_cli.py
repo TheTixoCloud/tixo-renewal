@@ -20,13 +20,21 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
+
+# Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
+# apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
+# once never hammers Virtualizor's admin API in a tight loop. Deliberately small (this is not
+# a substitute for Virtualizor's own rate limiting, if any) and only applied AFTER an attempt
+# that actually touched the API -- never after a pure skip (no API call made at all).
+API_CALL_SPACING_SECONDS = 0.5
 
 import argparse
 import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -775,37 +783,64 @@ def cmd_apply_due(args):
     checkpoint = conn.execute("SELECT first_poll_at FROM monitor_checkpoints WHERE id=1").fetchone()
     vpsids = [r[0] for r in conn.execute("SELECT DISTINCT vpsid FROM identities")]
 
-    applied, skipped = [], []
+    applied, skipped, deferred = [], [], []
     for vpsid in vpsids:
-        ident = conn.execute("SELECT created_epoch FROM identities WHERE vpsid=?", (vpsid,)).fetchone()
-        # apply-due must NEVER act on a hypothetical "as if renewed right now" baseline --
-        # only a REAL observed reset pattern (two snapshots: quota unchanged, usage dropped)
-        # is eligible for actual application. See _renewal_baseline_for_vpsid()'s docstring
-        # for the exact bug this guards against (using post-drop usage as the pre-drop value).
-        baseline = _renewal_baseline_for_vpsid(conn, vpsid)
-        if baseline is None:
-            skipped.append((vpsid, "NO_OBSERVED_RESET_PATTERN"))
+        # CRITICAL: one VPS's exception (network blip, unexpected API shape, etc.) must never
+        # abort processing of every OTHER eligible VPS in this run. Each vpsid is fully
+        # isolated; a failure here is recorded as skipped, not a crash of the whole batch.
+        try:
+            # Check for a pending deferred (backup/restore/migration-locked) retry FIRST,
+            # before computing any fresh baseline -- a locked VPS may not show a fresh reset
+            # pattern in the CURRENT period while still locked, but a previously-deferred
+            # attempt for an EARLIER period must still be retried using its ORIGINALLY
+            # computed quota, never recomputed from whatever USED looks like right now.
+            deferred_result = writer_mod.retry_deferred_renewal(
+                conn, args.node, vpsid, creds, WRITE_APPROVAL_MARKER,
+                read_live_quota_fn=lambda v: ls.fetch_single_vps_quota(v))
+            if deferred_result["status"] != "NO_DEFERRED_OPERATION":
+                deferred.append((vpsid, deferred_result))
+                time.sleep(API_CALL_SPACING_SECONDS)  # this retry touched the real API
+                continue
+
+            ident = conn.execute("SELECT created_epoch FROM identities WHERE vpsid=?", (vpsid,)).fetchone()
+            # apply-due must NEVER act on a hypothetical "as if renewed right now" baseline --
+            # only a REAL observed reset pattern (two snapshots: quota unchanged, usage dropped)
+            # is eligible for actual application. See _renewal_baseline_for_vpsid()'s docstring
+            # for the exact bug this guards against (using post-drop usage as the pre-drop value).
+            baseline = _renewal_baseline_for_vpsid(conn, vpsid)
+            if baseline is None:
+                skipped.append((vpsid, "NO_OBSERVED_RESET_PATTERN"))
+                continue
+            old_quota, old_used, event_ts = baseline
+            preview = pi.preview_renewal(
+                cfg, args.node, vpsid, verified_created_epoch=ident[0] if ident else None,
+                node_first_poll_at=checkpoint[0] if checkpoint else None,
+                old_quota=old_quota, old_used=old_used, event_ts=event_ts,
+            )
+            if preview["status"] != "PLAUSIBLE_RENEWAL_CANDIDATE":
+                skipped.append((vpsid, preview["status"]))
+                continue
+            period_index = renewal_period_index(preview["anchor_epoch"], event_ts)
+            period_key = f"{vpsid}|{preview['anchor_epoch']}|{period_index}"
+            result = writer_mod.apply_renewal(
+                conn, args.node, vpsid, period_key, Decimal(preview["proposed_new_quota_gb"]), creds,
+                WRITE_APPROVAL_MARKER, confirm=True,
+                read_live_quota_fn=lambda v: ls.fetch_single_vps_quota(v),
+            )
+            if result["status"] == "DEFERRED_LOCKED":
+                deferred.append((vpsid, result))
+            else:
+                applied.append((vpsid, result))
+            time.sleep(API_CALL_SPACING_SECONDS)  # this attempt touched the real API
+        except Exception as e:
+            skipped.append((vpsid, f"ERROR: {e}"))
             continue
-        old_quota, old_used, event_ts = baseline
-        preview = pi.preview_renewal(
-            cfg, args.node, vpsid, verified_created_epoch=ident[0] if ident else None,
-            node_first_poll_at=checkpoint[0] if checkpoint else None,
-            old_quota=old_quota, old_used=old_used, event_ts=event_ts,
-        )
-        if preview["status"] != "PLAUSIBLE_RENEWAL_CANDIDATE":
-            skipped.append((vpsid, preview["status"]))
-            continue
-        period_index = renewal_period_index(preview["anchor_epoch"], event_ts)
-        period_key = f"{vpsid}|{preview['anchor_epoch']}|{period_index}"
-        result = writer_mod.apply_renewal(
-            conn, args.node, vpsid, period_key, Decimal(preview["proposed_new_quota_gb"]), creds,
-            WRITE_APPROVAL_MARKER, confirm=True,
-            read_live_quota_fn=lambda v: ls.fetch_single_vps_quota(v),
-        )
-        applied.append((vpsid, result))
 
     conn.close()
-    print(f"Applied/attempted: {len(applied)}, skipped (not due/approved): {len(skipped)}")
+    print(f"Applied/attempted: {len(applied)}, deferred (locked): {len(deferred)}, "
+          f"skipped (not due/approved/errored): {len(skipped)}")
+    for vpsid, result in deferred:
+        print(f"  DEFERRED vpsid={vpsid}: {result}")
     for vpsid, result in applied:
         print(f"  vpsid={vpsid}: {result}")
     return 0

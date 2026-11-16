@@ -154,3 +154,20 @@ def test_fetch_single_vps_all_bad_format_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(ls.subprocess, "run", lambda *a, **k: FakeResult())
     with pytest.raises(ls.LocalSourceError, match="unexpected query result format"):
         ls.fetch_single_vps_all(131, path)
+
+
+# ---------- v1.2: DATABASE WRITE POLICY static guard --------------------------------------
+
+def test_local_source_module_contains_no_write_sql_keywords():
+    """Permanent static guard: this module must NEVER become a fallback write path. Scans
+    the actual source file (not just docstrings) for SQL write keywords -- if this ever
+    fails, someone added a write capability that must not exist here."""
+    import inspect
+    source = inspect.getsource(ls)
+    forbidden = ("UPDATE ", "INSERT INTO", "DELETE FROM", "DROP TABLE", "ALTER TABLE",
+                 "TRUNCATE", "REPLACE INTO")
+    # Case-sensitive on purpose -- real SQL keywords in this codebase are always uppercase in
+    # the f-string templates (see the existing SELECT statements), so this won't false-positive
+    # on lowercase prose mentioning "update" in a comment/docstring.
+    hits = [kw for kw in forbidden if kw in source]
+    assert not hits, f"found write-SQL keyword(s) in local_source.py: {hits}"

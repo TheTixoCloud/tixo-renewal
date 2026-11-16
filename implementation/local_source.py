@@ -1,11 +1,23 @@
-"""Host-local, read-only Virtualizor DB access. Runs directly ON the Virtualizor host itself
--- no SSH, no dependency on the Ubuntu development server at runtime. Reuses the exact
-credential-reading approach already proven safe and reviewed in `/root/virt-creation-times.py`
-(read `universal.php`, connect with the panel's own DB user via the local mysql client), but
-as a self-contained function bundled in this package rather than relying on that specific file
-existing on the target host.
+"""Host-local, STRICTLY READ-ONLY Virtualizor/EMPS database diagnostic adapter. Runs directly
+ON the Virtualizor host itself -- no SSH, no dependency on the Ubuntu development server at
+runtime. Reuses the exact credential-reading approach already proven safe and reviewed in
+`/root/virt-creation-times.py` (read `universal.php`, connect with the panel's own DB user via
+the local mysql client), but as a self-contained function bundled in this package rather than
+relying on that specific file existing on the target host.
 
-Every function here is a pure SELECT. Nothing in this module writes anything, ever.
+DATABASE WRITE POLICY (explicit, by design, not just by convention):
+  - Every function here is a pure SELECT. Nothing in this module writes anything, ever.
+  - This adapter is OPTIONAL and used only by read-only diagnostics (`inspect-vps`, the
+    gated manual integration test) -- it is never required for normal installation or
+    renewal, and the real write mechanism is ALWAYS Virtualizor's own Admin API
+    (`writer.py`'s `act=managevps`), never a direct database write.
+  - This module must NEVER become a fallback write path, under any circumstance, including a
+    locked/backup VPS or an uncertain API outcome -- those are handled by `writer.py`'s
+    DEFERRED_LOCKED / UNKNOWN_NEEDS_VERIFICATION states instead, not by reaching for direct
+    SQL. See tests/test_local_source.py's static guard asserting no write-SQL keyword
+    appears anywhere in this file's source, ever.
+  - Database credentials are read locally from `universal.php` (root-only file, standard
+    Virtualizor permissions) and never leave this process or get logged/printed.
 """
 from __future__ import annotations
 

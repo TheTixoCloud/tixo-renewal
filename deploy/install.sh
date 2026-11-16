@@ -56,15 +56,50 @@ if [ "$(id -u)" -ne 0 ] && [ -z "${TIXO_RENEWAL_INSTALL_DIR:-}" ]; then
   echo "require root. Re-run with sudo, or set TIXO_RENEWAL_INSTALL_DIR to a writable path."
 fi
 
-if [ ! -f /usr/local/virtualizor/universal.php ] && [ ! -f /usr/local/emps/etc/virtualizor/universal.php ]; then
+# Virtualizor Master/Slave detection: HONEST LIMITATION, stated explicitly rather than
+# invented -- this checks only for the presence of a local universal.php (the Admin API
+# config this project's read-only diagnostics and writer.py both depend on), which is the
+# Master's own file. A genuine "is this specifically a Slave-only node" check would require
+# Virtualizor-internal knowledge this project has not verified against a real Slave install,
+# so it is NOT claimed here. If universal.php is absent, installation continues (local setup
+# only) but is NOT a supported/tested configuration for actual renewal use.
+if [ -f /usr/local/virtualizor/universal.php ] || [ -f /usr/local/emps/etc/virtualizor/universal.php ]; then
+  echo "Virtualizor Admin API config (universal.php) found -- Master-compatible install detected."
+else
   echo "NOTE: no Virtualizor universal.php found at the usual locations on this host."
-  echo "      Installation will continue (this is just local setup), but 'dry-run'/'status'"
-  echo "      will fail to read live VPS data until this is run ON an actual Virtualizor host."
+  echo "      This is either not a Virtualizor Master, or Virtualizor is not installed here."
+  echo "      Installation will continue (local setup only), but 'dry-run'/'status'/'apply'"
+  echo "      will all fail to reach live VPS data until this is run ON an actual Virtualizor"
+  echo "      Master host. Slave-only Virtualizor nodes are NOT a verified/supported"
+  echo "      configuration for this project -- the Admin API this writer uses is a Master"
+  echo "      concept, not independently confirmed against a real Slave-only installation."
 fi
 
 if ! command -v flock >/dev/null 2>&1; then
-  echo "ERROR: 'flock' (util-linux) not found -- required for safe non-overlapping timers." >&2
+  echo "'flock' (util-linux) not found -- required for safe non-overlapping timers."
+  if [ "$(id -u)" -eq 0 ] && command -v apt-get >/dev/null 2>&1; then
+    echo "Attempting to install it automatically (util-linux, a safe, standard Ubuntu package)..."
+    apt-get update -qq && apt-get install -y -qq util-linux
+    if ! command -v flock >/dev/null 2>&1; then
+      echo "ERROR: automatic install of util-linux did not provide 'flock'. Install it yourself." >&2
+      exit 1
+    fi
+    echo "'flock' is now available."
+  else
+    echo "ERROR: cannot auto-install (not root, or apt-get unavailable). Install util-linux yourself." >&2
+    exit 1
+  fi
+fi
+
+if ! command -v systemctl >/dev/null 2>&1; then
+  echo "ERROR: systemd (systemctl) not found -- this installer requires systemd for the" >&2
+  echo "monitor/apply/notifier timers. This is not something safe to auto-install." >&2
   exit 1
+fi
+
+if [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ]; then
+  echo "WARNING: untested CPU architecture '$(uname -m)' -- this is pure-Python stdlib code"
+  echo "         so it should still work, but has only been verified on x86_64/aarch64."
 fi
 
 mkdir -p "$INSTALL_DIR"/{lib,bin,shadow-monitor-state,renewal-config,backups,systemd}
