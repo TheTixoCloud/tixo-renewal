@@ -204,3 +204,58 @@ def test_explicit_billing_anchor_at_vps_level(tmp_path):
     p = pol.resolve_policy(cfg, "h", 5)
     assert p.billing_anchor == "explicit"
     assert p.explicit_anchor_epoch == 1700000000
+
+
+# 7. PERMANENT FIX: fractional-GB quota normalization for Virtualizor's integer-only
+# `bandwidth` column. Real production incident: vpsid 106, 2026-11-15, requested 1009.59 GB,
+# Virtualizor silently truncated to 1009 GB -- the write succeeded but our own live read-back
+# correctly refused to call it APPLIED, requiring a manual resolve-operation afterward.
+# Business decision (2026-11-16): round UP (ceiling), never down -- never grant less than the
+# calculated entitlement.
+
+def test_round_quota_for_virtualizor_rounds_up_fractional():
+    assert pol.round_quota_for_virtualizor(Decimal("1009.59")) == Decimal("1010")
+
+
+def test_round_quota_for_virtualizor_reproduces_the_real_vps106_case():
+    """The exact real-world numbers from the VPS 106 incident: old_quota=1100,
+    old_used=190.41, monthly_grant=100 -> exact 1009.59 -> must now round to 1010, NOT the
+    1009 Virtualizor silently truncated to historically."""
+    remaining = Decimal("1100") - Decimal("190.41")
+    exact = remaining + Decimal("100")
+    assert exact == Decimal("1009.59")
+    assert pol.round_quota_for_virtualizor(exact) == Decimal("1010")
+
+
+def test_round_quota_for_virtualizor_leaves_exact_integers_unchanged():
+    """Idempotency / no-op for the common whole-GB case -- must never add a spurious +1."""
+    assert pol.round_quota_for_virtualizor(Decimal("200")) == Decimal("200")
+
+
+def test_round_quota_for_virtualizor_is_idempotent_when_applied_twice():
+    once = pol.round_quota_for_virtualizor(Decimal("1009.59"))
+    twice = pol.round_quota_for_virtualizor(once)
+    assert once == twice == Decimal("1010")
+
+
+def test_round_quota_for_virtualizor_handles_none():
+    assert pol.round_quota_for_virtualizor(None) is None
+
+
+def test_round_quota_for_virtualizor_tiny_fraction_still_rounds_up():
+    """Even a 0.01 GB fraction must round up, not down -- any truncation at all would
+    under-credit the customer versus their calculated entitlement."""
+    assert pol.round_quota_for_virtualizor(Decimal("99.01")) == Decimal("100")
+
+
+def test_round_quota_respects_carryover_cap_before_rounding():
+    """Rounding must happen AFTER the cap is applied (via compute_renewal_quota), so a cap is
+    never exceeded by more than the same <1GB rounding amount -- not bypassed by rounding
+    somehow happening first."""
+    p = pol.Policy(initial_allocation_gb=Decimal("100"), monthly_grant_gb=Decimal("100"),
+                    carryover_enabled=True, carryover_cap_gb=Decimal("500.5"),
+                    billing_anchor="verified_creation", explicit_anchor_epoch=None,
+                    auto_renewal_enabled=True, excluded=False, source="global")
+    exact = pol.compute_renewal_quota(p, Decimal("10000"), Decimal("1"))  # remaining >> cap
+    assert exact == Decimal("600.5")  # 500.5 cap + 100 grant
+    assert pol.round_quota_for_virtualizor(exact) == Decimal("601")

@@ -30,6 +30,7 @@ from decimal import Decimal
 from typing import Optional
 
 import credentials as credentials_mod
+import policy as policy_mod
 
 
 class SanitizedNetworkError(Exception):
@@ -423,6 +424,17 @@ def apply_renewal(conn, node_id: str, vpsid: int, period_key: str, new_quota_gb,
     # which serializes Decimals to strings for JSON/printing) must not silently fail the
     # post-write verification comparison just because Decimal("200") != "200" in Python.
     new_quota_gb = Decimal(new_quota_gb) if not isinstance(new_quota_gb, Decimal) else new_quota_gb
+    # Unconditional defensive rounding, regardless of caller: this is the ONE choke point every
+    # real write path goes through (manual `apply`, `apply-due`, the integration test script),
+    # so it is also the only place that can GUARANTEE no fractional GB ever reaches
+    # Virtualizor's integer-only `bandwidth` column -- policy_integration.preview_renewal
+    # already rounds too (so apply-due's displayed preview matches what actually gets sent),
+    # but the manual `apply` CLI command takes --new-quota-gb directly from the operator and
+    # bypasses preview_renewal entirely. That exact gap is what produced the real VPS 106
+    # incident (2026-11-15: requested 1009.59, Virtualizor silently truncated to 1009, live
+    # read-back correctly refused to call it APPLIED). Rounding here closes it for every
+    # caller, present and future, without relying on each one remembering to round first.
+    new_quota_gb = policy_mod.round_quota_for_virtualizor(new_quota_gb)
     if not is_write_approved(approval_marker_path):
         raise WriteBlockedError(f"write not approved: {approval_marker_path} does not exist")
 

@@ -462,12 +462,18 @@ def cmd_apply(args):
         print("--execute requires --node, --vpsid, --period-key, and --new-quota-gb.")
         return 1
 
-    print("You are about to WRITE to production Virtualizor via its admin API.")
-    print(f"  node={args.node} vpsid={args.vpsid} period_key={args.period_key} "
-          f"new_quota_gb={args.new_quota_gb}")
-
     import writer as writer_mod
     import local_source as ls
+
+    _requested_decimal = Decimal(args.new_quota_gb)
+    _normalized_decimal = pol.round_quota_for_virtualizor(_requested_decimal)
+    print("You are about to WRITE to production Virtualizor via its admin API.")
+    print(f"  node={args.node} vpsid={args.vpsid} period_key={args.period_key} "
+          f"requested_new_quota_gb={args.new_quota_gb}")
+    if _normalized_decimal != _requested_decimal:
+        print(f"  NOTE: Virtualizor's bandwidth field is integer-only -- the actual value "
+              f"sent will be normalized to {_normalized_decimal} GB (rounded up from "
+              f"{_requested_decimal} GB), not the exact fractional value typed above.")
 
     node = next((n for n in nodes_mod.load_nodes(_node_config_path()) if n.node_id == args.node), None)
     if node is None:

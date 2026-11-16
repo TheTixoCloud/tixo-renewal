@@ -212,3 +212,30 @@ def test_plan_change_unlimited_to_limited_restores_normal_eligibility(tmp_path):
                                        Decimal("1000"), Decimal("900"),
                                        iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
     assert after_replan["status"] == "PLAUSIBLE_RENEWAL_CANDIDATE"
+
+
+# 9. PERMANENT FIX: fractional-GB quota normalization at the preview layer -- reproduces the
+# real VPS 106 incident (2026-11-15) and proves preview_renewal now reports the SAME value
+# apply_due/apply would actually request, with the exact pre-rounding math preserved for audit.
+
+def test_preview_rounds_fractional_proposed_quota_up_reproducing_vps106(tmp_path):
+    cfg = make_config(tmp_path, auto_renewal_enabled=True)
+    created = int(datetime(2026, 10, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "self", 106, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("1100"), Decimal("190.41"),  # the real VPS 106 numbers
+                                 iso(datetime(2026, 11, 15, tzinfo=timezone.utc)))
+    assert result["status"] == "PLAUSIBLE_RENEWAL_CANDIDATE"
+    assert result["exact_calculated_quota_gb"] == "1009.59"  # the real math, preserved for audit
+    assert result["proposed_new_quota_gb"] == "1010"  # rounded UP -- NOT 1009 (the historical
+    # truncated outcome) and NOT 1009.59 (unrepresentable in Virtualizor's integer column)
+
+
+def test_preview_proposed_quota_unchanged_for_exact_integer_result(tmp_path):
+    """No spurious +1 for the common whole-GB case."""
+    cfg = make_config(tmp_path, auto_renewal_enabled=True)
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("1000"), Decimal("900"),
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert result["proposed_new_quota_gb"] == "200"
+    assert result["exact_calculated_quota_gb"] == "200"

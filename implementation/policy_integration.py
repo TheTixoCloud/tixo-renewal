@@ -93,7 +93,13 @@ def preview_renewal(policy_config: pol.PolicyConfig, node_id: str, vpsid: int,
                 "initial_grant_note": initial_grant_note}
 
     eligible, detail = check_monthly_anniversary(anchor_epoch, event_ts)
-    proposed_quota = pol.compute_renewal_quota(p, old_quota, old_used)
+    exact_proposed_quota = pol.compute_renewal_quota(p, old_quota, old_used)
+    # Rounded HERE, once, at the earliest point the final quota is computed -- every
+    # downstream consumer (apply_due, cmd_preview, cmd_apply via writer.apply_renewal's own
+    # defensive rounding, post-write verification, ledger recording) ends up using this exact
+    # same normalized value. See round_quota_for_virtualizor()'s docstring for why (VPS 106,
+    # 2026-11-15 incident). The pre-rounding exact calculation is preserved below for audit.
+    proposed_quota = pol.round_quota_for_virtualizor(exact_proposed_quota)
 
     if not p.auto_renewal_enabled:
         status = "PREVIEW_ONLY_AUTO_RENEWAL_DISABLED"
@@ -111,6 +117,7 @@ def preview_renewal(policy_config: pol.PolicyConfig, node_id: str, vpsid: int,
         "carryover_enabled": p.carryover_enabled,
         "carryover_cap_gb": str(p.carryover_cap_gb) if p.carryover_cap_gb is not None else "unlimited",
         "proposed_new_quota_gb": str(proposed_quota),
+        "exact_calculated_quota_gb": str(exact_proposed_quota),  # pre-rounding, audit only
         "initial_grant_note": initial_grant_note,
         "auto_renewal_enabled": p.auto_renewal_enabled,
     }

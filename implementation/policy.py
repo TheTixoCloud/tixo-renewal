@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, replace
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING
 from pathlib import Path
 from typing import Optional
 
@@ -249,3 +249,30 @@ def compute_renewal_quota(policy: Policy, old_quota: Decimal, old_used: Decimal)
     else:
         carryover = remaining
     return carryover + policy.monthly_grant_gb
+
+
+def round_quota_for_virtualizor(quota_gb: Optional[Decimal]) -> Optional[Decimal]:
+    """Virtualizor's own `vps.bandwidth` column is a plain SQL integer -- confirmed via
+    `DESCRIBE vps` on ir1 (`bandwidth int(10)`, while `used_bandwidth` is `decimal(12,2)`):
+    it cannot store a fractional GB value at all. A real production apply (vpsid 106,
+    2026-11-15) requested 1009.59 GB; Virtualizor silently TRUNCATED it to 1009 GB. The write
+    genuinely succeeded, but our own live read-back correctly refused to call it APPLIED
+    because 1009 != 1009.59 -- a real, reachable mismatch, not hypothetical, and it required a
+    manual `resolve-operation` to close out afterward.
+
+    Business decision (owner-confirmed, 2026-11-16): round UP (ceiling) to the nearest whole
+    GB, never down -- a customer must never receive less than their calculated carryover
+    entitlement because of a rounding artifact. The at-most-0.99GB-per-cycle upside is
+    negligible against a >=100GB monthly base and is strictly customer-favorable. Compatible
+    with the existing carryover_cap_gb logic (rounding happens AFTER the cap is applied, so a
+    cap is never exceeded by more than the same <1GB rounding amount) and with
+    carryover_enabled=False (rounding still applies to the monthly_grant_gb-only result).
+
+    This has only been verified against ir1's schema. Another node's `vps.bandwidth` column
+    type should be independently confirmed before assuming the same integer-only behavior --
+    this function is still safe to apply unconditionally even if a future node DOES support
+    fractional GB, since rounding up to the nearest whole GB is simply a more conservative
+    (never-less-than-entitled) value in that case too."""
+    if quota_gb is None:
+        return None
+    return quota_gb.to_integral_value(rounding=ROUND_CEILING)

@@ -235,6 +235,81 @@ def test_pre_write_read_failure_never_calls_the_api(conn, tmp_path):
     assert result["status"] == "UNKNOWN_NEEDS_VERIFICATION"
 
 
+# 5b. PERMANENT FIX: fractional-GB quota normalization. Real production incident: vpsid 106,
+# 2026-11-15, the manual `apply` CLI took --new-quota-gb=1009.59 directly from the operator
+# (bypassing policy_integration.preview_renewal entirely) and sent it straight to
+# Virtualizor, whose `bandwidth` column is integer-only -- it silently truncated to 1009,
+# and the live read-back correctly refused to call it APPLIED. apply_renewal() must now
+# defensively round ANY caller's new_quota_gb before the API call and before the read-back
+# comparison, so this can never recur regardless of which caller forgets to round first.
+
+def test_apply_renewal_rounds_fractional_quota_up_before_api_call(conn, tmp_path):
+    marker = approved_marker(tmp_path)
+    captured = {}
+
+    def capture_post(url, data, timeout):
+        captured["data"] = data
+        return '{"done":1}'
+
+    reads = iter([Decimal("190.41"), Decimal("1010"), Decimal("1010")])  # before, after, confirm
+    result = w.apply_renewal(conn, "self", 106, "106|1792101459|1", Decimal("1009.59"), CREDS,
+                              marker, confirm=True, read_live_quota_fn=lambda v: next(reads),
+                              http_post=capture_post, write_cooldown_seconds=0)
+    body_params = dict(pair.split("=") for pair in captured["data"].split("&"))
+    assert body_params["bandwidth"] == "1010"  # rounded UP, not 1009.59 or 1009
+    assert result["status"] == "APPLIED"
+    assert result["verified_after_quota_gb"] == Decimal("1010")
+    row = conn.execute("SELECT requested_new_quota_gb FROM operations WHERE operation_id=?",
+                        (result["operation_id"],)).fetchone()
+    assert row[0] == "1010"  # ledger records the NORMALIZED value that was actually requested
+
+
+def test_apply_renewal_exact_integer_quota_unaffected_idempotent(conn, tmp_path):
+    """No behavior change at all for the common whole-GB case."""
+    marker = approved_marker(tmp_path)
+    reads = iter([Decimal("50"), Decimal("200"), Decimal("200")])
+    result = w.apply_renewal(conn, "n1", 7, "p1", Decimal("200"), CREDS, marker, confirm=True,
+                              read_live_quota_fn=lambda v: next(reads),
+                              http_post=lambda url, data, timeout: '{"done":1}',
+                              write_cooldown_seconds=0)
+    assert result["status"] == "APPLIED"
+    assert result["verified_after_quota_gb"] == Decimal("200")
+
+
+def test_apply_renewal_recovers_safely_if_virtualizor_still_truncates_unexpectedly(conn, tmp_path):
+    """Defense in depth: even after normalizing our OWN request to a whole GB, if some other
+    node's Virtualizor behaves unexpectedly and the live read-back still doesn't match the
+    (now-integer) requested value, the existing UNKNOWN_NEEDS_VERIFICATION fail-closed path
+    must still catch it -- this fix does not weaken that guarantee."""
+    marker = approved_marker(tmp_path)
+    result = w.apply_renewal(conn, "n1", 7, "p1", Decimal("1009.59"), CREDS, marker, confirm=True,
+                              read_live_quota_fn=lambda v: Decimal("999"),  # unexpected mismatch
+                              http_post=lambda url, data, timeout: '{"done":1}',
+                              write_cooldown_seconds=0)
+    assert result["status"] == "UNKNOWN_NEEDS_VERIFICATION"
+    assert result["verified_after_quota_gb"] == Decimal("999")
+
+
+def test_apply_renewal_rounding_is_idempotent_across_duplicate_attempts(conn, tmp_path):
+    """A second attempt at the SAME period with the same fractional input must still be
+    blocked by the existing duplicate-protection -- rounding must not create a new/different
+    period identity or bypass that check."""
+    marker = approved_marker(tmp_path)
+    reads = iter([Decimal("190.41"), Decimal("1010"), Decimal("1010")])
+    first = w.apply_renewal(conn, "self", 106, "106|1792101459|1", Decimal("1009.59"), CREDS,
+                             marker, confirm=True, read_live_quota_fn=lambda v: next(reads),
+                             http_post=lambda url, data, timeout: '{"done":1}',
+                             write_cooldown_seconds=0)
+    assert first["status"] == "APPLIED"
+
+    second = w.apply_renewal(
+        conn, "self", 106, "106|1792101459|1", Decimal("1009.59"), CREDS, marker, confirm=True,
+        read_live_quota_fn=lambda v: pytest.fail("must not read live quota for a blocked duplicate"),
+        http_post=lambda *a, **k: pytest.fail("must not call the API for a blocked duplicate"))
+    assert second["status"] == "BLOCKED_UNRESOLVED_PRIOR_OPERATION"
+    assert second["operation_id"] == first["operation_id"]
+
+
 # 6. POST body shape must match the real, already-verified-working manual script exactly -------
 
 def test_managevps_post_body_includes_required_theme_edit_and_editvps_fields():
