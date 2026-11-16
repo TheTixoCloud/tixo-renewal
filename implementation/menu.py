@@ -25,13 +25,76 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import analytics
+import hostinfo
+import inventory as inv
+import inventory_sync as isync
 import nodes as nodes_mod
 import policy as pol
 import renewal_cli
 import shadow_monitor as sm
+import virtualizor_info as vinfo
 
 GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/TheTixoCloud/tixo-renewal/releases/latest"
 DEFAULT_DISPLAY_TZ = "Asia/Tehran"
+
+BANNER = r"""
+  _____ _           _____ _                 _
+ |_   _(_)_  _____ / ____| |               | |
+   | |  \ \/ / _ \ |      | | ___  _   _  __| |
+   | |   >  < (_) | |     | |/ _ \| | | |/ _` |
+   |_|  /_/\_\___/| |____ | | (_) | |_| | (_| |
+                    \_____|_|\___/ \__,_|\__,_|
+         Virtualizor Bandwidth Renewal
+"""
+
+DEFAULT_DASHBOARD_REFRESH_MIN = isync.DEFAULT_REFRESH_INTERVAL_MIN
+DEFAULT_USAGE_THRESHOLD_PERCENT = Decimal("90")
+
+
+def dashboard_settings_path(config_dir: str) -> str:
+    return os.path.join(config_dir, "dashboard-settings.json")
+
+
+def load_dashboard_settings(config_dir: str) -> dict:
+    path = dashboard_settings_path(config_dir)
+    if not os.path.exists(path):
+        return {"refresh_interval_minutes": DEFAULT_DASHBOARD_REFRESH_MIN,
+                "usage_threshold_percent": str(DEFAULT_USAGE_THRESHOLD_PERCENT)}
+    try:
+        import json
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {"refresh_interval_minutes": DEFAULT_DASHBOARD_REFRESH_MIN,
+                "usage_threshold_percent": str(DEFAULT_USAGE_THRESHOLD_PERCENT)}
+    data.setdefault("refresh_interval_minutes", DEFAULT_DASHBOARD_REFRESH_MIN)
+    data.setdefault("usage_threshold_percent", str(DEFAULT_USAGE_THRESHOLD_PERCENT))
+    return data
+
+
+def validate_usage_threshold_percent(value) -> Decimal:
+    try:
+        d = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"not a valid number: {value!r}")
+    if not (0 <= d <= 100):
+        raise ValueError("usage threshold must be between 0 and 100")
+    return d
+
+
+def save_dashboard_settings(config_dir: str, refresh_interval_minutes=None,
+                             usage_threshold_percent=None) -> None:
+    current = load_dashboard_settings(config_dir)
+    if refresh_interval_minutes is not None:
+        current["refresh_interval_minutes"] = renewal_cli.validate_interval_minutes(
+            refresh_interval_minutes, min_minutes=1, max_minutes=1440)
+    if usage_threshold_percent is not None:
+        current["usage_threshold_percent"] = str(validate_usage_threshold_percent(usage_threshold_percent))
+    import json
+    path = dashboard_settings_path(config_dir)
+    tmp = path + ".tmp"
+    Path(tmp).write_text(json.dumps(current, indent=2) + "\n")
+    os.replace(tmp, path)
 
 
 # ---------- timezone DISPLAY only -- never touches the host's actual system timezone --------
@@ -306,6 +369,121 @@ def render_dashboard(data: dict, style: Style, display_tz: str = "UTC") -> str:
     return "\n".join(lines)
 
 
+def render_progress_bar(percent, width: int = 20, style: Style = None) -> str:
+    style = style or Style(enabled=False)
+    if percent == hostinfo.UNAVAILABLE or percent is None:
+        return "[" + "?" * width + "] n/a"
+    try:
+        pct = max(0.0, min(100.0, float(percent)))
+    except (TypeError, ValueError):
+        return "[" + "?" * width + "] n/a"
+    filled = int(round(width * pct / 100))
+    color = style.RED if pct >= 90 else (style.YELLOW if pct >= 70 else style.GREEN)
+    bar = color + "#" * filled + style.RESET + "-" * (width - filled)
+    return f"[{bar}] {pct:.1f}%"
+
+
+def render_host_info(info: dict, style: Style) -> str:
+    lines = [f"{style.BOLD}{style.CYAN}=== Host System ==={style.RESET}"]
+    os_info = info["os"]
+    lines.append(f"  Hostname: {os_info['hostname']}  OS: {os_info['distribution']}  "
+                  f"Kernel: {os_info['kernel']} ({os_info['architecture']})")
+    cpu = info["cpu"]
+    lines.append(f"  CPU: {cpu['vendor']} / {cpu['model']}  "
+                  f"cores={cpu['physical_cores']} logical={cpu['logical_cpus']} "
+                  f"threads/core={cpu['threads_per_core']}")
+    mem = info["memory"]
+    usage = info["usage"]
+    lines.append(f"  Memory: {mem['total_mb']} MB total, {mem['available_mb']} MB available "
+                  f"{render_progress_bar(usage['memory_percent'], style=style)}")
+    lines.append(f"  Swap: {mem['swap_total_mb']} MB total, {mem['swap_free_mb']} MB free")
+    for d in info["disks"]:
+        lines.append(f"  Disk {d['mount_point']}: {d['used_gb']}/{d['total_gb']} GB used "
+                     f"{render_progress_bar(d['percent_used'], style=style)}")
+    up = info["uptime"]
+    lines.append(f"  Uptime: {up['uptime_seconds']}s  Load: {up['load_average']}")
+    temp = info["temperature"]
+    if temp["available"]:
+        zones = ", ".join(f"{z['type']}={z['celsius']}C" for z in temp["zones"])
+        lines.append(f"  Temperature: {zones}")
+    else:
+        lines.append(f"  Temperature: {style.DIM}unavailable ({temp['reason']}){style.RESET}")
+    for iface in info["network_interfaces"]:
+        lines.append(f"  Interface {iface['name']}: state={iface['state']} ipv4={iface['ipv4']}")
+    lines.append(f"  Host system timezone: {info['host_timezone']}")
+    return "\n".join(lines)
+
+
+def render_virtualizor_info(v_info: dict, style: Style) -> str:
+    lines = [f"{style.BOLD}{style.CYAN}=== Virtualizor ==={style.RESET}"]
+    installed = v_info["installed"]
+    color = style.GREEN if installed else style.RED
+    lines.append(f"  Installed: {color}{installed}{style.RESET}  Version: {v_info['version']}")
+    techs = v_info["virtualization_technologies"]
+    lines.append(f"  Virtualization technologies detected: {', '.join(techs) if techs else '(none detected)'}")
+    api = v_info.get("api")
+    if api:
+        if api["ok"]:
+            lines.append(f"  API: {style.GREEN}reachable{style.RESET} ({api['latency_ms']} ms)")
+        else:
+            lines.append(f"  API: {style.RED}error{style.RESET} ({api['error']})")
+    return "\n".join(lines)
+
+
+def render_analytics_summary(result: dict, style: Style) -> str:
+    lines = [f"{style.BOLD}{style.CYAN}=== Bandwidth Analytics ==={style.RESET}"]
+    lines.append(f"  Total VPS: {result['total_vps']}  Limited: {result['limited_vps_count']}  "
+                 f"Unlimited: {result['unlimited_vps_count']}  Unknown quota: {result['unknown_quota_vps_count']}")
+    lines.append(f"  Running: {result['running_count']}  Stopped/suspended: {result['stopped_count']}")
+    lines.append(f"  Limited fleet: {result['limited_used_sum_gb']} / {result['limited_quota_sum_gb']} GB used "
+                 f"(coverage {result['limited_used_sum_coverage']}), "
+                 f"{result['limited_remaining_sum_gb']} GB remaining")
+    lines.append(f"  Unlimited fleet actual usage: {result['unlimited_used_sum_gb']} GB "
+                 f"(coverage {result['unlimited_used_sum_coverage']})")
+    if result["vps_over_threshold"]:
+        lines.append(f"  {style.YELLOW}Over usage threshold: {result['vps_over_threshold']}{style.RESET}")
+    if result["top_consumers"]:
+        lines.append("  Top consumers: " + ", ".join(
+            f"vpsid={c['vpsid']} ({c['used_gb']} GB)" for c in result["top_consumers"][:5]))
+    return "\n".join(lines)
+
+
+def paginate(records: list, page: int = 1, page_size: int = 20):
+    total_pages = max(1, (len(records) + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    return records[start:start + page_size], page, total_pages
+
+
+def filter_and_sort_vps(records: list[dict], search: str = None, status_filter: str = None,
+                         sort_by: str = "vpsid") -> list[dict]:
+    out = records
+    if search:
+        s = search.lower()
+        out = [r for r in out if s in str(r.get("vpsid", "")).lower()
+               or s in str(r.get("hostname", "")).lower()]
+    if status_filter:
+        out = [r for r in out if str(r.get("status", "")).lower() == status_filter.lower()]
+    try:
+        out = sorted(out, key=lambda r: (str(r.get(sort_by, "")) if sort_by not in
+                     ("vpsid",) else r.get(sort_by, 0)))
+    except TypeError:
+        pass
+    return out
+
+
+def render_vps_table(records: list[dict], style: Style) -> str:
+    if not records:
+        return f"  {style.DIM}(no VPS records -- run an inventory sync first){style.RESET}"
+    header = f"  {'VPSID':>7}  {'HOSTNAME':<24}  {'STATUS':<10}  {'QUOTA_GB':>10}  {'USED_GB':>10}"
+    lines = [style.BOLD + header + style.RESET]
+    for r in records:
+        lines.append(f"  {r['vpsid']:>7}  {str(r.get('hostname'))[:24]:<24}  "
+                     f"{str(r.get('status'))[:10]:<10}  {str(r.get('quota_gb')):>10}  "
+                     f"{str(r.get('used_gb')):>10}")
+    return "\n".join(lines)
+
+
 # ---------- menu actions ---------------------------------------------------------------------
 
 def _confirm(prompt: str) -> bool:
@@ -464,13 +642,99 @@ def action_uninstall():
     renewal_cli.cmd_uninstall(argparse.Namespace(purge=purge))
 
 
+def action_system_info(style: Style):
+    print(render_host_info(hostinfo.collect_host_info(), style))
+    v_info = {
+        "installed": vinfo.detect_virtualizor_installed(),
+        "version": vinfo.detect_virtualizor_version(),
+        "virtualization_technologies": vinfo.detect_virtualization_technologies(),
+        "api": None,
+    }
+    node_id = "self"
+    try:
+        import credentials as creds_mod
+        path = creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, node_id)
+        if os.path.exists(path):
+            creds = creds_mod.load_credentials(path)
+            v_info["api"] = vinfo.probe_api_latency(creds)
+    except Exception:
+        pass
+    print(render_virtualizor_info(v_info, style))
+
+
+def _inventory_db_path() -> str:
+    return os.path.join(renewal_cli.STATE_DIR, "inventory.sqlite3")
+
+
+def action_inventory_sync(node_id: str = "self"):
+    import credentials as creds_mod
+    path = creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, node_id)
+    if not os.path.exists(path):
+        print(f"No stored credentials for node '{node_id}' -- configure them first.")
+        return
+    creds = creds_mod.load_credentials(path)
+    conn = inv.open_db(_inventory_db_path())
+    result = isync.run_inventory_sync(conn, node_id, creds, renewal_cli.STATE_DIR)
+    if result["status"] == "OK":
+        d = result["diff"]
+        print(f"Inventory sync OK: +{d['added_count']} added, -{d['removed_count']} removed, "
+              f"{d['modified_count']} modified.")
+        if d["quota_changed"]:
+            print(f"  Quota changes detected on vpsid: {d['quota_changed']}")
+    elif result["status"] == "ALREADY_RUNNING":
+        print("An inventory sync is already running -- try again shortly.")
+    elif result["status"] == "PARTIAL":
+        print(f"Sync returned a PARTIAL/incomplete response ({result['error']}) -- "
+              f"not treated as a change, previous snapshot kept as current.")
+    else:
+        print(f"Inventory sync ERROR: {result['error']}")
+
+
+def action_inventory_view(style: Style, node_id: str = "self"):
+    conn = inv.open_db(_inventory_db_path())
+    records = inv.latest_records(conn, node_id)
+    settings = load_dashboard_settings(renewal_cli.CONFIG_DIR)
+    threshold = Decimal(settings["usage_threshold_percent"])
+    print(render_vps_table(records, style))
+    print()
+    print(render_analytics_summary(
+        analytics.compute_bandwidth_analytics(records, usage_threshold_percent=threshold), style))
+    sync_info = inv.last_sync_info(conn, node_id)
+    state = isync.load_sync_state(renewal_cli.STATE_DIR)
+    freshness = isync.classify_freshness(
+        sync_info["captured_at"] if sync_info else None, state["last_attempt_status"],
+        settings["refresh_interval_minutes"])
+    print(f"\n  Snapshot freshness: {freshness}")
+
+
+def action_configure_dashboard_settings():
+    settings = load_dashboard_settings(renewal_cli.CONFIG_DIR)
+    try:
+        refresh = input(f"Dashboard refresh interval in minutes "
+                         f"[{settings['refresh_interval_minutes']}]: ").strip() \
+                  or settings["refresh_interval_minutes"]
+        threshold = input(f"Usage alert threshold percent "
+                           f"[{settings['usage_threshold_percent']}]: ").strip() \
+                    or settings["usage_threshold_percent"]
+        save_dashboard_settings(renewal_cli.CONFIG_DIR, refresh_interval_minutes=refresh,
+                                 usage_threshold_percent=threshold)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+    print("Dashboard settings updated.")
+
+
 MENU_ITEMS = [
     ("Install / Initial Setup", action_install),
     ("Dashboard", None),  # needs style, wired specially below
+    ("System & Virtualizor information", None),  # needs style, wired specially below
+    ("Sync VPS inventory (read-only)", action_inventory_sync),
+    ("View VPS inventory & analytics", None),  # needs style, wired specially below
     ("Configure/rotate Virtualizor API credentials", lambda: renewal_cli.cmd_store_credentials(
         argparse.Namespace(node=input("Node id: ").strip() or "self"))),
     ("Configure monthly gift (GB, 0 is valid)", action_configure_gift),
     ("Configure monitor/apply/notifier intervals", action_configure_intervals),
+    ("Configure dashboard refresh interval & usage threshold", action_configure_dashboard_settings),
     ("Configure display timezone (default Asia/Tehran)", action_configure_timezone),
     ("Enable automatic renewal", lambda: action_toggle_auto_renewal(True)),
     ("Disable automatic renewal", lambda: action_toggle_auto_renewal(False)),
@@ -489,13 +753,18 @@ def run_menu():
               "or run this in a real terminal for the management menu.")
         return 1
     while True:
-        print(f"\n{style.BOLD}{style.CYAN}Tixo Renewal v{renewal_cli.VERSION}{style.RESET}")
+        print(f"{style.CYAN}{BANNER}{style.RESET}")
+        print(f"{style.BOLD}{style.CYAN}Tixo Renewal v{renewal_cli.VERSION}{style.RESET}")
         for i, (label, _) in enumerate(MENU_ITEMS, 1):
             print(f"  {i}. {label}")
-        print(f"  0. Exit")
+        print(f"  0. Exit  (h for help)")
         choice = input("Choose an option: ").strip()
         if choice == "0":
             return 0
+        if choice.lower() == "h":
+            print("Navigate by number. 0 exits. Dangerous actions (uninstall, restore) "
+                  "require an explicit typed confirmation. No credential is ever printed.")
+            continue
         try:
             idx = int(choice) - 1
             label, fn = MENU_ITEMS[idx]
@@ -505,6 +774,10 @@ def run_menu():
         try:
             if label == "Dashboard":
                 action_dashboard(style)
+            elif label == "System & Virtualizor information":
+                action_system_info(style)
+            elif label == "View VPS inventory & analytics":
+                action_inventory_view(style)
             else:
                 fn()
         except Exception as e:

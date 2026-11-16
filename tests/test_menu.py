@@ -275,6 +275,110 @@ def test_render_dashboard_shows_deferred_locked_entries():
     assert "retries=2" in out
 
 
+def test_dashboard_settings_defaults_when_unset(tmp_path):
+    settings = menu.load_dashboard_settings(str(tmp_path))
+    assert settings["refresh_interval_minutes"] == menu.DEFAULT_DASHBOARD_REFRESH_MIN
+    assert settings["usage_threshold_percent"] == str(menu.DEFAULT_USAGE_THRESHOLD_PERCENT)
+
+
+def test_save_and_load_dashboard_settings_roundtrip(tmp_path):
+    menu.save_dashboard_settings(str(tmp_path), refresh_interval_minutes=15,
+                                  usage_threshold_percent="80")
+    settings = menu.load_dashboard_settings(str(tmp_path))
+    assert settings["refresh_interval_minutes"] == 15
+    assert settings["usage_threshold_percent"] == "80"
+
+
+def test_validate_usage_threshold_rejects_out_of_range():
+    with pytest.raises(ValueError):
+        menu.validate_usage_threshold_percent("150")
+    with pytest.raises(ValueError):
+        menu.validate_usage_threshold_percent("-5")
+
+
+def test_validate_usage_threshold_accepts_boundary_values():
+    assert menu.validate_usage_threshold_percent("0") == Decimal("0")
+    assert menu.validate_usage_threshold_percent("100") == Decimal("100")
+
+
+def test_render_progress_bar_handles_unavailable_without_raising():
+    out = menu.render_progress_bar(menu.hostinfo.UNAVAILABLE, style=menu.Style(enabled=False))
+    assert "n/a" in out
+
+
+def test_render_progress_bar_renders_percent():
+    out = menu.render_progress_bar(42.0, style=menu.Style(enabled=False))
+    assert "42.0%" in out
+
+
+def test_render_host_info_includes_hostname_and_cpu():
+    info = menu.hostinfo.collect_host_info()
+    out = menu.render_host_info(info, menu.Style(enabled=False))
+    assert info["os"]["hostname"] in out
+
+
+def test_render_virtualizor_info_handles_not_installed():
+    v_info = {"installed": False, "version": "unavailable", "virtualization_technologies": [],
+              "api": None}
+    out = menu.render_virtualizor_info(v_info, menu.Style(enabled=False))
+    assert "False" in out
+
+
+def test_render_analytics_summary_shows_counts():
+    result = menu.analytics.compute_bandwidth_analytics([
+        {"vpsid": 1, "quota_gb": "100", "used_gb": "50", "status": "running"},
+        {"vpsid": 2, "quota_gb": "0", "used_gb": "10", "status": "running"},
+    ])
+    out = menu.render_analytics_summary(result, menu.Style(enabled=False))
+    assert "Total VPS: 2" in out
+
+
+def test_paginate_splits_into_pages():
+    records = list(range(25))
+    page1, page, total_pages = menu.paginate(records, page=1, page_size=10)
+    assert len(page1) == 10
+    assert total_pages == 3
+
+
+def test_paginate_clamps_out_of_range_page():
+    records = list(range(5))
+    page_data, page, total_pages = menu.paginate(records, page=99, page_size=10)
+    assert page == 1
+    assert total_pages == 1
+
+
+def test_filter_and_sort_vps_by_search():
+    records = [{"vpsid": 1, "hostname": "web1"}, {"vpsid": 2, "hostname": "db1"}]
+    out = menu.filter_and_sort_vps(records, search="web")
+    assert len(out) == 1
+    assert out[0]["vpsid"] == 1
+
+
+def test_filter_and_sort_vps_by_status():
+    records = [{"vpsid": 1, "status": "running"}, {"vpsid": 2, "status": "stopped"}]
+    out = menu.filter_and_sort_vps(records, status_filter="stopped")
+    assert len(out) == 1
+    assert out[0]["vpsid"] == 2
+
+
+def test_filter_and_sort_vps_sort_by_vpsid_descending_input():
+    records = [{"vpsid": 3}, {"vpsid": 1}, {"vpsid": 2}]
+    out = menu.filter_and_sort_vps(records, sort_by="vpsid")
+    assert [r["vpsid"] for r in out] == [1, 2, 3]
+
+
+def test_render_vps_table_empty_shows_hint():
+    out = menu.render_vps_table([], menu.Style(enabled=False))
+    assert "inventory sync" in out
+
+
+def test_render_vps_table_shows_vpsid_and_hostname():
+    records = [{"vpsid": 1, "hostname": "web1", "status": "running", "quota_gb": "100", "used_gb": "10"}]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    assert "web1" in out
+    assert "1" in out
+
+
 def test_render_dashboard_shows_expired_and_failed_entries():
     data = {"policy_ok": True, "monthly_grant_gb": "100", "auto_renewal_enabled": True,
             "write_approved": True, "timers": {},

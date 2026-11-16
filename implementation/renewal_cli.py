@@ -20,7 +20,7 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
 # apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
@@ -890,6 +890,79 @@ def cmd_resolve_operation(args):
 
 # ---------- CLI wiring ----------
 
+def cmd_hostinfo(args):
+    """Read-only host hardware/OS report, noninteractive. Never touches Virtualizor or any
+    VPS -- see implementation/hostinfo.py for what "unavailable" vs "unsupported" vs
+    "permission_denied" means for each field."""
+    import hostinfo as hostinfo_mod
+    info = hostinfo_mod.collect_host_info()
+    import json
+    print(json.dumps(info, indent=2, default=str))
+    return 0
+
+
+def cmd_virtualizor_info(args):
+    """Read-only Virtualizor installation/version/API-connectivity report, noninteractive."""
+    import virtualizor_info as vinfo_mod
+    report = {
+        "installed": vinfo_mod.detect_virtualizor_installed(),
+        "version": vinfo_mod.detect_virtualizor_version(),
+        "virtualization_technologies": vinfo_mod.detect_virtualization_technologies(),
+    }
+    if getattr(args, "node", None):
+        path = creds_mod.default_credentials_path(CONFIG_DIR, args.node)
+        if os.path.exists(path):
+            stored = creds_mod.load_credentials(path)
+            report["api"] = vinfo_mod.probe_api_latency(stored)
+    import json
+    print(json.dumps(report, indent=2, default=str))
+    return 0
+
+
+def cmd_inventory_sync(args):
+    """One read-only, rate-limited, non-overlapping VPS inventory refresh. Never writes to
+    Virtualizor, never touches WRITE_APPROVED, never shares a lock/retry-budget with the
+    renewal engine's own apply path."""
+    import inventory as inv_mod
+    import inventory_sync as isync_mod
+    path = creds_mod.default_credentials_path(CONFIG_DIR, args.node)
+    try:
+        stored = creds_mod.load_credentials(path)
+    except (FileNotFoundError, creds_mod.CredentialSecurityError) as e:
+        print(f"Cannot load stored credentials: {e}")
+        return 1
+    conn = inv_mod.open_db(os.path.join(STATE_DIR, "inventory.sqlite3"))
+    result = isync_mod.run_inventory_sync(conn, args.node, stored, STATE_DIR)
+    print(f"status={result['status']}")
+    if result["status"] == "OK":
+        d = result["diff"]
+        print(f"added={d['added_count']} removed={d['removed_count']} modified={d['modified_count']}")
+        if d["quota_changed"]:
+            print(f"quota_changed_vpsid={d['quota_changed']}")
+        return 0
+    if result.get("error"):
+        import writer as writer_mod
+        print(f"detail={writer_mod.redact_url_patterns(str(result['error']))}")
+    return 0 if result["status"] in ("OK", "ALREADY_RUNNING") else 1
+
+
+def cmd_inventory_status(args):
+    """Read-only summary of the inventory snapshot database -- last sync time, record count,
+    freshness classification. Never touches the renewal ledger."""
+    import inventory as inv_mod
+    import inventory_sync as isync_mod
+    conn = inv_mod.open_db(os.path.join(STATE_DIR, "inventory.sqlite3"))
+    sync_info = inv_mod.last_sync_info(conn, args.node)
+    state = isync_mod.load_sync_state(STATE_DIR)
+    freshness = isync_mod.classify_freshness(
+        sync_info["captured_at"] if sync_info else None, state["last_attempt_status"],
+        isync_mod.DEFAULT_REFRESH_INTERVAL_MIN)
+    print(f"freshness={freshness}")
+    print(f"last_sync={sync_info}")
+    print(f"last_attempt_status={state['last_attempt_status']}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="renewal_cli.py")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -948,6 +1021,20 @@ def main():
     apply_due_p.add_argument("--node", required=True)
     apply_due_p.add_argument("--non-interactive", action="store_true")
     apply_due_p.set_defaults(func=cmd_apply_due)
+
+    sub.add_parser("hostinfo").set_defaults(func=cmd_hostinfo)
+
+    vinfo_p = sub.add_parser("virtualizor-info")
+    vinfo_p.add_argument("--node")
+    vinfo_p.set_defaults(func=cmd_virtualizor_info)
+
+    inv_sync_p = sub.add_parser("inventory-sync")
+    inv_sync_p.add_argument("--node", required=True)
+    inv_sync_p.set_defaults(func=cmd_inventory_sync)
+
+    inv_status_p = sub.add_parser("inventory-status")
+    inv_status_p.add_argument("--node", required=True)
+    inv_status_p.set_defaults(func=cmd_inventory_status)
 
     resolve_p = sub.add_parser("resolve-operation")
     resolve_p.add_argument("--node", required=True)
