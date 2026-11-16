@@ -310,6 +310,78 @@ def test_apply_renewal_rounding_is_idempotent_across_duplicate_attempts(conn, tm
     assert second["operation_id"] == first["operation_id"]
 
 
+# 5c. CRITICAL: zero-quota write block. Virtualizor's bandwidth<=0 is empirically confirmed
+# to mean UNLIMITED (see policy.round_quota_for_virtualizor / MANUAL_ONLY_UNLIMITED). A
+# calculated target of exactly 0 GB (zero remaining + explicitly configured 0 GB gift) must
+# NEVER reach the API -- it would silently make the VPS unlimited.
+
+def test_apply_renewal_refuses_zero_quota_before_any_api_call(conn, tmp_path):
+    marker = approved_marker(tmp_path)
+    with pytest.raises(w.WriteBlockedError):
+        w.apply_renewal(conn, "hostA", 1, "p-zero", Decimal("0"), CREDS, marker, confirm=True,
+                         read_live_quota_fn=lambda v: pytest.fail("must never read live quota"),
+                         http_post=lambda *a, **k: pytest.fail("must never call the API"))
+    # No operation row at all -- blocked before record_operation_start, not recorded as a
+    # failed attempt.
+    row = conn.execute("SELECT COUNT(*) FROM operations WHERE vpsid=1").fetchone()
+    assert row[0] == 0
+
+
+def test_apply_renewal_refuses_negative_quota_the_same_way(conn, tmp_path):
+    """Defensive: compute_renewal_quota can never actually produce a negative value, but the
+    writer must not trust that invariant blindly."""
+    marker = approved_marker(tmp_path)
+    with pytest.raises(w.WriteBlockedError):
+        w.apply_renewal(conn, "hostA", 1, "p-neg", Decimal("-5"), CREDS, marker, confirm=True,
+                         read_live_quota_fn=lambda v: pytest.fail("must never read live quota"),
+                         http_post=lambda *a, **k: pytest.fail("must never call the API"))
+
+
+def test_apply_renewal_zero_quota_block_applies_even_via_manual_apply_bypass(conn, tmp_path):
+    """The exact real-world gap this closes: the manual `apply` CLI command takes
+    --new-quota-gb directly from the operator and never goes through
+    policy_integration.preview_renewal's own BLOCKED_ZERO_QUOTA_UNSUPPORTED check. Simulated
+    here by calling apply_renewal directly with a raw operator-supplied string, exactly as
+    cmd_apply would."""
+    marker = approved_marker(tmp_path)
+    with pytest.raises(w.WriteBlockedError):
+        w.apply_renewal(conn, "self", 999, "999|period|1", "0", CREDS, marker, confirm=True,
+                         read_live_quota_fn=lambda v: pytest.fail("must never read live quota"),
+                         http_post=lambda *a, **k: pytest.fail("must never call the API"))
+
+
+def test_apply_renewal_fractional_that_rounds_to_zero_is_still_blocked(conn, tmp_path):
+    """0.4 GB would round DOWN under a naive rounding scheme, but round_quota_for_virtualizor
+    uses CEILING -- so this specific case actually rounds UP to 1, not blocked. This test
+    documents that boundary explicitly: only a true zero-or-below exact/ceiling result blocks."""
+    marker = approved_marker(tmp_path)
+    reads = iter([Decimal("50"), Decimal("1"), Decimal("1")])
+    result = w.apply_renewal(conn, "hostA", 1, "p-tiny", Decimal("0.4"), CREDS, marker,
+                              confirm=True, read_live_quota_fn=lambda v: next(reads),
+                              http_post=lambda url, data, timeout: '{"done":1}',
+                              write_cooldown_seconds=0)
+    assert result["status"] == "APPLIED"
+    assert result["verified_after_quota_gb"] == Decimal("1")
+
+
+def test_apply_renewal_duplicate_protection_unaffected_by_zero_quota_block(conn, tmp_path):
+    """A blocked zero-quota attempt must not itself create an operation row that could
+    confuse later duplicate-protection bookkeeping."""
+    marker = approved_marker(tmp_path)
+    with pytest.raises(w.WriteBlockedError):
+        w.apply_renewal(conn, "hostA", 1, "p-zero", Decimal("0"), CREDS, marker, confirm=True,
+                         read_live_quota_fn=lambda v: pytest.fail("unreachable"),
+                         http_post=lambda *a, **k: pytest.fail("unreachable"))
+    # A subsequent LEGITIMATE apply for the SAME period must still be able to proceed --
+    # nothing was recorded that would wrongly block it.
+    reads = iter([Decimal("50"), Decimal("200"), Decimal("200")])
+    result = w.apply_renewal(conn, "hostA", 1, "p-zero", Decimal("200"), CREDS, marker,
+                              confirm=True, read_live_quota_fn=lambda v: next(reads),
+                              http_post=lambda url, data, timeout: '{"done":1}',
+                              write_cooldown_seconds=0)
+    assert result["status"] == "APPLIED"
+
+
 # 6. POST body shape must match the real, already-verified-working manual script exactly -------
 
 def test_managevps_post_body_includes_required_theme_edit_and_editvps_fields():

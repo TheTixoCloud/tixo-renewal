@@ -99,6 +99,32 @@ def test_normal_consumption_is_not_a_reset():
     assert "did not decrease" in p.reasons[0]
 
 
+# 2b. Business rule item 5: exhaustion/overrun ALONE (flat, no observed drop) is never proof
+# of a reset -- only a genuine pre/post drop within the verified timing window counts.
+
+def test_vps_sitting_exactly_at_full_quota_with_no_drop_is_not_a_reset():
+    eng = CarryoverEngine(fixed_reset_keys=set())
+    eng.ingest_event(ev("VPS_ADDED", 1, "100", "T0", "T1"))
+    eng.ingest_event(ev("QUOTA_CHANGE", 1, "100", "T1", "T2", old_q=5000, new_q=5000))
+    # Fully exhausted (used == quota) but FLAT across two observations -- no drop at all.
+    eng.ingest_event(ev("USAGE_DROP_REVIEW", 1, "100", "T2", "T3", old_q=5000, new_q=5000, old_u=5000, new_u=5000))
+    p = eng.get_proposals()[1]
+    assert p.status.startswith("REJECTED")
+    assert "did not decrease" in p.reasons[0]
+
+
+def test_vps_sitting_slightly_over_quota_with_no_drop_is_not_a_reset():
+    """Slight overrun (Virtualizor accounting slop) sitting flat must never, by itself, be
+    mistaken for a reset -- it still needs an actual observed drop."""
+    eng = CarryoverEngine(fixed_reset_keys=set())
+    eng.ingest_event(ev("VPS_ADDED", 1, "100", "T0", "T1"))
+    eng.ingest_event(ev("QUOTA_CHANGE", 1, "100", "T1", "T2", old_q=5000, new_q=5000))
+    eng.ingest_event(ev("USAGE_DROP_REVIEW", 1, "100", "T2", "T3", old_q=5000, new_q=5000, old_u=5001, new_u=5002))
+    p = eng.get_proposals()[1]
+    assert p.status.startswith("REJECTED")
+    assert "did not decrease" in p.reasons[0]
+
+
 # 3. Monthly reset ----------------------------------------------------------
 
 def test_monthly_reset_no_prior_purchases():

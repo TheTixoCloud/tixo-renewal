@@ -67,6 +67,21 @@ def preview_renewal(policy_config: pol.PolicyConfig, node_id: str, vpsid: int,
                           f"must be handled manually regardless of policy or "
                           f"auto_renewal_enabled"}
 
+    # Evidence-preservation only -- does NOT change the calculation. Slight USED>quota overrun
+    # is expected Virtualizor accounting slop (confirmed business rule: never treated as
+    # corruption or a reason to subtract from the gift; compute_renewal_quota already clamps
+    # remaining to zero regardless of overrun size). An ANOMALOUSLY LARGE overrun is still
+    # clamped the same way (never blocks or alters the formula) but is flagged here for a
+    # human to review, since it could indicate a genuine data problem worth investigating
+    # separately from the renewal itself. Threshold is a deliberately conservative, documented
+    # DEFAULT judgment call (not a proven business rule) -- mirrors the same style already
+    # used by engine.py's reset-vs-not-reset heuristic (absolute-or-relative combination).
+    overrun_gb = (old_used - old_quota) if (old_used is not None and old_used > old_quota) else Decimal(0)
+    OVERRUN_ANOMALY_ABS_GB = Decimal("50")
+    OVERRUN_ANOMALY_REL = Decimal("0.05")  # 5% of quota
+    overrun_anomaly_flag = overrun_gb > 0 and (
+        overrun_gb > OVERRUN_ANOMALY_ABS_GB or overrun_gb > old_quota * OVERRUN_ANOMALY_REL)
+
     p = pol.resolve_policy(policy_config, node_id, vpsid)
 
     if p.excluded:
@@ -101,6 +116,31 @@ def preview_renewal(policy_config: pol.PolicyConfig, node_id: str, vpsid: int,
     # 2026-11-15 incident). The pre-rounding exact calculation is preserved below for audit.
     proposed_quota = pol.round_quota_for_virtualizor(exact_proposed_quota)
 
+    # CRITICAL, unconditional, checked before any other status (even PREVIEW_ONLY) --
+    # Virtualizor's bandwidth<=0 is empirically confirmed to mean UNLIMITED on this platform
+    # (see the MANUAL_ONLY_UNLIMITED check above and writer.apply_renewal's matching guard).
+    # A calculated target of exactly 0 GB (only reachable when remaining==0 AND the configured
+    # gift is explicitly 0) must NEVER be written as-is -- doing so would silently make the
+    # VPS unlimited, the exact opposite of a "0 GB gift" / "no further allowance" intent. This
+    # is a genuine platform representation gap, not something this code can safely resolve by
+    # guessing an alternative (e.g. a 1GB floor) -- that would be a NEW business rule this
+    # function has no authorization to invent. Block and report instead.
+    if proposed_quota is not None and proposed_quota <= 0:
+        return {
+            "vpsid": vpsid, "status": "BLOCKED_ZERO_QUOTA_UNSUPPORTED", "policy_source": p.source,
+            "detail": f"calculated target is {proposed_quota} GB (remaining=0 and configured "
+                      f"monthly_grant_gb={p.monthly_grant_gb}); Virtualizor cannot represent a "
+                      f"0 GB bandwidth LIMIT distinctly from UNLIMITED (bandwidth<=0) -- this "
+                      f"would NOT apply a zero allowance, it would remove the limit entirely. "
+                      f"Blocked structurally. Needs an explicitly-approved decision (e.g. a "
+                      f"minimum floor above 0, or manual handling) before this VPS's period "
+                      f"can ever be applied.",
+            "exact_calculated_quota_gb": str(exact_proposed_quota),
+            "old_quota_gb": str(old_quota), "old_used_gb": str(old_used),
+            "monthly_grant_gb": str(p.monthly_grant_gb),
+            "overrun_gb": str(overrun_gb), "overrun_anomaly_flag": overrun_anomaly_flag,
+        }
+
     if not p.auto_renewal_enabled:
         status = "PREVIEW_ONLY_AUTO_RENEWAL_DISABLED"
     elif eligible:
@@ -118,6 +158,7 @@ def preview_renewal(policy_config: pol.PolicyConfig, node_id: str, vpsid: int,
         "carryover_cap_gb": str(p.carryover_cap_gb) if p.carryover_cap_gb is not None else "unlimited",
         "proposed_new_quota_gb": str(proposed_quota),
         "exact_calculated_quota_gb": str(exact_proposed_quota),  # pre-rounding, audit only
+        "overrun_gb": str(overrun_gb), "overrun_anomaly_flag": overrun_anomaly_flag,
         "initial_grant_note": initial_grant_note,
         "auto_renewal_enabled": p.auto_renewal_enabled,
     }

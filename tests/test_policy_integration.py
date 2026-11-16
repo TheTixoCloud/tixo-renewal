@@ -87,7 +87,13 @@ def test_zero_monthly_grant_host_preview(tmp_path):
                                  Decimal("1000"), Decimal("200"),
                                  iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
     assert result["monthly_grant_gb"] == "0"
-    assert result["proposed_new_quota_gb"] == "0"  # carryover disabled + 0 grant = 0, not 100
+    # UPDATED (2026-11-16): a calculated 0 is correctly no longer reported as a normal
+    # writable "0" -- see BLOCKED_ZERO_QUOTA_UNSUPPORTED (Virtualizor's bandwidth<=0 means
+    # UNLIMITED, so writing 0 here would remove the limit, not "grant zero"). The original
+    # math (carryover disabled + 0 grant = 0, not 100) is still correct and still visible via
+    # exact_calculated_quota_gb -- only the write-eligibility status changed.
+    assert result["status"] == "BLOCKED_ZERO_QUOTA_UNSUPPORTED"
+    assert result["exact_calculated_quota_gb"] == "0"
 
 
 # 4. No verified epoch and no explicit anchor -> fail closed -------------------------------------
@@ -239,3 +245,94 @@ def test_preview_proposed_quota_unchanged_for_exact_integer_result(tmp_path):
                                  iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
     assert result["proposed_new_quota_gb"] == "200"
     assert result["exact_calculated_quota_gb"] == "200"
+
+
+# 10. CRITICAL: zero-quota write block -- Virtualizor's bandwidth<=0 means UNLIMITED, so a
+# calculated target of exactly 0 GB (remaining=0 AND configured gift=0) must never be treated
+# as a normal writable candidate, even with auto_renewal_enabled=True.
+
+def test_zero_gift_and_zero_remaining_blocks_as_zero_quota_unsupported_not_plausible(tmp_path):
+    cfg = make_config(tmp_path, auto_renewal_enabled=True, monthly_grant_gb="0")
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("5000"), Decimal("5000"),  # exact exhaustion
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert result["status"] == "BLOCKED_ZERO_QUOTA_UNSUPPORTED"
+    assert result["status"] != "PLAUSIBLE_RENEWAL_CANDIDATE"
+    assert result["exact_calculated_quota_gb"] == "0"
+
+
+def test_zero_gift_with_slight_overrun_also_blocks_not_applies(tmp_path):
+    cfg = make_config(tmp_path, auto_renewal_enabled=True, monthly_grant_gb="0")
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("5000"), Decimal("5001"),  # 1 GB overrun
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert result["status"] == "BLOCKED_ZERO_QUOTA_UNSUPPORTED"
+
+
+def test_zero_gift_but_nonzero_remaining_is_not_blocked(tmp_path):
+    """Only an actual zero RESULT blocks -- a 0 GB gift with real remaining balance is a
+    perfectly normal, applicable renewal."""
+    cfg = make_config(tmp_path, auto_renewal_enabled=True, monthly_grant_gb="0")
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("5000"), Decimal("4000"),
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert result["status"] == "PLAUSIBLE_RENEWAL_CANDIDATE"
+    assert result["proposed_new_quota_gb"] == "1000"  # 1000 remaining + 0 gift
+
+
+def test_zero_quota_block_takes_priority_even_when_auto_renewal_disabled(tmp_path):
+    """Must surface even in preview-only mode -- an operator should see this blocker before
+    ever enabling auto-renewal for this VPS, not discover it only after flipping the flag."""
+    cfg = make_config(tmp_path, auto_renewal_enabled=False, monthly_grant_gb="0")
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("5000"), Decimal("5000"),
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert result["status"] == "BLOCKED_ZERO_QUOTA_UNSUPPORTED"
+
+
+def test_unlimited_vps_stays_manual_only_regardless_of_gift_value(tmp_path):
+    """Item 9: gift settings (including 0) must never affect the unlimited-VPS exclusion."""
+    for gift in ("0", "100", "9999"):
+        cfg = make_config(tmp_path, auto_renewal_enabled=True, monthly_grant_gb=gift)
+        result = pi.preview_renewal(cfg, "hostA", 1, None, None,
+                                     Decimal("0"), Decimal("0"),
+                                     iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+        assert result["status"] == "MANUAL_ONLY_UNLIMITED"
+
+
+# 11. Overrun anomaly evidence flag -- additive, non-blocking, never changes the calculation.
+
+def test_small_overrun_is_not_flagged_as_anomaly(tmp_path):
+    cfg = make_config(tmp_path, auto_renewal_enabled=True)
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("5000"), Decimal("5001"),  # 1 GB over, trivial
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert result["overrun_gb"] == "1"
+    assert result["overrun_anomaly_flag"] is False
+    assert result["proposed_new_quota_gb"] == "100"  # calculation unaffected either way
+
+
+def test_large_overrun_is_flagged_as_anomaly_but_calculation_unaffected(tmp_path):
+    cfg = make_config(tmp_path, auto_renewal_enabled=True)
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("5000"), Decimal("10000"),  # 5000 GB over -- extreme
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert result["overrun_gb"] == "5000"
+    assert result["overrun_anomaly_flag"] is True
+    assert result["proposed_new_quota_gb"] == "100"  # still just clamped + gift, never blocked
+
+
+def test_no_overrun_reports_zero_not_negative(tmp_path):
+    cfg = make_config(tmp_path, auto_renewal_enabled=True)
+    created = int(datetime(2026, 9, 15, tzinfo=timezone.utc).timestamp())
+    result = pi.preview_renewal(cfg, "hostA", 1, created, iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+                                 Decimal("5000"), Decimal("1000"),
+                                 iso(datetime(2026, 10, 15, tzinfo=timezone.utc)))
+    assert result["overrun_gb"] == "0"
+    assert result["overrun_anomaly_flag"] is False

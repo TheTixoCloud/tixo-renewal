@@ -259,3 +259,64 @@ def test_round_quota_respects_carryover_cap_before_rounding():
     exact = pol.compute_renewal_quota(p, Decimal("10000"), Decimal("1"))  # remaining >> cap
     assert exact == Decimal("600.5")  # 500.5 cap + 100 grant
     assert pol.round_quota_for_virtualizor(exact) == Decimal("601")
+
+
+# 8. Business-rule worked examples (exhausted quota, slight overrun, configurable gift
+# including explicit 0) -- verbatim from the confirmed business requirements.
+
+def _policy(gift_gb, carryover_enabled=True, cap=None):
+    return pol.Policy(initial_allocation_gb=Decimal(str(gift_gb)), monthly_grant_gb=Decimal(str(gift_gb)),
+                       carryover_enabled=carryover_enabled, carryover_cap_gb=cap,
+                       billing_anchor="verified_creation", explicit_anchor_epoch=None,
+                       auto_renewal_enabled=True, excluded=False, source="global")
+
+
+def test_example_exact_exhaustion_gift_100():
+    assert pol.compute_renewal_quota(_policy(100), Decimal("5000"), Decimal("5000")) == Decimal("100")
+
+
+def test_example_slight_overrun_gift_100_never_subtracts_the_overrun():
+    """Quota 5000, USED 5001 (1 GB over) -> 100 GB, NOT 99 GB."""
+    result = pol.compute_renewal_quota(_policy(100), Decimal("5000"), Decimal("5001"))
+    assert result == Decimal("100")
+    assert result != Decimal("99")
+
+
+def test_example_remaining_balance_preserved_gift_100():
+    assert pol.compute_renewal_quota(_policy(100), Decimal("5000"), Decimal("4000")) == Decimal("1100")
+
+
+def test_example_exact_exhaustion_gift_zero():
+    """Explicit 0 GB gift is valid and must be preserved -- mathematical result is 0, not
+    silently replaced by 100 or any other default."""
+    result = pol.compute_renewal_quota(_policy(0), Decimal("5000"), Decimal("5000"))
+    assert result == Decimal("0")
+
+
+def test_example_slight_overrun_gift_zero_still_clamps_not_negative():
+    result = pol.compute_renewal_quota(_policy(0), Decimal("5000"), Decimal("5001"))
+    assert result == Decimal("0")
+    assert result >= Decimal("0")
+
+
+def test_gift_of_zero_is_not_falsy_replaced_in_policy_override_parsing():
+    """REGRESSION-STYLE GUARD: PolicyOverride.from_dict must use 'in dict', never
+    dict.get(key, default) or truthiness, so an explicit 0 is never confused with 'not
+    configured'."""
+    ov = pol.PolicyOverride.from_dict({"monthly_grant_gb": "0"})
+    assert ov.monthly_grant_gb == Decimal("0")
+    assert ov.monthly_grant_gb is not None
+
+
+def test_gift_of_zero_survives_full_three_tier_resolution(tmp_path):
+    data = {"schema_version": 1, "global_defaults": base_global(monthly_grant_gb="100"),
+            "vps_overrides": {"hostA:1": {"monthly_grant_gb": "0"}}}
+    cfg = pol.load_policy_config(write_config(tmp_path, data))
+    p = pol.resolve_policy(cfg, "hostA", 1)
+    assert p.monthly_grant_gb == Decimal("0")
+
+
+def test_gift_of_zero_global_default_is_valid_and_not_rejected(tmp_path):
+    data = {"schema_version": 1, "global_defaults": base_global(monthly_grant_gb="0")}
+    cfg = pol.load_policy_config(write_config(tmp_path, data))  # must not raise
+    assert cfg.global_defaults.monthly_grant_gb == Decimal("0")

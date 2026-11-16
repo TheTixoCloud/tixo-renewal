@@ -435,6 +435,21 @@ def apply_renewal(conn, node_id: str, vpsid: int, period_key: str, new_quota_gb,
     # read-back correctly refused to call it APPLIED). Rounding here closes it for every
     # caller, present and future, without relying on each one remembering to round first.
     new_quota_gb = policy_mod.round_quota_for_virtualizor(new_quota_gb)
+    # CRITICAL, unconditional structural guard: Virtualizor's bandwidth<=0 is empirically
+    # confirmed to mean UNLIMITED (see MANUAL_ONLY_UNLIMITED detection and
+    # policy_integration.preview_renewal's matching check). Writing a calculated 0 GB target
+    # (e.g. a VPS with zero remaining balance and an explicitly configured 0 GB gift) would
+    # silently make the VPS unlimited -- the opposite of the intended "no further allowance."
+    # This is the SAME shared choke point the fractional-rounding fix uses, so it protects the
+    # manual `apply` CLI path too, which bypasses preview_renewal's own check entirely. A
+    # programming/configuration error if reached with confirm=True, not a recoverable outcome
+    # -- there is no safe alternative value this function is authorized to substitute.
+    if new_quota_gb <= 0:
+        raise WriteBlockedError(
+            f"refusing to write bandwidth={new_quota_gb} GB: on this platform, a value <=0 "
+            f"means UNLIMITED, not 'zero allowance' -- this would remove the VPS's bandwidth "
+            f"limit entirely. Blocked structurally; requires an explicitly-approved "
+            f"alternative (e.g. a minimum floor above 0) before any write can proceed.")
     if not is_write_approved(approval_marker_path):
         raise WriteBlockedError(f"write not approved: {approval_marker_path} does not exist")
 
