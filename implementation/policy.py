@@ -276,3 +276,27 @@ def round_quota_for_virtualizor(quota_gb: Optional[Decimal]) -> Optional[Decimal
     if quota_gb is None:
         return None
     return quota_gb.to_integral_value(rounding=ROUND_CEILING)
+
+
+def apply_minimum_renewal_floor(rounded_quota_gb: Optional[Decimal]) -> Optional[Decimal]:
+    """Owner-approved minimum EFFECTIVE quota policy (2026-11-16): a genuinely eligible,
+    validated LIMITED-bandwidth renewal must never compute to less than 1 GB, regardless of
+    the configured gift (including an explicitly configured 0 GB gift) -- Virtualizor's
+    bandwidth<=0 means UNLIMITED, so anything below 1 is not representable as "a small
+    allowance," only as "no limit at all." The floor is a MINIMUM EFFECTIVE QUOTA, not an
+    additional gift: the configured gift value itself is never altered by this function, only
+    the final result of (remaining + gift) after rounding.
+
+    CRITICAL SCOPE: this floor must be applied ONLY inside the validated renewal-policy
+    calculation (policy_integration.preview_renewal, and shadow_monitor's mirrored reporting
+    recompute) -- i.e. only to a value that was actually computed FROM a verified pre-reset
+    snapshot pair + resolved policy. It must NEVER be applied to an arbitrary raw manual
+    --new-quota-gb value typed directly at the `apply` CLI, which bypasses preview_renewal
+    entirely -- that path must keep blocking 0/negative outright (writer.apply_renewal's own
+    guard, deliberately NOT touched by this function) rather than silently floor it to 1,
+    since there is no reliable way to distinguish "this 1 came from a validated calculation"
+    from "an operator happened to type 1, or 0, by hand." Call this function ONLY at the one
+    shared choke point both apply_due and cmd_preview go through -- never from writer.py."""
+    if rounded_quota_gb is None:
+        return None
+    return max(Decimal(1), rounded_quota_gb)

@@ -321,10 +321,12 @@ def detect_renewal_candidates(conn: sqlite3.Connection, node_id: str = None,
                 import policy as _pol  # local import: shadow_monitor must stay importable
                 resolved = _pol.resolve_policy(policy_config, node_id, p.vpsid)
                 exact = _pol.compute_renewal_quota(resolved, p.old_quota_gb, p.old_used_gb)
-                # Rounded to match exactly what apply_due would actually request -- see
-                # policy_integration.preview_renewal's matching rounding (same root cause:
-                # Virtualizor's integer-only bandwidth column, VPS 106 2026-11-15 incident).
-                proposed = _pol.round_quota_for_virtualizor(exact)
+                # Rounded (ceiling) then floored to a minimum of 1 GB, to match exactly what
+                # apply_due would actually request -- see policy_integration.preview_renewal's
+                # matching calculation (same root cause: Virtualizor's integer-only bandwidth
+                # column meaning both fractional AND <=0 values are unrepresentable as a real
+                # limit; VPS 106 2026-11-15 incident; owner-approved 1GB floor, 2026-11-16).
+                proposed = _pol.apply_minimum_renewal_floor(_pol.round_quota_for_virtualizor(exact))
                 policy_resolved = True
                 if proposed != p.proposed_new_quota_gb:
                     policy_note = (f"policy-resolved monthly_grant_gb={resolved.monthly_grant_gb} "

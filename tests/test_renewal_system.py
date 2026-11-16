@@ -552,11 +552,12 @@ def test_apply_due_never_writes_to_unlimited_quota_vps_even_with_auto_renewal_en
     conn.close()
 
 
-def test_apply_due_never_writes_zero_quota_when_gift_is_zero_and_fully_exhausted(cli_env, monkeypatch):
-    """Full end-to-end proof, through the real apply_due() path, of the other critical gap:
-    an explicitly configured 0 GB gift combined with a fully-exhausted (or slightly
-    over-exhausted) VPS computes to a 0 GB target -- which must NEVER be written, because
-    Virtualizor's bandwidth<=0 means UNLIMITED, not 'zero allowance'."""
+def test_apply_due_applies_minimum_1gb_floor_when_gift_is_zero_and_fully_exhausted(cli_env, monkeypatch):
+    """Full end-to-end proof, through the real apply_due() path, of the OWNER-APPROVED minimum
+    effective quota policy (2026-11-16): an explicitly configured 0 GB gift combined with a
+    fully-exhausted VPS computes to 0 remaining + 0 gift = 0, which is floored to an EFFECTIVE
+    1 GB and genuinely applied -- NOT blocked (supersedes the earlier
+    BLOCKED_ZERO_QUOTA_UNSUPPORTED behavior, which this test previously asserted)."""
     renewal_cli.cmd_install(argparse_namespace())
     os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
     open(renewal_cli.WRITE_APPROVAL_MARKER, "w").write("approved")
@@ -581,18 +582,46 @@ def test_apply_due_never_writes_zero_quota_when_gift_is_zero_and_fully_exhausted
         {"vpsid": 50, "created_epoch": created_epoch, "quota_gb": Decimal("5000"), "used_gb": Decimal("1")}])
     renewal_cli.cmd_dry_run(argparse_namespace())
 
-    import writer as writer_mod
-    monkeypatch.setattr(writer_mod, "call_managevps_api",
-                         lambda *a, **k: pytest.fail("must never write a 0 GB quota"))
+    import writer as writer_mod, time as time_mod
+    monkeypatch.setattr(writer_mod, "call_managevps_api", lambda *a, **k: {"raw": '{"done":1}', "parsed": {"done": 1}})
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
     import local_source as ls
-    monkeypatch.setattr(ls, "fetch_single_vps_quota",
-                         lambda vpsid: pytest.fail("must never even read-verify for a blocked zero-quota write"))
+    reads = iter([Decimal("5000"), Decimal("1"), Decimal("1")])  # pre-write, post-write, confirm
+    monkeypatch.setattr(ls, "fetch_single_vps_quota", lambda vpsid: next(reads))
 
     rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
     db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
     conn = sqlite3.connect(db_path)
-    op = conn.execute("SELECT status FROM operations WHERE vpsid=50").fetchone()
-    assert op is None
+    op = conn.execute("SELECT status, requested_new_quota_gb FROM operations WHERE vpsid=50").fetchone()
+    assert op is not None
+    assert op[0] == "APPLIED"
+    assert op[1] == "1"  # the floored effective quota, never 0
+    conn.close()
+
+
+def test_manual_apply_cli_still_blocks_raw_zero_never_floors_it(cli_env):
+    """CRITICAL architectural guarantee: the 1GB floor applies ONLY inside the validated
+    renewal-policy calculation (preview_renewal/apply_due). A raw manual `apply` with
+    --new-quota-gb 0 typed directly bypasses that calculation entirely and must remain
+    BLOCKED, never silently converted to 1 GB -- there is no way to distinguish a manually-
+    typed 0 from a validated one, so the safe behavior (block) must be preserved."""
+    renewal_cli.cmd_install(argparse_namespace())
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    open(renewal_cli.WRITE_APPROVAL_MARKER, "w").write("approved")
+    import credentials as creds_mod
+    creds_mod.store_credentials(
+        creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, "test-node"),
+        "https://example.invalid", "k", "p")
+
+    import writer as writer_mod
+    with pytest.raises(writer_mod.WriteBlockedError):
+        renewal_cli.cmd_apply(argparse_namespace(
+            node="test-node", vpsid="1", period_key="p1", new_quota_gb="0",
+            execute=True, non_interactive=True))
+    db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
+    conn = sqlite3.connect(db_path)
+    op = conn.execute("SELECT COUNT(*) FROM operations WHERE vpsid=1").fetchone()[0]
+    assert op == 0  # blocked before any operation row was ever created
     conn.close()
 
 

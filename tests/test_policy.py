@@ -320,3 +320,42 @@ def test_gift_of_zero_global_default_is_valid_and_not_rejected(tmp_path):
     data = {"schema_version": 1, "global_defaults": base_global(monthly_grant_gb="0")}
     cfg = pol.load_policy_config(write_config(tmp_path, data))  # must not raise
     assert cfg.global_defaults.monthly_grant_gb == Decimal("0")
+
+
+# 9. apply_minimum_renewal_floor -- the owner-approved minimum effective quota (2026-11-16).
+
+def test_minimum_floor_raises_zero_to_one():
+    assert pol.apply_minimum_renewal_floor(Decimal("0")) == Decimal("1")
+
+
+def test_minimum_floor_leaves_values_above_one_unchanged():
+    assert pol.apply_minimum_renewal_floor(Decimal("100")) == Decimal("100")
+
+
+def test_minimum_floor_leaves_exactly_one_unchanged():
+    assert pol.apply_minimum_renewal_floor(Decimal("1")) == Decimal("1")
+
+
+def test_minimum_floor_handles_none():
+    assert pol.apply_minimum_renewal_floor(None) is None
+
+
+def test_minimum_floor_composed_with_rounding_matches_all_seven_examples():
+    """All seven owner-approved worked examples, exercised through the exact two-function
+    pipeline (compute_renewal_quota -> round_quota_for_virtualizor -> apply_minimum_renewal_floor)
+    that policy_integration.preview_renewal actually uses."""
+    cases = [
+        # (old_quota, old_used, gift, expected_effective)
+        (Decimal("5000"), Decimal("5000"), Decimal("100"), Decimal("100")),
+        (Decimal("5000"), Decimal("5001"), Decimal("100"), Decimal("100")),
+        (Decimal("5000"), Decimal("4000"), Decimal("100"), Decimal("1100")),
+        (Decimal("5000"), Decimal("5000"), Decimal("0"), Decimal("1")),
+        (Decimal("5000"), Decimal("5001"), Decimal("0"), Decimal("1")),
+        (Decimal("5000"), Decimal("4999"), Decimal("0"), Decimal("1")),
+        (Decimal("5000"), Decimal("4998.5"), Decimal("0"), Decimal("2")),
+    ]
+    for old_quota, old_used, gift, expected in cases:
+        p = _policy(gift)
+        exact = pol.compute_renewal_quota(p, old_quota, old_used)
+        effective = pol.apply_minimum_renewal_floor(pol.round_quota_for_virtualizor(exact))
+        assert effective == expected, f"old_quota={old_quota} old_used={old_used} gift={gift}: got {effective}, expected {expected}"

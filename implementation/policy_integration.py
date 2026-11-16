@@ -109,37 +109,22 @@ def preview_renewal(policy_config: pol.PolicyConfig, node_id: str, vpsid: int,
 
     eligible, detail = check_monthly_anniversary(anchor_epoch, event_ts)
     exact_proposed_quota = pol.compute_renewal_quota(p, old_quota, old_used)
-    # Rounded HERE, once, at the earliest point the final quota is computed -- every
-    # downstream consumer (apply_due, cmd_preview, cmd_apply via writer.apply_renewal's own
-    # defensive rounding, post-write verification, ledger recording) ends up using this exact
-    # same normalized value. See round_quota_for_virtualizor()'s docstring for why (VPS 106,
-    # 2026-11-15 incident). The pre-rounding exact calculation is preserved below for audit.
-    proposed_quota = pol.round_quota_for_virtualizor(exact_proposed_quota)
-
-    # CRITICAL, unconditional, checked before any other status (even PREVIEW_ONLY) --
-    # Virtualizor's bandwidth<=0 is empirically confirmed to mean UNLIMITED on this platform
-    # (see the MANUAL_ONLY_UNLIMITED check above and writer.apply_renewal's matching guard).
-    # A calculated target of exactly 0 GB (only reachable when remaining==0 AND the configured
-    # gift is explicitly 0) must NEVER be written as-is -- doing so would silently make the
-    # VPS unlimited, the exact opposite of a "0 GB gift" / "no further allowance" intent. This
-    # is a genuine platform representation gap, not something this code can safely resolve by
-    # guessing an alternative (e.g. a 1GB floor) -- that would be a NEW business rule this
-    # function has no authorization to invent. Block and report instead.
-    if proposed_quota is not None and proposed_quota <= 0:
-        return {
-            "vpsid": vpsid, "status": "BLOCKED_ZERO_QUOTA_UNSUPPORTED", "policy_source": p.source,
-            "detail": f"calculated target is {proposed_quota} GB (remaining=0 and configured "
-                      f"monthly_grant_gb={p.monthly_grant_gb}); Virtualizor cannot represent a "
-                      f"0 GB bandwidth LIMIT distinctly from UNLIMITED (bandwidth<=0) -- this "
-                      f"would NOT apply a zero allowance, it would remove the limit entirely. "
-                      f"Blocked structurally. Needs an explicitly-approved decision (e.g. a "
-                      f"minimum floor above 0, or manual handling) before this VPS's period "
-                      f"can ever be applied.",
-            "exact_calculated_quota_gb": str(exact_proposed_quota),
-            "old_quota_gb": str(old_quota), "old_used_gb": str(old_used),
-            "monthly_grant_gb": str(p.monthly_grant_gb),
-            "overrun_gb": str(overrun_gb), "overrun_anomaly_flag": overrun_anomaly_flag,
-        }
+    # Rounded (ceiling), then floored to a minimum of 1 GB -- owner-approved policy
+    # (2026-11-16): a genuinely eligible LIMITED-bandwidth renewal must never compute to less
+    # than 1 GB, since Virtualizor's bandwidth<=0 means UNLIMITED on this platform, not "zero
+    # allowance" -- below 1 is simply not representable as a small limit. The floor is a
+    # MINIMUM EFFECTIVE QUOTA, never an additional gift: the configured gift value itself is
+    # untouched. Done HERE, once, at the earliest point the final quota is computed, so every
+    # downstream consumer (apply_due, cmd_preview, post-write verification, ledger recording)
+    # uses this exact same normalized value -- see round_quota_for_virtualizor()'s docstring
+    # for the rounding rationale (VPS 106, 2026-11-15) and
+    # apply_minimum_renewal_floor()'s docstring for why this floor is deliberately applied
+    # ONLY here (the validated renewal-policy calculation), never inside writer.apply_renewal
+    # or the manual `apply` CLI's raw input handling -- those must keep blocking an arbitrary
+    # 0/negative request outright, not silently floor it, since there is no reliable way to
+    # tell "this came from a validated calculation" apart from "an operator typed it by hand."
+    # The pre-rounding exact calculation is preserved below for audit.
+    proposed_quota = pol.apply_minimum_renewal_floor(pol.round_quota_for_virtualizor(exact_proposed_quota))
 
     if not p.auto_renewal_enabled:
         status = "PREVIEW_ONLY_AUTO_RENEWAL_DISABLED"
