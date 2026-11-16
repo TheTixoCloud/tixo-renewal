@@ -63,3 +63,22 @@ def test_every_implementation_module_imported_by_renewal_cli_is_in_build_list():
 
     missing = [f"{name}.py" for name in imported if f"{name}.py" not in build_script]
     assert not missing, f"modules imported by renewal_cli.py but missing from build_package.sh: {missing}"
+
+
+def test_bootstrap_default_tag_matches_current_version():
+    """Regression test: bootstrap.sh's default pinned TAG has twice been left pointing at the
+    PREVIOUS release after a version bump, which silently installs stale code even when a
+    user fetches bootstrap.sh from the new tag's own URL (see v1.2.0 and v1.3.0 release
+    history). The default tag must always match renewal_cli.VERSION."""
+    impl_dir = os.path.join(os.path.dirname(__file__), "..", "implementation")
+    sys.path.insert(0, impl_dir)
+    import renewal_cli
+
+    bootstrap_text = open(os.path.join(DEPLOY_DIR, "bootstrap.sh")).read()
+    import re
+    m = re.search(r'TAG="\$\{TIXO_RENEWAL_VERSION:-v([0-9.]+)\}"', bootstrap_text)
+    assert m, "could not find bootstrap.sh's default TAG pattern"
+    assert m.group(1) == renewal_cli.VERSION, (
+        f"bootstrap.sh defaults to v{m.group(1)} but renewal_cli.VERSION is "
+        f"{renewal_cli.VERSION} -- bump bootstrap.sh's default TAG to match"
+    )
