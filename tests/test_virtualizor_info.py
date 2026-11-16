@@ -123,11 +123,24 @@ def test_parse_listvs_response_suspended_flag_overrides_machine_status():
     assert result["records"][0]["status"] == "suspended"
 
 
-def test_parse_listvs_response_machine_status_used_when_not_suspended():
+def test_parse_listvs_response_machine_status_field_never_used_for_vps_status():
+    """machine_status was found (by reading Virtualizor's own virtualizor.sql schema and
+    cross-referencing baremetal-theme files that reference it) to be a BAREMETAL-specific
+    field, unrelated to VPS running/stopped state -- it must never be trusted for VPS
+    status, no matter what value it holds."""
     parsed = {"vs": {"5": {"vpsid": "5", "bandwidth": "10", "suspended": "0",
-                           "machine_status": "stopped"}}}
+                           "machine_status": "1"}}}
     result = vinfo.parse_listvs_response(parsed)
-    assert result["records"][0]["status"] == "stopped"
+    assert result["records"][0]["status"] == "unknown"
+
+
+def test_parse_listvs_response_status_unknown_when_not_suspended():
+    """No reliable running/stopped field exists in this endpoint's response (confirmed via
+    the vps table schema, which has no status column at all) -- status is honestly reported
+    as 'unknown' rather than guessed as 'running'."""
+    parsed = {"vs": {"5": {"vpsid": "5", "bandwidth": "10", "suspended": "0"}}}
+    result = vinfo.parse_listvs_response(parsed)
+    assert result["records"][0]["status"] == "unknown"
 
 
 def test_parse_listvs_response_locked_field_parsed_as_bool():
@@ -157,3 +170,135 @@ def test_call_vs_api_uses_act_vs_not_act_listvs():
     w.call_vs_api(CREDS, http_get=capture_get)
     assert "act=vs" in captured["url"]
     assert "act=listvs" not in captured["url"]
+
+
+# ---------- v1.5.0 regression: pagination (the real 50-vs-61 production discrepancy) ------
+
+def _page_response(vpsids, numvps_total, page_num, page_size):
+    start = (page_num - 1) * page_size
+    chunk = vpsids[start:start + page_size]
+    vs = {str(v): {"vpsid": str(v), "bandwidth": "100", "used_bandwidth": "10"} for v in chunk}
+    return {"vs": vs, "servers": [{"numvps": str(numvps_total)}]}
+
+
+def test_fetch_vs_inventory_reproduces_and_fixes_the_real_50_vs_60_discrepancy():
+    """Regression test for the actual production bug: act=vs silently truncated to 50 of 60
+    real VPSs with zero in-response indicator of truncation. A naive single-page caller
+    (the pre-v1.5.0 code) would have returned exactly 50. fetch_vs_inventory must walk pages
+    and return all 60."""
+    all_ids = list(range(1, 61))  # 60 real VPSs, matching the confirmed ir1 authoritative count
+    calls = []
+    def fake_call_vs_api(creds, extra_params=None, timeout=20):
+        page = extra_params.get("page", 1)
+        page_size = extra_params.get("reslen", 50)
+        calls.append(page)
+        return {"parsed": _page_response(all_ids, 60, page, page_size)}
+    result = vinfo.fetch_vs_inventory("fake-creds", call_vs_api=fake_call_vs_api,
+                                       sleep_fn=lambda s: None)
+    assert result["fetched_count"] == 60
+    assert result["authoritative_total"] == 60
+    assert result["complete"] is True
+    assert {r["vpsid"] for r in result["records"]} == set(all_ids)
+    assert calls == [1, 2]  # page 1 (50) + page 2 (10, < page_size, stops)
+
+
+def test_fetch_vs_inventory_single_page_naive_call_would_have_undercounted():
+    """Demonstrates the actual bug shape: calling the API exactly once (no pagination logic)
+    returns only the first page -- 50 of 60 -- which is the literal pre-fix production
+    symptom the operator reported (as 50 vs 61; the real total was 60, see below)."""
+    all_ids = list(range(1, 61))
+    naive_result = _page_response(all_ids, 60, page_num=1, page_size=50)
+    assert len(naive_result["vs"]) == 50
+    assert naive_result["servers"][0]["numvps"] == "60"
+
+
+def test_fetch_vs_inventory_marks_incomplete_when_fetched_count_disagrees_with_authoritative():
+    """If pagination somehow still undercounts (e.g. a page silently dropped), the mismatch
+    against servers[].numvps must produce an explicit INCOMPLETE INVENTORY diagnostic --
+    never a silent, confidently-wrong 'complete' result."""
+    def fake_call_vs_api(creds, extra_params=None, timeout=20):
+        page = extra_params.get("page", 1)
+        if page == 1:
+            return {"parsed": {"vs": {"1": {"vpsid": "1", "bandwidth": "10"}},
+                                "servers": [{"numvps": "5"}]}}
+        return {"parsed": {"vs": {}, "servers": [{"numvps": "5"}]}}
+    result = vinfo.fetch_vs_inventory("fake-creds", call_vs_api=fake_call_vs_api,
+                                       page_size=50, sleep_fn=lambda s: None)
+    assert result["complete"] is False
+    assert "INCOMPLETE INVENTORY" in result["error"]
+    assert result["fetched_count"] == 1
+    assert result["authoritative_total"] == 5
+
+
+def test_fetch_vs_inventory_stops_as_soon_as_a_short_page_is_seen():
+    """A page returning fewer records than page_size is the natural last page -- no extra
+    call needed to confirm emptiness."""
+    def fake_call_vs_api(creds, extra_params=None, timeout=20):
+        page = extra_params.get("page", 1)
+        if page == 1:
+            return {"parsed": {"vs": {"1": {"vpsid": "1", "bandwidth": "10"}}, "servers": []}}
+        raise AssertionError("should not have requested a second page")
+    result = vinfo.fetch_vs_inventory("fake-creds", call_vs_api=fake_call_vs_api,
+                                       max_pages=20, sleep_fn=lambda s: None)
+    assert result["pages_fetched"] == 1
+    assert result["fetched_count"] == 1
+
+
+def test_fetch_vs_inventory_stops_on_a_genuinely_empty_page():
+    def fake_call_vs_api(creds, extra_params=None, timeout=20):
+        page = extra_params.get("page", 1)
+        page_size = extra_params.get("reslen", 50)
+        if page == 1:
+            return {"parsed": {"vs": {str(i): {"vpsid": str(i), "bandwidth": "10"}
+                                       for i in range(1, page_size + 1)}, "servers": []}}
+        return {"parsed": {"vs": {}, "servers": []}}
+    result = vinfo.fetch_vs_inventory("fake-creds", call_vs_api=fake_call_vs_api,
+                                       page_size=5, max_pages=20, sleep_fn=lambda s: None)
+    assert result["pages_fetched"] == 2
+    assert result["fetched_count"] == 5
+
+
+def test_fetch_vs_inventory_bounded_by_max_pages_never_loops_forever():
+    def fake_call_vs_api(creds, extra_params=None, timeout=20):
+        page = extra_params.get("page", 1)
+        return {"parsed": {"vs": {str(page): {"vpsid": str(page), "bandwidth": "10"}},
+                            "servers": [{"numvps": "999"}]}}
+    result = vinfo.fetch_vs_inventory("fake-creds", call_vs_api=fake_call_vs_api,
+                                       page_size=1, max_pages=3, sleep_fn=lambda s: None)
+    assert result["pages_fetched"] <= 3
+    assert result["complete"] is False  # fetched 3, authoritative says 999
+
+
+def test_fetch_vs_inventory_first_page_network_failure_raises_not_swallowed():
+    import pytest
+    def fake_call_vs_api(creds, extra_params=None, timeout=20):
+        raise ConnectionError("down")
+    with pytest.raises(ConnectionError):
+        vinfo.fetch_vs_inventory("fake-creds", call_vs_api=fake_call_vs_api, sleep_fn=lambda s: None)
+
+
+def test_fetch_vs_inventory_later_page_failure_keeps_partial_data_as_incomplete():
+    def fake_call_vs_api(creds, extra_params=None, timeout=20):
+        page = extra_params.get("page", 1)
+        if page == 1:
+            return {"parsed": {"vs": {str(i): {"vpsid": str(i), "bandwidth": "10"} for i in range(1, 51)},
+                                "servers": [{"numvps": "60"}]}}
+        raise ConnectionError("down mid-pagination")
+    result = vinfo.fetch_vs_inventory("fake-creds", call_vs_api=fake_call_vs_api,
+                                       sleep_fn=lambda s: None)
+    assert result["complete"] is False
+    assert result["fetched_count"] == 50
+    assert "mid-pagination" in result["error"]
+
+
+def test_fetch_vs_inventory_rate_limits_between_pages():
+    sleeps = []
+    def fake_call_vs_api(creds, extra_params=None, timeout=20):
+        page = extra_params.get("page", 1)
+        if page == 1:
+            return {"parsed": {"vs": {str(i): {"vpsid": str(i), "bandwidth": "10"} for i in range(1, 51)},
+                                "servers": []}}
+        return {"parsed": {"vs": {}, "servers": []}}
+    vinfo.fetch_vs_inventory("fake-creds", call_vs_api=fake_call_vs_api,
+                              sleep_fn=lambda s: sleeps.append(s))
+    assert len(sleeps) >= 1

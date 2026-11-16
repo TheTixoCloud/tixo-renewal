@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     node_id TEXT NOT NULL,
     captured_at TEXT NOT NULL,
-    record_count INTEGER NOT NULL
+    record_count INTEGER NOT NULL,
+    authoritative_total INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS snapshot_records (
@@ -94,6 +95,7 @@ def ingest_snapshot(conn: sqlite3.Connection, node_id: str, parse_result: dict,
         return {"status": "REJECTED_INCOMPLETE", "reason": parse_result.get("error"),
                 "diff": None}
 
+    authoritative_total = parse_result.get("authoritative_total")
     captured_at = captured_at or utcnow_iso()
     records = parse_result["records"]
     prev_id = latest_snapshot_id(conn, node_id)
@@ -102,8 +104,9 @@ def ingest_snapshot(conn: sqlite3.Connection, node_id: str, parse_result: dict,
     conn.execute("BEGIN")
     try:
         cur = conn.execute(
-            "INSERT INTO snapshots (node_id, captured_at, record_count) VALUES (?, ?, ?)",
-            (node_id, captured_at, len(records)),
+            "INSERT INTO snapshots (node_id, captured_at, record_count, authoritative_total) "
+            "VALUES (?, ?, ?, ?)",
+            (node_id, captured_at, len(records), authoritative_total),
         )
         snapshot_id = cur.lastrowid
         for r in records:
@@ -141,6 +144,15 @@ def ingest_snapshot(conn: sqlite3.Connection, node_id: str, parse_result: dict,
     return {"status": "OK", "reason": None, "diff": diff, "snapshot_id": snapshot_id}
 
 
+# Fields that represent a genuine CONFIGURATION change -- deliberately EXCLUDES used_gb.
+# Real-world finding (v1.5.0): including used_gb here caused ~42 of ~60 real VPSs to be
+# reported as "modified" on every single sync, purely from normal bandwidth consumption
+# ticking up between polls -- a false-positive flood with no actual configuration change
+# behind it. Usage is tracked separately below (usage_trend), never mixed into "modified".
+CONFIG_CHANGE_FIELDS = ("hostname", "status", "quota_gb", "ram_mb", "cores", "disk_gb",
+                        "locked", "node_serid")
+
+
 def _diff_snapshots(prev: dict, current: dict) -> dict:
     """Pure diff between two already-validated-complete snapshots (dicts keyed by vpsid).
     `prev` empty means this is the first-ever snapshot for this node -- everything in
@@ -152,10 +164,11 @@ def _diff_snapshots(prev: dict, current: dict) -> dict:
     added = sorted(current_ids - prev_ids)
     removed = sorted(prev_ids - current_ids)
     modified = []
+    usage_trend = []
     for vpsid in sorted(prev_ids & current_ids):
         old, new = prev[vpsid], current[vpsid]
         changed_fields = {}
-        for field in ("hostname", "status", "quota_gb", "used_gb", "ram_mb", "cores", "disk_gb", "locked"):
+        for field in CONFIG_CHANGE_FIELDS:
             old_val = old.get(field)
             new_val = str(new.get(field))
             if old_val is not None and old_val != new_val:
@@ -163,8 +176,12 @@ def _diff_snapshots(prev: dict, current: dict) -> dict:
         if changed_fields:
             modified.append({"vpsid": vpsid, "changes": changed_fields})
 
+        old_used, new_used = old.get("used_gb"), str(new.get("used_gb"))
+        if old_used is not None and old_used != new_used:
+            usage_trend.append({"vpsid": vpsid, "old_used_gb": old_used, "new_used_gb": new_used})
+
     quota_changed = [m for m in modified if "quota_gb" in m["changes"]]
-    return {"added": added, "removed": removed, "modified": modified,
+    return {"added": added, "removed": removed, "modified": modified, "usage_trend": usage_trend,
             "quota_changed": [m["vpsid"] for m in quota_changed],
             "added_count": len(added), "removed_count": len(removed),
             "modified_count": len(modified)}
@@ -199,9 +216,10 @@ def latest_records(conn: sqlite3.Connection, node_id: str) -> list[dict]:
 
 def last_sync_info(conn: sqlite3.Connection, node_id: str):
     row = conn.execute(
-        "SELECT captured_at, record_count FROM snapshots WHERE node_id=? ORDER BY id DESC LIMIT 1",
+        "SELECT captured_at, record_count, authoritative_total FROM snapshots "
+        "WHERE node_id=? ORDER BY id DESC LIMIT 1",
         (node_id,),
     ).fetchone()
     if row is None:
         return None
-    return {"captured_at": row[0], "record_count": row[1]}
+    return {"captured_at": row[0], "record_count": row[1], "authoritative_total": row[2]}

@@ -416,3 +416,106 @@ def test_main_cli_flag_forces_lightweight_menu(monkeypatch):
     monkeypatch.setattr(menu, "run_menu", fake_run_menu)
     rc = menu.main()
     assert called.get("ran") is True
+
+
+# ---------- v1.5.0: RED theme, grouped host info, navigation helpers, VPS detail ----------
+
+def test_style_accent_is_bright_red_when_enabled():
+    style = menu.Style(enabled=True)
+    assert style.ACCENT == style.BRIGHT_RED
+    assert style.ACCENT == "\033[91m"
+
+
+def test_style_accent_empty_when_disabled():
+    style = menu.Style(enabled=False)
+    assert style.ACCENT == ""
+
+
+def test_supports_unicode_reflects_stdout_encoding(monkeypatch):
+    class FakeStdout:
+        encoding = "utf-8"
+    monkeypatch.setattr(sys, "stdout", FakeStdout())
+    assert menu.supports_unicode() is True
+
+
+def test_supports_unicode_false_for_ascii_encoding(monkeypatch):
+    class FakeStdout:
+        encoding = "ascii"
+    monkeypatch.setattr(sys, "stdout", FakeStdout())
+    assert menu.supports_unicode() is False
+
+
+def test_render_banner_picks_fallback_when_no_unicode(monkeypatch):
+    monkeypatch.setattr(menu, "supports_unicode", lambda: False)
+    out = menu.render_banner(menu.Style(enabled=False))
+    assert "CONTROL CENTER" in out
+    assert out.strip() == menu.BANNER_FALLBACK.strip()
+
+
+def test_clear_screen_noop_when_not_interactive(monkeypatch, capsys):
+    monkeypatch.setattr(menu, "is_interactive", lambda: False)
+    menu.clear_screen()
+    out = capsys.readouterr().out
+    assert out == ""
+
+
+def test_render_host_info_groups_into_sections():
+    info = menu.hostinfo.collect_host_info()
+    out = menu.render_host_info(info, menu.Style(enabled=False))
+    for section in ("OPERATING SYSTEM", "CPU", "MEMORY & SWAP", "STORAGE", "NETWORK", "TIMEZONE"):
+        assert section in out
+
+
+def test_render_host_info_hides_virtual_interfaces_by_default():
+    info = {
+        "os": {"hostname": "h", "distribution": "d", "kernel": "k", "architecture": "a"},
+        "cpu": {"vendor": "v", "model": "m", "physical_cores": 1, "logical_cpus": 2, "threads_per_core": 2},
+        "memory": {"total_mb": 100, "available_mb": 50, "swap_total_mb": 10, "swap_free_mb": 5},
+        "disks": [],
+        "uptime": {"uptime_seconds": 3600, "load_average": {"1m": 1, "5m": 1, "15m": 1}},
+        "usage": {"cpu_percent": "unsupported", "memory_percent": 50.0},
+        "temperature": {"available": False, "reason": "unavailable", "zones": []},
+        "network_interfaces": [
+            {"name": "eth0", "state": "up", "ipv4": "10.0.0.1", "is_virtual": False},
+            {"name": "vnet5", "state": "up", "ipv4": "unavailable", "is_virtual": True},
+        ],
+        "host_timezone": "UTC",
+    }
+    out = menu.render_host_info(info, menu.Style(enabled=False))
+    assert "eth0" in out
+    assert "vnet5" not in out
+    assert "1 virtual interface(s) hidden" in out
+
+
+def test_render_host_info_shows_virtual_interfaces_when_requested():
+    info = {
+        "os": {"hostname": "h", "distribution": "d", "kernel": "k", "architecture": "a"},
+        "cpu": {"vendor": "v", "model": "m", "physical_cores": 1, "logical_cpus": 2, "threads_per_core": 2},
+        "memory": {"total_mb": 100, "available_mb": 50, "swap_total_mb": 10, "swap_free_mb": 5},
+        "disks": [],
+        "uptime": {"uptime_seconds": 3600, "load_average": {"1m": 1, "5m": 1, "15m": 1}},
+        "usage": {"cpu_percent": "unsupported", "memory_percent": 50.0},
+        "temperature": {"available": False, "reason": "unavailable", "zones": []},
+        "network_interfaces": [
+            {"name": "vnet5", "state": "up", "ipv4": "unavailable", "is_virtual": True},
+        ],
+        "host_timezone": "UTC",
+    }
+    out = menu.render_host_info(info, menu.Style(enabled=False), show_virtual_interfaces=True)
+    assert "vnet5" in out
+
+
+def test_render_vps_detail_shows_all_fields():
+    record = {"vpsid": 42, "hostname": "web1", "status": "suspended", "quota_gb": "100",
+              "used_gb": "50", "ram_mb": "2048", "cores": "2", "disk_gb": "40",
+              "virtualization": "kvm", "locked": False, "node_serid": 1}
+    out = menu.render_vps_detail(record, menu.Style(enabled=False))
+    assert "42" in out
+    assert "web1" in out
+    assert "suspended" in out
+
+
+def test_render_vps_table_marks_unlimited_quota():
+    records = [{"vpsid": 1, "hostname": "h", "status": "running", "quota_gb": "0", "used_gb": "500"}]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    assert "UNLIMITED" in out

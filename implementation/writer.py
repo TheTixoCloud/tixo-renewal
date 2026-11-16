@@ -399,7 +399,8 @@ def call_listvs_api(creds: ApiCredentials, timeout: int = 20, http_get=None) -> 
     return {"raw": raw, "parsed": parsed}
 
 
-def call_vs_api(creds: ApiCredentials, timeout: int = 20, http_get=None) -> dict:
+def call_vs_api(creds: ApiCredentials, timeout: int = 20, http_get=None,
+                 extra_params: dict = None) -> dict:
     """Calls Virtualizor's `act=vs` admin API action -- the REAL per-VPS listing endpoint
     (confirmed empirically, read-only key-names-only, against the real ir1 installation in
     v1.4.0 development: top-level `vs` dict keyed by vpsid, one entry per VPS, with fields
@@ -407,13 +408,20 @@ def call_vs_api(creds: ApiCredentials, timeout: int = 20, http_get=None) -> dict
     machine_status/locked/serid). Same safety shape as call_listvs_api: pure GET, api=json,
     NO vpsid/editvps/theme_edit/POST body -- cannot mutate anything.
 
+    PAGINATION (found empirically in v1.5.0 development: this endpoint silently caps results
+    at a default page size -- confirmed ~50 on the real ir1 installation -- with NO
+    pagination indicator in a single response; the only way to detect truncation is the
+    `servers[].numvps` authoritative count). `extra_params` lets callers (virtualizor_info.
+    fetch_vs_inventory) pass `reslen`/`page` to walk all pages; never used to pass any
+    mutation-shaped parameter.
+
     Method: HTTP GET. Endpoint: `{base_url}?act=vs&api=json&adminapikey=...&adminapipass=...`.
     `http_get` is injectable for tests; defaults to a real GET (never called by tests)."""
     safe_base_url = credentials_mod.validate_and_normalize_base_url(creds.base_url)
-    params = urllib.parse.urlencode({
-        "act": "vs", "api": "json",
-        "adminapikey": creds.api_key, "adminapipass": creds.api_pass,
-    })
+    query = {"act": "vs", "api": "json", "adminapikey": creds.api_key, "adminapipass": creds.api_pass}
+    if extra_params:
+        query.update(extra_params)
+    params = urllib.parse.urlencode(query)
     url = f"{safe_base_url}?{params}"
     if http_get is None:
         def http_get(url, timeout):

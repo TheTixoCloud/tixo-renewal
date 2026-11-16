@@ -40,13 +40,13 @@ def should_use_textual(force_cli: bool = False, is_interactive: bool = True,
 
 
 BANNER = r"""
-  _____ _           _____ _                 _
- |_   _(_)_  _____ / ____| |               | |
-   | |  \ \/ / _ \ |      | | ___  _   _  __| |
-   | |   >  < (_) | |     | |/ _ \| | | |/ _` |
-   |_|  /_/\_\___/| |____ | | (_) | |_| | (_| |
-                    \_____|_|\___/ \__,_|\__,_|
-         Virtualizor Bandwidth Renewal -- Control Center
+ ████████╗██╗██╗  ██╗ ██████╗      ██████╗██╗      ██████╗ ██╗   ██╗██████╗
+ ╚══██╔══╝██║╚██╗██╔╝██╔═══██╗    ██╔════╝██║     ██╔═══██╗██║   ██║██╔══██╗
+    ██║   ██║ ╚███╔╝ ██║   ██║    ██║     ██║     ██║   ██║██║   ██║██║  ██║
+    ██║   ██║ ██╔██╗ ██║   ██║    ██║     ██║     ██║   ██║██║   ██║██║  ██║
+    ██║   ██║██╔╝ ██╗╚██████╔╝    ╚██████╗███████╗╚██████╔╝╚██████╔╝██████╔╝
+    ╚═╝   ╚═╝╚═╝  ╚═╝ ╚═════╝      ╚═════╝╚══════╝ ╚═════╝  ╚═════╝ ╚═════╝
+                      C O N T R O L   C E N T E R
 """
 
 
@@ -88,16 +88,43 @@ def build_app(renewal_cli_mod, menu_mod):
             elif event.key in ("n", "escape"):
                 self.dismiss(False)
 
+    class VpsDetailScreen(ModalScreen):
+        """Pushed as its own screen (not a tab) -- Escape/0 pops back to the inventory
+        table, matching the project-wide 'press 0 or Escape to go back' navigation rule."""
+        BINDINGS = [Binding("escape", "dismiss_detail", "Back"),
+                    Binding("0", "dismiss_detail", "Back")]
+
+        def __init__(self, record: dict, style):
+            super().__init__()
+            self.record = record
+            self.style = style
+
+        def compose(self) -> ComposeResult:
+            yield Container(
+                Static(menu_mod.render_vps_detail(self.record, self.style), id="vps-detail-body"),
+                Label("[0 / esc] Back to inventory", id="vps-detail-hint"),
+                id="vps-detail-dialog",
+            )
+
+        def action_dismiss_detail(self) -> None:
+            self.dismiss()
+
     class TixoControlCenter(App):
+        # TixoCloud brand theme: red accent (#e8303a) on a dark-gray background -- replaces
+        # the earlier cyan/blue palette per the explicit red-branding redesign request.
         CSS = """
-        Screen { background: #0a0e14; color: #c0cdd9; }
-        Header { background: #0d2b3e; color: #58d6ff; }
-        Footer { background: #0d2b3e; color: #58d6ff; }
-        #banner { color: #58d6ff; text-align: center; padding: 1; }
-        .card { border: round #1f6f8b; padding: 1; margin: 1; background: #0f1620; }
-        .card-title { color: #58d6ff; text-style: bold; }
-        DataTable { background: #0f1620; }
-        #confirm-dialog { border: thick #ff5f5f; padding: 2; background: #1a0e0e; }
+        Screen { background: #121212; color: #d8d8d8; }
+        Header { background: #1c1c1c; color: #e8303a; }
+        Footer { background: #1c1c1c; color: #e8303a; }
+        #banner { color: #e8303a; text-align: center; padding: 1; text-style: bold; }
+        Tabs { background: #1c1c1c; }
+        Tab.-active { color: #e8303a; text-style: bold; }
+        .card { border: round #e8303a; padding: 1; margin: 1; background: #1a1a1a; }
+        .card-title { color: #e8303a; text-style: bold; }
+        DataTable { background: #1a1a1a; }
+        DataTable > .datatable--header { background: #262626; color: #e8303a; }
+        #confirm-dialog { border: thick #e8303a; padding: 2; background: #1a0e0e; }
+        #vps-detail-dialog { border: thick #e8303a; padding: 2; background: #1a1a1a; width: 60; }
         """
         BINDINGS = [
             Binding("q", "quit", "Quit"),
@@ -111,6 +138,7 @@ def build_app(renewal_cli_mod, menu_mod):
         def __init__(self):
             super().__init__()
             self._node_id = "self"
+            self._inventory_records = []
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=True)
@@ -123,14 +151,24 @@ def build_app(renewal_cli_mod, menu_mod):
                     Tab("Virtualizor", id="tab-virtualizor"),
                     Tab("Settings", id="tab-settings"),
                 )
+                yield Static(id="coverage-banner")
                 yield Static(id="body")
+                yield DataTable(id="inventory-table")
             yield Footer()
 
         def on_mount(self) -> None:
+            table = self.query_one("#inventory-table", DataTable)
+            table.add_columns("VPSID", "Hostname", "Status", "Quota GB", "Used GB")
+            table.cursor_type = "row"
+            table.display = False
             self.render_dashboard_tab()
 
         def on_tabs_tab_activated(self, event) -> None:
             tab_id = event.tab.id
+            table = self.query_one("#inventory-table", DataTable)
+            coverage = self.query_one("#coverage-banner", Static)
+            table.display = tab_id == "tab-inventory"
+            coverage.update("")
             if tab_id == "tab-dashboard":
                 self.render_dashboard_tab()
             elif tab_id == "tab-inventory":
@@ -141,6 +179,18 @@ def build_app(renewal_cli_mod, menu_mod):
                 self.render_virtualizor_tab()
             elif tab_id == "tab-settings":
                 self.render_settings_tab()
+
+        def on_data_table_row_selected(self, event) -> None:
+            if not self._inventory_records:
+                return
+            row_key = event.row_key
+            try:
+                vpsid = int(str(row_key.value))
+            except (TypeError, ValueError, AttributeError):
+                return
+            record = next((r for r in self._inventory_records if r["vpsid"] == vpsid), None)
+            if record is not None:
+                self.push_screen(VpsDetailScreen(record, self._plain_style()))
 
         def _plain_style(self):
             return menu_mod.Style(enabled=False)
@@ -154,14 +204,28 @@ def build_app(renewal_cli_mod, menu_mod):
         def render_inventory_tab(self) -> None:
             conn = inv_mod.open_db(os.path.join(renewal_cli_mod.STATE_DIR, "inventory.sqlite3"))
             records = inv_mod.latest_records(conn, self._node_id)
+            self._inventory_records = records
+            sync_info = inv_mod.last_sync_info(conn, self._node_id)
             settings = menu_mod.load_dashboard_settings(renewal_cli_mod.CONFIG_DIR)
             from decimal import Decimal
             threshold = Decimal(settings["usage_threshold_percent"])
-            table_text = menu_mod.render_vps_table(records, self._plain_style())
+
+            style = self._plain_style()
+            self.query_one("#coverage-banner", Static).update(
+                menu_mod._render_coverage_banner(sync_info, style))
+
+            table = self.query_one("#inventory-table", DataTable)
+            table.clear()
+            for r in records:
+                table.add_row(str(r["vpsid"]), str(r.get("hostname")), str(r.get("status")),
+                              str(r.get("quota_gb")), str(r.get("used_gb")), key=str(r["vpsid"]))
+
             summary = menu_mod.render_analytics_summary(
                 analytics_mod.compute_bandwidth_analytics(records, usage_threshold_percent=threshold),
-                self._plain_style())
-            self.query_one("#body", Static).update(table_text + "\n\n" + summary)
+                style)
+            self.query_one("#body", Static).update(
+                summary if records else "No VPS records -- run an inventory sync from the "
+                                        "lightweight CLI menu (`tixo-renewal --cli`) first.")
 
         def render_host_tab(self) -> None:
             info = hostinfo_mod.collect_host_info()

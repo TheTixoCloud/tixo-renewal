@@ -78,3 +78,24 @@ def test_read_text_distinguishes_missing_from_permission_denied(tmp_path, monkey
         assert hostinfo._read_text(str(restricted)) == hostinfo.PERMISSION_DENIED
     finally:
         os.chmod(restricted, 0o644)
+
+
+# ---------- v1.5.0: distinguish physical/management interfaces from virtual ones ----------
+
+def test_is_virtual_interface_recognizes_common_virtualization_prefixes():
+    assert hostinfo.is_virtual_interface("vnet12") is True
+    assert hostinfo.is_virtual_interface("tap0") is True
+    assert hostinfo.is_virtual_interface("virbr0") is True
+    assert hostinfo.is_virtual_interface("veth1234") is True
+    assert hostinfo.is_virtual_interface("docker0") is True
+
+
+def test_is_virtual_interface_false_for_physical_looking_names():
+    assert hostinfo.is_virtual_interface("eth0") is False
+    assert hostinfo.is_virtual_interface("enp3s0") is False
+    assert hostinfo.is_virtual_interface("eno1") is False
+
+
+def test_get_network_interfaces_tags_is_virtual_field():
+    interfaces = hostinfo.get_network_interfaces()
+    assert all("is_virtual" in i for i in interfaces)

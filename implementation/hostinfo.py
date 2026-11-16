@@ -211,11 +211,31 @@ def _ipv4_for_interface(name: str):
         return None
 
 
+# Prefixes used by virtualization/container stacks for their auto-generated interfaces --
+# NOT physical/management interfaces an operator cares about by default. On a Virtualizor
+# KVM host with dozens of running VMs, every single guest gets its own tap/vnet device, which
+# previously flooded the host-info screen with "dozens of virtual interfaces" (the exact
+# complaint this classification fixes). This is a naming-convention heuristic, not a kernel-
+# verified distinction -- an interface that doesn't match any of these prefixes is treated as
+# physical/management by default, which errs toward SHOWING an unfamiliar interface rather
+# than hiding something that might matter.
+VIRTUAL_INTERFACE_PREFIXES = ("vnet", "tap", "virbr", "veth", "br-", "docker", "vif", "tun")
+
+
+def is_virtual_interface(name: str) -> bool:
+    return any(name.startswith(p) for p in VIRTUAL_INTERFACE_PREFIXES)
+
+
 def get_network_interfaces() -> list[dict]:
     """Enumerates interfaces via /sys/class/net (always present on Linux) and resolves each
     interface's IPv4 address via a local ioctl -- no subprocess, no `ip`/`ifconfig` dependency.
     IPv6 addresses are not resolved per-interface here (would need /proc/net/if_inet6 parsing);
-    their absence is reported honestly as unsupported rather than silently omitted."""
+    their absence is reported honestly as unsupported rather than silently omitted.
+
+    Each entry is tagged `is_virtual` (see VIRTUAL_INTERFACE_PREFIXES) -- callers (menu.py's
+    host-info screen) use this to show only physical/management interfaces by default and
+    put virtual ones behind an explicit "show all" action, rather than flooding the screen
+    with one entry per VM on a busy hypervisor."""
     net_dir = Path("/sys/class/net")
     if not net_dir.is_dir():
         return []
@@ -232,7 +252,8 @@ def get_network_interfaces() -> list[dict]:
             pass
         ipv4 = _ipv4_for_interface(name)
         interfaces.append({"name": name, "state": state,
-                            "ipv4": ipv4 if ipv4 else UNAVAILABLE, "ipv6": UNSUPPORTED})
+                            "ipv4": ipv4 if ipv4 else UNAVAILABLE, "ipv6": UNSUPPORTED,
+                            "is_virtual": is_virtual_interface(name)})
     return interfaces
 
 

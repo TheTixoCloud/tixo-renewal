@@ -119,18 +119,27 @@ def _call_with_bounded_retry(fn, max_retries=DEFAULT_API_RETRY_COUNT,
 
 def run_inventory_sync(conn, node_id: str, creds, state_dir: str, call_listvs_api=None,
                         parse_listvs_response=None, max_retries=DEFAULT_API_RETRY_COUNT,
-                        sleep_fn=time.sleep) -> dict:
-    """The full read-only refresh: acquire lock -> bounded-retry API call -> parse -> ingest
-    -> release lock -> persist attempt state. Never raises WriteBlockedError or touches
-    WRITE_APPROVED -- this path performs no write of any kind to Virtualizor, ever."""
+                        sleep_fn=time.sleep, page_size: int = None, max_pages: int = None) -> dict:
+    """The full read-only refresh: acquire lock -> bounded-retry, FULLY PAGINATED fetch
+    (see virtualizor_info.fetch_vs_inventory -- act=vs silently truncates at a default page
+    size with no in-response indicator) -> ingest -> release lock -> persist attempt state.
+    Never raises WriteBlockedError or touches WRITE_APPROVED -- this path performs no write
+    of any kind to Virtualizor, ever.
+
+    `call_listvs_api` (kept under its historical parameter name for test-injection
+    compatibility) is passed through as fetch_vs_inventory's `call_vs_api` -- the real
+    default is writer.call_vs_api (`act=vs`), not the similarly-named writer.call_listvs_api
+    (`act=listvs`, which lists physical servers/nodes, not VPSs, on the installation this was
+    verified against -- see writer.call_listvs_api's docstring)."""
     import inventory as inv
     import virtualizor_info as vinfo
-    # NOTE: despite the parameter's historical name, the real default is writer.call_vs_api
-    # (`act=vs`) -- confirmed empirically to be the actual per-VPS listing endpoint; the
-    # similarly-named call_listvs_api (`act=listvs`) lists physical servers/nodes, not VPSs,
-    # on the installation this was verified against. See writer.call_listvs_api's docstring.
-    call_listvs_api = call_listvs_api or __import__("writer").call_vs_api
-    parse_listvs_response = parse_listvs_response or vinfo.parse_listvs_response
+    call_vs_api = call_listvs_api or __import__("writer").call_vs_api
+    fetch_vs_inventory = parse_listvs_response or vinfo.fetch_vs_inventory
+    kwargs = {}
+    if page_size is not None:
+        kwargs["page_size"] = page_size
+    if max_pages is not None:
+        kwargs["max_pages"] = max_pages
 
     try:
         lock = acquire_inventory_lock(state_dir)
@@ -139,24 +148,23 @@ def run_inventory_sync(conn, node_id: str, creds, state_dir: str, call_listvs_ap
 
     try:
         try:
-            result = _call_with_bounded_retry(
-                lambda: call_listvs_api(creds), max_retries=max_retries, sleep_fn=sleep_fn)
+            parse_result = _call_with_bounded_retry(
+                lambda: fetch_vs_inventory(creds, call_vs_api=call_vs_api, sleep_fn=sleep_fn, **kwargs),
+                max_retries=max_retries, sleep_fn=sleep_fn)
         except Exception as e:
             save_sync_state(state_dir, "ERROR", str(e))
             return {"status": "ERROR", "error": str(e)}
 
-        parsed = result.get("parsed")
-        if parsed is None:
-            save_sync_state(state_dir, "ERROR", "response was not valid JSON")
-            return {"status": "ERROR", "error": "response was not valid JSON"}
-
-        parse_result = parse_listvs_response(parsed)
         outcome = inv.ingest_snapshot(conn, node_id, parse_result)
         if outcome["status"] == "REJECTED_INCOMPLETE":
             save_sync_state(state_dir, "REJECTED_INCOMPLETE", outcome["reason"])
-            return {"status": "PARTIAL", "error": outcome["reason"]}
+            return {"status": "PARTIAL", "error": outcome["reason"],
+                    "fetched_count": parse_result.get("fetched_count"),
+                    "authoritative_total": parse_result.get("authoritative_total")}
 
         save_sync_state(state_dir, "OK", None)
-        return {"status": "OK", "error": None, "diff": outcome["diff"]}
+        return {"status": "OK", "error": None, "diff": outcome["diff"],
+                "fetched_count": parse_result.get("fetched_count"),
+                "authoritative_total": parse_result.get("authoritative_total")}
     finally:
         release_inventory_lock(lock)

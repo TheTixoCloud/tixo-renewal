@@ -46,10 +46,12 @@ def test_unknown_quota_vps_counted_separately_not_as_limited_or_unlimited():
 
 def test_running_and_stopped_counts():
     records = [rec(1, "100", "10", status="running"), rec(2, "100", "10", status="stopped"),
-               rec(3, "100", "10", status="suspended")]
+               rec(3, "100", "10", status="suspended"), rec(4, "100", "10", status="unknown")]
     result = analytics.compute_bandwidth_analytics(records)
     assert result["running_count"] == 1
-    assert result["stopped_count"] == 2
+    assert result["stopped_count"] == 1
+    assert result["suspended_count"] == 1
+    assert result["unknown_status_count"] == 1
 
 
 def test_usage_threshold_flags_vps_over_limit():

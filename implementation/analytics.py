@@ -43,8 +43,16 @@ def compute_bandwidth_analytics(records: list[dict], usage_threshold_percent: De
         else:
             limited.append(r)
 
+    # STATUS VOCABULARY (v1.5.0 correction): only "suspended" is a confirmed, reliable value
+    # from the real API (see virtualizor_info.parse_listvs_response's docstring on why
+    # machine_status is never used for VPS run-state). "running"/"stopped" are counted
+    # separately for forward compatibility if a reliable live-state source is added later,
+    # but on the current data source every non-suspended VPS reports "unknown" -- counted as
+    # unknown_status_count, never silently folded into running or stopped.
     running = sum(1 for r in records if str(r.get("status")).lower() == "running")
-    stopped = sum(1 for r in records if str(r.get("status")).lower() in ("stopped", "suspended"))
+    stopped = sum(1 for r in records if str(r.get("status")).lower() == "stopped")
+    suspended = sum(1 for r in records if str(r.get("status")).lower() == "suspended")
+    unknown_status = sum(1 for r in records if str(r.get("status")).lower() == "unknown")
 
     limited_quota_sum = sum((Decimal(str(r["quota_gb"])) for r in limited), Decimal(0))
     limited_used = [r for r in limited if _is_known_decimal(r.get("used_gb"))]
@@ -75,6 +83,8 @@ def compute_bandwidth_analytics(records: list[dict], usage_threshold_percent: De
         "unknown_quota_vps_count": len(unknown_quota),
         "running_count": running,
         "stopped_count": stopped,
+        "suspended_count": suspended,
+        "unknown_status_count": unknown_status,
         "limited_quota_sum_gb": limited_quota_sum,
         "limited_used_sum_gb": limited_used_sum,
         "limited_used_sum_coverage": f"{len(limited_used)}/{len(limited)}",

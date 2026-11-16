@@ -85,7 +85,7 @@ def test_bounded_retry_gives_up_after_max_retries():
 
 def test_run_inventory_sync_happy_path(tmp_path):
     conn = inv.open_db(str(tmp_path / "inv.sqlite3"))
-    def fake_call_listvs(creds):
+    def fake_call_listvs(creds, extra_params=None):
         return {"raw": "...", "parsed": {"vs": {"1.2.3.4": {"vpsid": "1", "bandwidth": "100",
                                                               "used_bandwidth": "10"}}}}
     result = isync.run_inventory_sync(conn, "self", creds=None, state_dir=str(tmp_path),
@@ -98,7 +98,7 @@ def test_run_inventory_sync_happy_path(tmp_path):
 
 def test_run_inventory_sync_reports_error_without_raising(tmp_path):
     conn = inv.open_db(str(tmp_path / "inv.sqlite3"))
-    def fake_call_listvs(creds):
+    def fake_call_listvs(creds, extra_params=None):
         raise ConnectionError("network down")
     result = isync.run_inventory_sync(conn, "self", creds=None, state_dir=str(tmp_path),
                                        call_listvs_api=fake_call_listvs, max_retries=0,
@@ -109,7 +109,7 @@ def test_run_inventory_sync_reports_error_without_raising(tmp_path):
 
 def test_run_inventory_sync_reports_partial_on_incomplete_parse(tmp_path):
     conn = inv.open_db(str(tmp_path / "inv.sqlite3"))
-    def fake_call_listvs(creds):
+    def fake_call_listvs(creds, extra_params=None):
         return {"raw": "...", "parsed": {"vs": {"1.2.3.4": {"hostname": "no-vpsid"}}}}
     result = isync.run_inventory_sync(conn, "self", creds=None, state_dir=str(tmp_path),
                                        call_listvs_api=fake_call_listvs)
@@ -121,7 +121,7 @@ def test_run_inventory_sync_refuses_when_lock_already_held(tmp_path):
     fh = isync.acquire_inventory_lock(str(tmp_path))
     try:
         result = isync.run_inventory_sync(conn, "self", creds=None, state_dir=str(tmp_path),
-                                           call_listvs_api=lambda creds: {"parsed": {"vs": {}}})
+                                           call_listvs_api=lambda creds, extra_params=None: {"parsed": {"vs": {}}})
         assert result["status"] == "ALREADY_RUNNING"
     finally:
         isync.release_inventory_lock(fh)
@@ -130,7 +130,7 @@ def test_run_inventory_sync_refuses_when_lock_already_held(tmp_path):
 def test_run_inventory_sync_never_touches_write_approval_marker(tmp_path):
     conn = inv.open_db(str(tmp_path / "inv.sqlite3"))
     marker = tmp_path / "WRITE_APPROVED"
-    def fake_call_listvs(creds):
+    def fake_call_listvs(creds, extra_params=None):
         return {"parsed": {"vs": {"1.2.3.4": {"vpsid": "1", "bandwidth": "100"}}}}
     isync.run_inventory_sync(conn, "self", creds=None, state_dir=str(tmp_path),
                               call_listvs_api=fake_call_listvs)
