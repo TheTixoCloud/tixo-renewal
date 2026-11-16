@@ -233,6 +233,17 @@ def is_virtual_interface(name: str) -> bool:
     return any(name.startswith(p) for p in VIRTUAL_INTERFACE_PREFIXES)
 
 
+def get_interface_mac(name: str) -> str:
+    """Reads /sys/class/net/<name>/address -- used as a strong (though not infallible)
+    identity signal for detecting an interface RENAME (same physical device, new kernel
+    name) versus a genuine replacement (different device). Returns UNAVAILABLE if the
+    interface doesn't exist or has no MAC (e.g. some tunnel/virtual types)."""
+    try:
+        return (Path("/sys/class/net") / name / "address").read_text().strip()
+    except OSError:
+        return UNAVAILABLE
+
+
 def _read_interface_counter(iface_dir: Path, stat_name: str):
     try:
         return int((iface_dir / "statistics" / stat_name).read_text().strip())

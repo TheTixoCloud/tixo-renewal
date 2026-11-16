@@ -1114,3 +1114,38 @@ def test_hostnet_sync_systemd_unit_never_auto_enabled_by_install(cli_env):
     import subprocess
     # Never invoked by cmd_install itself -- verified by the absence of any systemctl calls
     # in install.sh being exercised here (cmd_install is pure Python file-writing).
+
+
+# ---------- v1.7.0 final: noninteractive hostnet configuration for headless installs -----
+
+def test_cmd_hostnet_configure_refuses_without_yes(cli_env, capsys):
+    renewal_cli.cmd_install(argparse_namespace())
+    rc = renewal_cli.cmd_hostnet_configure(argparse_namespace(interface="eth0", yes=False))
+    assert rc == 1
+    assert "Refusing" in capsys.readouterr().out
+
+
+def test_cmd_hostnet_configure_succeeds_with_yes(cli_env):
+    renewal_cli.cmd_install(argparse_namespace())
+    rc = renewal_cli.cmd_hostnet_configure(argparse_namespace(interface="eth0", yes=True))
+    assert rc == 0
+    import hostnet_sync as hns_mod
+    settings = hns_mod.load_settings(renewal_cli.CONFIG_DIR)
+    assert settings["interface"] == "eth0"
+
+
+def test_cmd_hostnet_configure_refuses_virtual_interface(cli_env, capsys):
+    renewal_cli.cmd_install(argparse_namespace())
+    rc = renewal_cli.cmd_hostnet_configure(argparse_namespace(interface="viifv1234", yes=True))
+    assert rc == 1
+    assert "Rejected" in capsys.readouterr().out
+
+
+def test_cmd_hostnet_suggest_never_saves_anything(cli_env, capsys):
+    renewal_cli.cmd_install(argparse_namespace())
+    rc = renewal_cli.cmd_hostnet_suggest(argparse_namespace())
+    assert rc == 0
+    import hostnet_sync as hns_mod
+    settings = hns_mod.load_settings(renewal_cli.CONFIG_DIR)
+    assert settings["interface"] is None  # suggest never configures
+    assert "auto_selected=" in capsys.readouterr().out

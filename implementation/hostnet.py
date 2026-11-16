@@ -65,7 +65,21 @@ CREATE TABLE IF NOT EXISTS hostnet_cumulative (
     last_rx_bytes INTEGER,
     last_tx_bytes INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS hostnet_source_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    old_interface TEXT,
+    new_interface TEXT,
+    detected_at TEXT NOT NULL,
+    note TEXT
+);
 """
+
+SOURCE_EVENT_CONFIGURED = "CONFIGURED"
+SOURCE_EVENT_INTERFACE_MISSING = "INTERFACE_MISSING"
+SOURCE_EVENT_RENAME_DETECTED = "RENAME_DETECTED"
+SOURCE_EVENT_REPLACED = "REPLACED"
 
 
 def utcnow_iso() -> str:
@@ -171,6 +185,24 @@ def record_sample(conn: sqlite3.Connection, interface: str, rx_bytes: int, tx_by
     return {"interface": interface, "sampled_at": sampled_at, "rx_delta": rx_delta,
             "tx_delta": tx_delta, "discontinuity_type": discontinuity, "gap_seconds": gap_seconds,
             "cumulative_rx_bytes": cum_rx, "cumulative_tx_bytes": cum_tx}
+
+
+def record_source_event(conn: sqlite3.Connection, event_type: str, old_interface: str = None,
+                         new_interface: str = None, detected_at: str = None, note: str = None) -> None:
+    conn.execute(
+        "INSERT INTO hostnet_source_events (event_type, old_interface, new_interface, "
+        "detected_at, note) VALUES (?,?,?,?,?)",
+        (event_type, old_interface, new_interface, detected_at or utcnow_iso(), note),
+    )
+
+
+def get_source_events(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
+    rows = conn.execute(
+        "SELECT event_type, old_interface, new_interface, detected_at, note "
+        "FROM hostnet_source_events ORDER BY id DESC LIMIT ?", (limit,),
+    ).fetchall()
+    return [{"event_type": r[0], "old_interface": r[1], "new_interface": r[2],
+             "detected_at": r[3], "note": r[4]} for r in rows]
 
 
 def get_cumulative(conn: sqlite3.Connection, interface: str):

@@ -1067,6 +1067,42 @@ def cmd_hostnet_sync(args):
     return 0 if result["status"] in ("OK", "NOT_CONFIGURED", "ALREADY_RUNNING") else 1
 
 
+def cmd_hostnet_configure(args):
+    """Noninteractive configuration for headless installations. Requires --yes as the
+    explicit confirmation gate (the same safety property the interactive menu enforces via
+    a y/N prompt) -- never configures anything without it. --interface is required; this
+    command never guesses on an operator's behalf, even when auto-detection would have
+    identified a single high-confidence candidate (use `hostnet-suggest` first to see what
+    would be recommended, then pass that name explicitly here)."""
+    import hostnet_sync as hns_mod
+    if not getattr(args, "yes", False):
+        print("Refusing to configure without --yes (explicit confirmation required).")
+        return 1
+    try:
+        hns_mod.save_monitored_interface(CONFIG_DIR, args.interface, confirmed=True,
+                                          state_dir=STATE_DIR)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return 1
+    print(f"Now monitoring '{args.interface}'.")
+    return 0
+
+
+def cmd_hostnet_suggest(args):
+    """Read-only, noninteractive: prints the topology-aware candidate list and any auto-
+    detected high-confidence selection, without saving anything -- the headless-install
+    counterpart to the interactive menu's candidate display."""
+    import hostnet_sync as hns_mod
+    import net_topology
+    result = hns_mod.suggest_interfaces()
+    print(f"auto_selected={result['auto_selected']}")
+    for c in result["candidates"]:
+        print(f"candidate: {c['name']}  {net_topology.recommendation_reason(c)}")
+    for e in result["excluded"]:
+        print(f"excluded: {e['name']}  reason={e['exclusion_reason']}")
+    return 0
+
+
 def cmd_hostnet_status(args):
     """Read-only summary of host network accounting: configured interface, cumulative
     totals, last sample, live throughput if available."""
@@ -1195,6 +1231,12 @@ def main():
     inv_status_p.add_argument("--node", required=True)
     inv_status_p.set_defaults(func=cmd_inventory_status)
 
+    hostnet_configure_p = sub.add_parser("hostnet-configure")
+    hostnet_configure_p.add_argument("--interface", required=True)
+    hostnet_configure_p.add_argument("--yes", action="store_true")
+    hostnet_configure_p.set_defaults(func=cmd_hostnet_configure)
+
+    sub.add_parser("hostnet-suggest").set_defaults(func=cmd_hostnet_suggest)
     sub.add_parser("hostnet-sync").set_defaults(func=cmd_hostnet_sync)
     sub.add_parser("hostnet-status").set_defaults(func=cmd_hostnet_status)
 

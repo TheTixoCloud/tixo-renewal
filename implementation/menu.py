@@ -1190,33 +1190,56 @@ def action_configure_dashboard_settings():
 
 
 def action_configure_hostnet_interface():
-    """Requires explicit operator confirmation before saving -- never auto-selects an
-    interface, matching the 'clear operator confirmation' requirement."""
-    candidates = hostnet_sync.suggest_interfaces()
+    """Topology-aware selection (see net_topology.py): auto-detected bond/bridge members
+    are excluded entirely (the aggregate already represents them); when exactly one
+    candidate remains with high confidence, it's offered as the default but STILL requires
+    explicit operator confirmation before saving -- this function never auto-selects
+    without that confirmation step, matching the 'clear operator confirmation' requirement
+    even in the single-candidate case."""
+    import net_topology
+    result = hostnet_sync.suggest_interfaces()
     current = hostnet_sync.load_settings(renewal_cli.CONFIG_DIR).get("interface")
     print(f"Currently monitored interface: {current or '(none configured)'}")
+    candidates = result["candidates"]
+    if result["excluded"]:
+        print(f"\n{len(result['excluded'])} interface(s) excluded (virtual, uninformative, "
+              f"or a bond/bridge member that would double-count):")
+        for e in result["excluded"]:
+            print(f"    {e['name']}: {e['exclusion_reason']}")
     if not candidates:
-        print("No physical/management candidate interfaces detected.")
+        print("\nNo suitable candidate interfaces detected.")
         return
-    print("Candidates (most active first):")
+    print(f"\nCandidates (most active first):")
     for i, c in enumerate(candidates, 1):
         rx = c.get("rx_bytes"); tx = c.get("tx_bytes")
-        print(f"  {i}. {c['name']}  state={c['state']}  ipv4={c['ipv4']}  "
-              f"rx={rx if rx != 'unavailable' else '?'} tx={tx if tx != 'unavailable' else '?'}")
-    raw = input("Select a number to monitor, or type an interface name, blank to cancel: ").strip()
-    if not raw:
+        marker = " <- recommended" if result["auto_selected"] == c["name"] else ""
+        print(f"  {i}. {c['name']}  [{net_topology.recommendation_reason(c)}]  "
+              f"rx={rx if rx != 'unavailable' else '?'} tx={tx if tx != 'unavailable' else '?'}{marker}")
+    if result["auto_selected"]:
+        print(f"\nExactly one non-overlapping candidate was identified with high confidence.")
+    else:
+        print(f"\nMultiple plausible choices remain (see topology notes above) -- "
+              f"an explicit choice is required, nothing will be guessed.")
+    default_prompt = f" [{result['auto_selected']}]" if result["auto_selected"] else ""
+    raw = input(f"Select a number to monitor, or type an interface name{default_prompt}, "
+                f"blank to cancel: ").strip()
+    if not raw and result["auto_selected"]:
+        chosen = result["auto_selected"]
+    elif not raw:
         print("Cancelled.")
         return
-    try:
-        idx = int(raw) - 1
-        chosen = candidates[idx]["name"]
-    except (ValueError, IndexError):
-        chosen = raw
+    else:
+        try:
+            idx = int(raw) - 1
+            chosen = candidates[idx]["name"]
+        except (ValueError, IndexError):
+            chosen = raw
     if not _confirm(f"Monitor interface '{chosen}' for host network accounting?"):
         print("Cancelled.")
         return
     try:
-        hostnet_sync.save_monitored_interface(renewal_cli.CONFIG_DIR, chosen, confirmed=True)
+        hostnet_sync.save_monitored_interface(renewal_cli.CONFIG_DIR, chosen, confirmed=True,
+                                               state_dir=renewal_cli.STATE_DIR)
     except ValueError as e:
         print(f"Rejected: {e}")
         return
