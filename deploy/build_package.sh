@@ -22,6 +22,8 @@ cp -f "$HERE/integration_test_real_vps.py" "$HERE/bin/integration_test_real_vps.
 
 chmod +x "$HERE/install.sh" "$HERE/uninstall.sh" "$HERE/bin/renewal_cli.py" "$HERE/bin/integration_test_real_vps.py"
 
+find "$HERE/lib" "$HERE/bin" -type d -name __pycache__ -exec rm -rf {} +
+
 tar -czf "$HERE/tixo-renewal-package.tar.gz" -C "$HERE" lib bin install.sh uninstall.sh
 
 # SHA256SUMS is published as its own release asset alongside the tarball -- bootstrap.sh
