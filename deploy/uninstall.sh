@@ -12,13 +12,25 @@ done
 echo "== Virtualizor Bandwidth Rollover uninstaller =="
 echo "Install directory: $INSTALL_DIR"
 
-if [ -f /etc/systemd/system/virt-renewal-monitor.timer ]; then
-  echo "System-wide timer found. As a separate explicit step, disable it yourself:"
-  echo "  sudo systemctl disable --now virt-renewal-monitor.timer"
-  echo "  sudo rm /etc/systemd/system/virt-renewal-monitor.{service,timer}"
+if [ -f /etc/systemd/system/virt-renewal-monitor.timer ] || [ -f /etc/systemd/system/virt-renewal-apply.timer ] \
+   || [ -f /etc/systemd/system/virt-renewal-readiness-notifier.timer ]; then
+  echo "System-wide timer(s) found. As a separate explicit step, disable them yourself"
+  echo "(the apply timer is write-capable -- disable it FIRST if it was ever enabled):"
+  echo "  sudo systemctl disable --now virt-renewal-apply.timer virt-renewal-monitor.timer virt-renewal-readiness-notifier.timer"
+  echo "  sudo rm /etc/systemd/system/virt-renewal-{apply,monitor,readiness-notifier}.{service,timer}"
   echo "  sudo systemctl daemon-reload"
   echo "(This script does not do this automatically -- stopping a running service is itself"
   echo " an action that deserves an explicit, deliberate command, not a side effect of uninstall.)"
+fi
+
+if [ -f /usr/local/bin/tixo-renewal ]; then
+  if [ -w /usr/local/bin/tixo-renewal ] || [ "$(id -u)" -eq 0 ]; then
+    rm -f /usr/local/bin/tixo-renewal
+    echo "Removed global command: /usr/local/bin/tixo-renewal"
+  else
+    echo "Could not remove /usr/local/bin/tixo-renewal (not root) -- remove it yourself:"
+    echo "  sudo rm /usr/local/bin/tixo-renewal"
+  fi
 fi
 
 if [ ! -d "$INSTALL_DIR" ]; then

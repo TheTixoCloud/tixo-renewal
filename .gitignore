@@ -22,6 +22,7 @@ deploy/lib/
 deploy/bin/
 deploy/tixo-renewal-package.tar.gz
 deploy/*-package.tar.gz
+deploy/SHA256SUMS
 
 # Logs
 progress.log

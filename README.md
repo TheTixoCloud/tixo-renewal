@@ -1,10 +1,26 @@
-# Virtualizor Bandwidth Rollover
+# Tixo Renewal
 
 A host-local, policy-driven bandwidth carryover/renewal system for Virtualizor KVM VPS hosts.
 Runs directly on each Virtualizor master (no agent inside customer VPSs, no runtime
 dependency on any external server), with per-host and per-VPS configurable policies, a
 durable SQLite ledger, and production writes disabled until an operator explicitly approves
 them.
+
+## One-command install (Ubuntu 24.04 + Virtualizor)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.1.0/deploy/bootstrap.sh | sudo bash
+```
+
+This is pinned to the `v1.1.0` release tag (never a mutable branch), downloads the release
+tarball and its published `SHA256SUMS` from that *same* immutable release, verifies the
+checksum locally, then runs `install.sh`. After install, manage everything through:
+
+```bash
+tixo-renewal           # interactive menu: dashboard, credentials, gift/interval config,
+                        # enable/disable auto-renewal, logs, updates, backup/restore, uninstall
+tixo-renewal --status  # noninteractive status, for scripts/cron/monitoring
+```
 
 ## Why this exists
 
@@ -18,24 +34,33 @@ writes anything to Virtualizor without a human-approved, auditable path.
 ## Core rule
 
 ```
-On a verified monthly billing anniversary:
-    new_quota = min(unused_remaining, carryover_cap_or_unlimited) + configured_monthly_grant
-    new_usage = 0
+On a genuinely verified reset (real pre/post USED drop, correct calendar-anniversary window
+-- never inferred from the anniversary date or an exhausted quota alone):
+    remaining_gb       = max(0, old_quota_gb - pre_reset_used_gb)
+    calculated_gb       = remaining_gb + configured_gift_gb      # gift may be 0
+    effective_quota_gb = max(1, ceil(calculated_gb))              # integer GB, never 0
+    new_usage           = unchanged (this project never writes USED)
 ```
 
-Nothing here is hardcoded. Every number above is configurable at three levels — see
-"Policy configuration" below.
+Virtualizor's `bandwidth` column is integer-only and `<=0` means **unlimited**, so a
+calculated result is always rounded up to a whole GB and floored at 1 — never 0, never a
+fraction. Unlimited-bandwidth VPSs (now or created in the future) are permanently excluded
+from automatic renewal regardless of policy. Nothing above is hardcoded otherwise — every
+number is configurable at three levels, see "Policy configuration" below.
 
 ## Status
 
 | Area | State |
 |---|---|
 | Accounting engine (formula, exactly-once renewal, ID-reuse safety, receipt reconciliation) | Implemented, unit-tested |
-| Policy engine (global/host/VPS precedence, zero-vs-unset correctness) | Implemented, unit-tested |
-| Host-local read-only monitor (SQLite ledger, no SSH, no external dependency) | Implemented, unit-tested |
-| Production writer (Virtualizor admin API, crash/timeout-safe) | Implemented, unit-tested with mocked HTTP — **never run against a real server by this project's own tests** |
-| Unattended (systemd) apply path | Implemented, but **ships disabled**; requires an operator-created approval marker and secure credential storage before it can run at all |
-| Verified against a real Virtualizor renewal event | **Not yet** — no real, naturally-occurring renewal has been observed during development |
+| Policy engine (global/host/VPS precedence, zero-vs-unset correctness, configurable gift incl. 0) | Implemented, unit-tested |
+| Fractional-GB rounding + minimum-1GB effective quota floor | Implemented, unit-tested, **live-verified in production** |
+| Unlimited-VPS permanent exclusion | Implemented, unit-tested, live-verified |
+| Host-local read-only monitor + readiness notifier (SQLite ledger, no SSH) | Implemented, unit-tested, running in production on a 5-minute / 30-minute cadence with `flock`-based non-overlap protection |
+| Production writer (Virtualizor admin API, crash/timeout-safe, fail-closed on uncertain outcomes) | Implemented, unit-tested with mocked HTTP, **and live-verified against a real production renewal** |
+| Unattended (systemd) apply path | Implemented; ships **disabled by default** — requires an operator-created approval marker and secure credential storage before it can run at all |
+| Interactive management menu (`tixo-renewal`) | Implemented, unit-tested |
+| Verified against a real Virtualizor renewal event | **Yes** — a real production VPS completed a full automatic-eligible renewal cycle (genuine reset detected, formula applied, write verified, ledger recorded) |
 
 ## Quick start (read-only, safe)
 
@@ -71,9 +96,10 @@ zero-vs-unset guarantees).
 ## CLI commands
 
 `install`, `status`, `dry-run`, `verify`, `backup`, `rollback`, `uninstall`, `policy-show`,
-`policy-validate`, `preview`, `store-credentials`, `apply`, `apply-due`, `resolve-operation`.
-Every command's exact read/write behavior is documented in `implementation/renewal_cli.py`'s
-module docstring and in `docs/DEPLOYMENT.md`.
+`policy-validate`, `preview`, `store-credentials`, `validate-credentials`, `diagnose-api`,
+`inspect-vps`, `apply`, `apply-due`, `resolve-operation`. Every command's exact read/write
+behavior is documented in `implementation/renewal_cli.py`'s module docstring and in
+`docs/DEPLOYMENT.md`. The `tixo-renewal` menu wraps the common ones in a guided interface.
 
 ## Safety model
 
@@ -85,6 +111,17 @@ module docstring and in `docs/DEPLOYMENT.md`.
   `UNKNOWN_NEEDS_VERIFICATION` and blocks any further attempt for that exact renewal period
   until an operator resolves it with their own live verification — it is never silently
   retried.
+- A calculated quota of 0 (only reachable with a 0 GB gift and zero remaining balance) is
+  floored to 1 GB **only** inside the validated renewal calculation (`apply-due`/`preview`);
+  a raw manual `apply --new-quota-gb 0` typed directly still gets structurally blocked, never
+  silently floored, since that path has no reliable way to prove the value was validated.
+- Unlimited-bandwidth VPSs are checked and excluded **before** any policy/eligibility logic
+  runs, so no policy misconfiguration (including a global `auto_renewal_enabled: true`) can
+  ever route one into a write.
+- Monitor, apply, and the readiness notifier are three independent systemd timers, with
+  monitor+apply sharing a `flock` lock so they can never run concurrently against the same
+  ledger; neither sets `Persistent=true`, so enabling them never triggers an immediate
+  catch-up run.
 
 ## Testing
 

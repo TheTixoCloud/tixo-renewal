@@ -25,11 +25,45 @@ set -euo pipefail
 INSTALL_DIR="${TIXO_RENEWAL_INSTALL_DIR:-/opt/tixo-renewal}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "== Virtualizor Bandwidth Rollover installer =="
+echo "== Tixo Renewal installer =="
 echo "Install directory: $INSTALL_DIR"
 
+# ---- environment checks (fail fast, before touching anything) -----------------------------
 if [ ! -d "$SCRIPT_DIR/lib" ]; then
   echo "ERROR: $SCRIPT_DIR/lib not found. Run this script from the extracted package directory." >&2
+  exit 1
+fi
+
+PYTHON_BIN="$(command -v python3 || true)"
+if [ -z "$PYTHON_BIN" ]; then
+  echo "ERROR: python3 not found on this host." >&2
+  exit 1
+fi
+PY_VER="$("$PYTHON_BIN" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+echo "python3: $PYTHON_BIN (version $PY_VER)"
+
+if [ -f /etc/os-release ]; then
+  . /etc/os-release
+  echo "OS: ${PRETTY_NAME:-unknown}"
+  if [ "${ID:-}" != "ubuntu" ]; then
+    echo "WARNING: this installer is tested on Ubuntu 24.04; detected ID='${ID:-unknown}'. Continuing anyway."
+  fi
+fi
+
+if [ "$(id -u)" -ne 0 ] && [ -z "${TIXO_RENEWAL_INSTALL_DIR:-}" ]; then
+  echo "WARNING: not running as root and no custom TIXO_RENEWAL_INSTALL_DIR set -- the"
+  echo "default /opt/tixo-renewal location and the global 'tixo-renewal' command both"
+  echo "require root. Re-run with sudo, or set TIXO_RENEWAL_INSTALL_DIR to a writable path."
+fi
+
+if [ ! -f /usr/local/virtualizor/universal.php ] && [ ! -f /usr/local/emps/etc/virtualizor/universal.php ]; then
+  echo "NOTE: no Virtualizor universal.php found at the usual locations on this host."
+  echo "      Installation will continue (this is just local setup), but 'dry-run'/'status'"
+  echo "      will fail to read live VPS data until this is run ON an actual Virtualizor host."
+fi
+
+if ! command -v flock >/dev/null 2>&1; then
+  echo "ERROR: 'flock' (util-linux) not found -- required for safe non-overlapping timers." >&2
   exit 1
 fi
 
@@ -38,19 +72,37 @@ cp -f "$SCRIPT_DIR"/lib/*.py "$INSTALL_DIR/lib/"
 cp -f "$SCRIPT_DIR"/bin/*.py "$INSTALL_DIR/bin/"
 chmod +x "$INSTALL_DIR"/bin/*.py
 
-PYTHON_BIN="$(command -v python3)"
-if [ -z "$PYTHON_BIN" ]; then
-  echo "ERROR: python3 not found on this host." >&2
-  exit 1
-fi
-
 # Idempotent: the CLI's own `install` subcommand writes default configs only if absent, and
 # re-creates the SQLite schema only if missing (CREATE TABLE IF NOT EXISTS everywhere).
 export TIXO_RENEWAL_INSTALL_DIR="$INSTALL_DIR"
 PYTHONPATH="$INSTALL_DIR/lib" "$PYTHON_BIN" "$INSTALL_DIR/bin/renewal_cli.py" install
 
+# Global `tixo-renewal` command -> launches the interactive management menu. Only attempted
+# if /usr/local/bin is writable (root, or a writable custom prefix); never fatal if not --
+# the operator can always run menu.py directly.
+WRAPPER_PATH="/usr/local/bin/tixo-renewal"
+if [ -w "$(dirname "$WRAPPER_PATH")" ] || [ "$(id -u)" -eq 0 ]; then
+  cat > "$WRAPPER_PATH" <<WRAPPER_EOF
+#!/bin/bash
+export TIXO_RENEWAL_INSTALL_DIR="$INSTALL_DIR"
+export PYTHONPATH="$INSTALL_DIR/lib:$INSTALL_DIR/bin"
+exec "$PYTHON_BIN" "$INSTALL_DIR/lib/menu.py" "\$@"
+WRAPPER_EOF
+  chmod +x "$WRAPPER_PATH"
+  echo "Installed global command: $WRAPPER_PATH"
+else
+  echo "Could not write to /usr/local/bin (not root) -- skipped installing the global"
+  echo "'tixo-renewal' command. Run the menu directly instead:"
+  echo "  TIXO_RENEWAL_INSTALL_DIR=$INSTALL_DIR PYTHONPATH=$INSTALL_DIR/lib $PYTHON_BIN $INSTALL_DIR/lib/menu.py"
+fi
+
 echo
 echo "== Install complete =="
+echo "Management menu (dashboard, config, enable/disable, backup/restore, uninstall):"
+echo "  tixo-renewal"
+echo "Noninteractive status (for scripts/automation):"
+echo "  tixo-renewal --status"
+echo
 echo "Review and edit before anything else matters:"
 echo "  $INSTALL_DIR/renewal-config/policy.json   (bandwidth policy -- starts SAFE: auto_renewal_enabled=false)"
 echo "  $INSTALL_DIR/renewal-config/nodes.json    (this host, mode=local)"

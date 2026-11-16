@@ -240,6 +240,35 @@ def test_status_uses_this_installs_node_config_path_not_module_default(cli_env, 
         f"_node_config_path() {renewal_cli._node_config_path()!r}")
 
 
+def test_backup_uses_this_installs_node_config_path_not_module_default(cli_env, monkeypatch):
+    """Same regression class as cmd_status, found while adding the v1.1 menu: cmd_backup also
+    called nodes_mod.load_nodes() with no path argument."""
+    renewal_cli.cmd_install(argparse_namespace())
+    calls = []
+
+    def spy_load_nodes(path=None):
+        calls.append(path)
+        return [nodes_mod.NodeConfig("test-node", "root@203.0.113.1", "~/.ssh/fake", "test-node.sqlite3")]
+
+    monkeypatch.setattr(renewal_cli.nodes_mod, "load_nodes", spy_load_nodes)
+    renewal_cli.cmd_backup(argparse_namespace())
+    assert calls and calls[0] == renewal_cli._node_config_path()
+
+
+def test_rollback_uses_this_installs_node_config_path_not_module_default(cli_env, monkeypatch):
+    renewal_cli.cmd_install(argparse_namespace())
+    calls = []
+
+    def spy_load_nodes(path=None):
+        calls.append(path)
+        return [nodes_mod.NodeConfig("test-node", "root@203.0.113.1", "~/.ssh/fake", "test-node.sqlite3")]
+
+    monkeypatch.setattr(renewal_cli.nodes_mod, "load_nodes", spy_load_nodes)
+    with pytest.raises(FileNotFoundError):  # backup file genuinely doesn't exist -- expected
+        renewal_cli.cmd_rollback(argparse_namespace(node="test-node", backup_file="nonexistent.sqlite3", yes=True))
+    assert calls and calls[0] == renewal_cli._node_config_path()
+
+
 def test_install_honors_monthly_base_env_var(cli_env, monkeypatch):
     """TIXO_RENEWAL_MONTHLY_BASE_GB lets an operator configure the monthly base AT install
     time instead of hand-editing policy.json afterward."""
@@ -892,3 +921,51 @@ def test_apply_due_non_interactive_without_stored_credentials_fails_safe_no_prom
     monkeypatch.setattr("builtins.input", lambda *a, **k: pytest.fail("must not prompt"))
     rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
     assert rc == 1
+
+
+# ---------- v1.1: configurable monitor/apply/notifier intervals ----------------------------
+
+def test_validate_interval_minutes_accepts_plain_int():
+    assert renewal_cli.validate_interval_minutes(5) == 5
+    assert renewal_cli.validate_interval_minutes("30") == 30
+
+
+def test_validate_interval_minutes_rejects_out_of_range():
+    with pytest.raises(ValueError):
+        renewal_cli.validate_interval_minutes(0)
+    with pytest.raises(ValueError):
+        renewal_cli.validate_interval_minutes(181)
+
+
+def test_validate_interval_minutes_rejects_non_numeric_injection_attempt():
+    """CRITICAL: this value is interpolated directly into a systemd unit file's
+    OnUnitActiveSec= line -- must reject anything that isn't a plain integer, including
+    shell-metacharacter or unit-file-breaking strings."""
+    for bad in ("5; rm -rf /", "5\n[Service]\nExecStart=/bin/evil", "abc", "5min", ""):
+        with pytest.raises(ValueError):
+            renewal_cli.validate_interval_minutes(bad)
+
+
+def test_install_honors_custom_intervals_via_env_vars(cli_env, monkeypatch):
+    monkeypatch.setenv("TIXO_RENEWAL_MONITOR_INTERVAL_MIN", "10")
+    monkeypatch.setenv("TIXO_RENEWAL_APPLY_INTERVAL_MIN", "15")
+    monkeypatch.setenv("TIXO_RENEWAL_NOTIFIER_INTERVAL_MIN", "60")
+    renewal_cli.cmd_install(argparse_namespace())
+    monitor_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-monitor.timer")).read_text()
+    apply_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-apply.timer")).read_text()
+    notifier_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-readiness-notifier.timer")).read_text()
+    assert "OnUnitActiveSec=10min" in monitor_content
+    assert "OnUnitActiveSec=15min" in apply_content
+    assert "OnUnitActiveSec=60min" in notifier_content
+
+
+def test_write_systemd_units_is_the_single_shared_generator(cli_env):
+    """The menu's interval-reconfiguration feature must reuse this exact function -- never a
+    second, divergent implementation."""
+    renewal_cli.cmd_install(argparse_namespace())
+    renewal_cli.write_systemd_units(monitor_interval_min=20, apply_interval_min=20,
+                                     notifier_interval_min=45)
+    content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-monitor.timer")).read_text()
+    assert "OnUnitActiveSec=20min" in content
+    notifier_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-readiness-notifier.timer")).read_text()
+    assert "OnUnitActiveSec=45min" in notifier_content
