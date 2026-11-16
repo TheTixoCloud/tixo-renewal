@@ -15,7 +15,8 @@ mkdir -p "$HERE/lib" "$HERE/bin"
 for f in engine.py models.py storage.py policy.py policy_integration.py local_source.py \
          writer.py alerts.py backup.py nodes.py shadow_monitor.py credentials.py \
          readiness_notifier.py menu.py hostinfo.py virtualizor_info.py inventory.py \
-         inventory_sync.py analytics.py tui_textual.py event_history.py renewal_history.py; do
+         inventory_sync.py analytics.py tui_textual.py event_history.py renewal_history.py \
+         hostnet.py hostnet_sync.py jalali.py; do
   cp -f "$IMPL/$f" "$HERE/lib/$f"
 done
 cp -f "$IMPL/renewal_cli.py" "$HERE/bin/renewal_cli.py"

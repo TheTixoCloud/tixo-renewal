@@ -99,3 +99,34 @@ def test_is_virtual_interface_false_for_physical_looking_names():
 def test_get_network_interfaces_tags_is_virtual_field():
     interfaces = hostinfo.get_network_interfaces()
     assert all("is_virtual" in i for i in interfaces)
+
+
+# ---------- v1.7.0: viifv* filtering (real production bug) + uninformative-interface filter
+
+def test_is_virtual_interface_recognizes_viifv_prefix():
+    """Regression test: the operator observed real viifvXXXX interfaces still showing on the
+    'default' host info screen on ir1 despite the virtual-interface-hiding feature -- viifv
+    (Virtualizor's own per-VM interface naming convention) was missing from the prefix list."""
+    assert hostinfo.is_virtual_interface("viifv1234") is True
+    assert hostinfo.is_virtual_interface("viifv0") is True
+
+
+def test_get_network_interfaces_includes_rx_tx_bytes():
+    interfaces = hostinfo.get_network_interfaces()
+    assert all("rx_bytes" in i and "tx_bytes" in i for i in interfaces)
+
+
+def test_get_network_interfaces_flags_uninformative_entries():
+    interfaces = hostinfo.get_network_interfaces()
+    assert all("is_uninformative" in i for i in interfaces)
+
+
+def test_uninformative_flag_true_only_when_truly_uninformative_and_not_virtual():
+    # Simulate the shape directly since we can't control real /sys/class/net content.
+    def classify(name, state, ipv4, rx):
+        is_virtual = hostinfo.is_virtual_interface(name)
+        return (not is_virtual and state == hostinfo.UNAVAILABLE and not ipv4
+                and rx == hostinfo.UNAVAILABLE)
+    assert classify("eth9", hostinfo.UNAVAILABLE, None, hostinfo.UNAVAILABLE) is True
+    assert classify("viifv1", hostinfo.UNAVAILABLE, None, hostinfo.UNAVAILABLE) is False
+    assert classify("eth0", "up", "10.0.0.1", 12345) is False

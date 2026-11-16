@@ -236,11 +236,12 @@ def test_save_display_tz_rejects_invalid_and_does_not_persist(tmp_path):
     assert not os.path.exists(menu.display_settings_path(config_dir))
 
 
-def test_format_local_time_converts_utc_to_tehran():
+def test_format_local_time_converts_utc_to_tehran_with_jalali_date():
     # 2026-01-01T00:00:00 UTC -> Asia/Tehran is UTC+3:30 -> 03:30 local, same calendar day.
+    # v1.7.0: Asia/Tehran now shows the Jalali date alongside the clock time.
     out = menu.format_local_time("2026-01-01T00:00:00+00:00", "Asia/Tehran")
     assert "03:30:00" in out
-    assert "2026-01-01" in out
+    assert "Jalali" in out
 
 
 def test_format_local_time_handles_naive_timestamp_as_utc():
@@ -255,10 +256,17 @@ def test_format_local_time_never_raises_on_garbage_falls_back_to_raw():
 
 def test_format_local_time_timezone_boundary_crosses_calendar_day():
     """A known tricky case: a UTC time late in the day crosses into the NEXT calendar day in
-    a positive-offset timezone -- must be handled correctly, not just offset-blind."""
+    a positive-offset timezone -- must be handled correctly, not just offset-blind. Checked
+    against the underlying Gregorian conversion directly (format_local_time shows Jalali for
+    Tehran), since the clock-time rollover is the thing under test here, not the calendar."""
+    from zoneinfo import ZoneInfo
+    from datetime import datetime
+    dt = datetime.fromisoformat("2026-06-30T21:00:00+00:00").astimezone(ZoneInfo("Asia/Tehran"))
+    assert (dt.year, dt.month, dt.day) == (2026, 7, 1)  # 21:00 UTC + 3:30 = 00:30 the next day
+    assert dt.strftime("%H:%M:%S") == "00:30:00"
     out = menu.format_local_time("2026-06-30T21:00:00+00:00", "Asia/Tehran")
-    assert "2026-07-01" in out  # 21:00 UTC + 3:30 = 00:30 the next day
     assert "00:30:00" in out
+    assert "Jalali" in out
 
 
 # ---------- dashboard surfaces deferred/expired/failed operations --------------------------
@@ -484,7 +492,7 @@ def test_render_host_info_hides_virtual_interfaces_by_default():
     out = menu.render_host_info(info, menu.Style(enabled=False))
     assert "eth0" in out
     assert "vnet5" not in out
-    assert "1 virtual interface(s) hidden" in out
+    assert "1 interface(s) hidden" in out
 
 
 def test_render_host_info_shows_virtual_interfaces_when_requested():
@@ -528,3 +536,159 @@ def test_menu_items_no_longer_has_standalone_manual_inventory_sync():
     labels = [label for label, _ in menu.MENU_ITEMS]
     assert "Sync VPS inventory (read-only)" not in labels
     assert "View VPS inventory & analytics" in labels
+
+
+# ---------- v1.7.0: dashboard auto-sync health, verified via actual systemd state ----------
+
+def test_classify_timer_health_active():
+    assert menu.classify_timer_health("active", "enabled") == "ACTIVE"
+
+
+def test_classify_timer_health_failed():
+    assert menu.classify_timer_health("failed", "enabled") == "FAILED"
+
+
+def test_classify_timer_health_inactive_when_not_active_but_recognized():
+    assert menu.classify_timer_health("inactive", "disabled") == "INACTIVE"
+
+
+def test_classify_timer_health_unknown_never_fabricated_as_active():
+    assert menu.classify_timer_health("", "") == "UNKNOWN"
+    assert menu.classify_timer_health("activating", "enabled") == "UNKNOWN"
+
+
+def test_classify_timer_health_never_reports_active_merely_because_enabled():
+    """Explicit requirement: enabled=enabled with active=inactive must never be ACTIVE."""
+    assert menu.classify_timer_health("inactive", "enabled") == "INACTIVE"
+
+
+def test_render_dashboard_shows_fleet_totals_and_auto_sync_health():
+    data = {
+        "policy_ok": True, "monthly_grant_gb": "100", "auto_renewal_enabled": True,
+        "write_approved": True, "per_node": {},
+        "timers": {"virt-renewal-inventory-sync.timer": {"enabled": "enabled", "active": "active"}},
+        "inventory_sync_timer_health": "ACTIVE",
+        "inventory": {
+            "sync_info": {"captured_at": "2026-01-01T00:00:00+00:00", "record_count": 60, "authoritative_total": 60},
+            "freshness": "FRESH", "last_attempt_status": "OK", "last_attempt_error": None,
+            "refresh_interval_minutes": 15,
+            "fleet": {"total_vps": 60, "limited_vps_count": 56, "unlimited_vps_count": 4,
+                      "limited_quota_sum_gb": "296041", "limited_used_sum_gb": "238292.21",
+                      "limited_remaining_sum_gb": "57748.79", "unlimited_used_sum_gb": "23078.39",
+                      "total_used_all_vps_gb": "261370.60"},
+        },
+    }
+    out = menu.render_dashboard(data, menu.Style(enabled=False))
+    assert "ACTIVE" in out
+    assert "Current VPS count: 60" in out
+    assert "296041" in out
+    assert "261370.60" in out
+    assert "not sold/billed bandwidth" in out
+
+
+def test_render_dashboard_handles_missing_inventory_gracefully():
+    data = {"policy_ok": True, "monthly_grant_gb": "100", "auto_renewal_enabled": True,
+            "write_approved": True, "per_node": {}, "timers": {},
+            "inventory_error": "db locked", "inventory": None,
+            "inventory_sync_timer_health": "UNKNOWN"}
+    out = menu.render_dashboard(data, menu.Style(enabled=False))
+    assert "unavailable: db locked" in out
+
+
+def test_render_dashboard_shows_incomplete_coverage_in_red_marker():
+    data = {
+        "policy_ok": True, "monthly_grant_gb": "100", "auto_renewal_enabled": True,
+        "write_approved": True, "per_node": {}, "timers": {},
+        "inventory_sync_timer_health": "ACTIVE",
+        "inventory": {
+            "sync_info": {"captured_at": "2026-01-01T00:00:00+00:00", "record_count": 50, "authoritative_total": 60},
+            "freshness": "STALE", "last_attempt_status": "OK", "last_attempt_error": None,
+            "refresh_interval_minutes": 15,
+            "fleet": {"total_vps": 50, "limited_vps_count": 48, "unlimited_vps_count": 2,
+                      "limited_quota_sum_gb": "1", "limited_used_sum_gb": "1",
+                      "limited_remaining_sum_gb": "0", "unlimited_used_sum_gb": "0",
+                      "total_used_all_vps_gb": "1"},
+        },
+    }
+    out = menu.render_dashboard(data, menu.Style(enabled=False))
+    assert "Coverage: 50/60" in out
+
+
+# ---------- v1.7.0: IP search, numeric sort-by-quota/usage, VPS table IP column -----------
+
+def test_filter_and_sort_vps_search_by_ip():
+    records = [{"vpsid": 1, "hostname": "a", "ip_primary": "10.0.0.5"},
+               {"vpsid": 2, "hostname": "b", "ip_primary": "10.0.0.9"}]
+    out = menu.filter_and_sort_vps(records, search="10.0.0.9")
+    assert len(out) == 1
+    assert out[0]["vpsid"] == 2
+
+
+def test_filter_and_sort_vps_sort_by_quota_is_numeric_not_lexicographic():
+    records = [{"vpsid": 1, "quota_gb": "9"}, {"vpsid": 2, "quota_gb": "100"},
+               {"vpsid": 3, "quota_gb": "20"}]
+    out = menu.filter_and_sort_vps(records, sort_by="quota_gb")
+    assert [r["vpsid"] for r in out] == [1, 3, 2]  # 9 < 20 < 100 numerically
+
+
+def test_filter_and_sort_vps_sort_by_usage_numeric():
+    records = [{"vpsid": 1, "used_gb": "500"}, {"vpsid": 2, "used_gb": "50"}]
+    out = menu.filter_and_sort_vps(records, sort_by="used_gb")
+    assert [r["vpsid"] for r in out] == [2, 1]
+
+
+def test_filter_and_sort_vps_unparseable_quota_sorts_after_valid_values():
+    records = [{"vpsid": 1, "quota_gb": "unavailable"}, {"vpsid": 2, "quota_gb": "10"}]
+    out = menu.filter_and_sort_vps(records, sort_by="quota_gb")
+    assert [r["vpsid"] for r in out] == [2, 1]
+
+
+def test_render_vps_table_shows_primary_ip_column():
+    records = [{"vpsid": 1, "hostname": "web1", "status": "unknown", "quota_gb": "100",
+                "used_gb": "10", "ip_primary": "203.0.113.5"}]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    assert "203.0.113.5" in out
+
+
+# ---------- v1.7.0: host network traffic panel rendering ----------------------------------
+
+def test_render_hostnet_panel_no_samples_yet():
+    out = menu.render_hostnet_panel("eth0", None, None, None, menu.Style(enabled=False))
+    assert "No samples recorded yet" in out
+
+
+def test_render_hostnet_panel_shows_totals_and_speed():
+    cumulative = {"cumulative_rx_bytes": 5_000_000_000, "cumulative_tx_bytes": 2_000_000_000,
+                  "first_sample_at": "2026-01-01T00:00:00+00:00"}
+    live_rate = {"rx_bytes_per_sec": 1_000_000, "tx_bytes_per_sec": 500_000}
+    recent = {"sampled_at": "2026-01-02T00:00:00+00:00", "discontinuity_type": None, "gap_seconds": 300}
+    out = menu.render_hostnet_panel("ens1f1", cumulative, live_rate, recent, menu.Style(enabled=False))
+    assert "HOST NETWORK -- ens1f1" in out
+    assert "5.00 GB" in out
+    assert "Mbps" in out
+    assert "not automatically 'customer download/upload'" in out
+
+
+def test_render_hostnet_panel_handles_missing_live_rate_honestly():
+    cumulative = {"cumulative_rx_bytes": 100, "cumulative_tx_bytes": 100, "first_sample_at": None}
+    out = menu.render_hostnet_panel("eth0", cumulative, None, None, menu.Style(enabled=False))
+    assert "RX Speed:       " in out
+    assert "unavailable" in out
+
+
+def test_render_hostnet_panel_flags_discontinuity_as_data_quality_issue():
+    cumulative = {"cumulative_rx_bytes": 100, "cumulative_tx_bytes": 100, "first_sample_at": "2026-01-01T00:00:00+00:00"}
+    recent = {"sampled_at": "2026-01-02T00:00:00+00:00", "discontinuity_type": "REBOOT", "gap_seconds": 3600}
+    out = menu.render_hostnet_panel("eth0", cumulative, None, recent, menu.Style(enabled=False))
+    assert "discontinuity (REBOOT)" in out
+    assert "not observable" in out or "never invented" in out
+
+
+def test_format_bytes_human_decimal_units():
+    assert menu._format_bytes_human(5_000_000_000) == "5.00 GB"
+    assert menu._format_bytes_human(500) == "500 B"
+
+
+def test_format_bits_per_sec_human():
+    assert menu._format_bits_per_sec_human(12_500_000) == "100.00 Mbps"
+    assert menu._format_bits_per_sec_human(125_000_000) == "1.00 Gbps"

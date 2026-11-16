@@ -279,3 +279,19 @@ def test_get_usage_trend_for_vps_respects_limit(tmp_path):
 def test_get_usage_trend_for_vps_empty_when_never_seen(tmp_path):
     conn = inv.open_db(str(tmp_path / "inv.sqlite3"))
     assert inv.get_usage_trend_for_vps(conn, "self", 999) == []
+
+
+def test_ip_list_persisted_and_retrieved_as_real_list(tmp_path):
+    conn = inv.open_db(str(tmp_path / "inv.sqlite3"))
+    r = rec(1)
+    r["ip_list"] = ["203.0.113.5", "203.0.113.6"]
+    inv.ingest_snapshot(conn, "self", make_parse_result([r]))
+    records = inv.latest_records(conn, "self")
+    assert records[0]["ip_list"] == ["203.0.113.5", "203.0.113.6"]
+
+
+def test_ip_list_unavailable_when_not_provided(tmp_path):
+    conn = inv.open_db(str(tmp_path / "inv.sqlite3"))
+    inv.ingest_snapshot(conn, "self", make_parse_result([rec(1)]))
+    records = inv.latest_records(conn, "self")
+    assert records[0]["ip_list"] == "unavailable"

@@ -20,7 +20,7 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 
 # Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
 # apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
@@ -207,6 +207,38 @@ Unit=virt-renewal-inventory-sync.service
 WantedBy=timers.target
 """
 
+# Host network accounting: reads ONLY local /sys/class/net counters -- no Virtualizor API
+# call of any kind, entirely independent of inventory/renewal timers and their locks. Like
+# the inventory-sync unit, this is generated for REVIEW ONLY -- never auto-enabled by
+# install.sh, and in v1.7.0 specifically never installed/activated during development per
+# explicit instruction (no automatic production activation). An operator who has configured
+# a monitored interface (see hostnet_sync.save_monitored_interface) and reviewed this file
+# enables it themselves, the same explicit pattern as every other timer in this project.
+HOSTNET_SERVICE_UNIT_TEMPLATE = """[Unit]
+Description=Tixo Renewal host network traffic sample (local kernel counters only, read-only)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH={libdir}
+Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
+ExecStart={python} {cli} hostnet-sync
+WorkingDirectory={workdir}
+User={user}
+"""
+
+HOSTNET_TIMER_UNIT_TEMPLATE = """[Unit]
+Description=Sample host network traffic counters approximately every {interval}min
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec={interval}min
+Unit=virt-renewal-hostnet-sync.service
+
+[Install]
+WantedBy=timers.target
+"""
+
 
 # ---------- install ----------
 
@@ -227,10 +259,14 @@ DEFAULT_NOTIFIER_INTERVAL_MIN = 30
 DEFAULT_INVENTORY_INTERVAL_MIN = 15
 
 
+DEFAULT_HOSTNET_INTERVAL_MIN = 5
+
+
 def write_systemd_units(monitor_interval_min: int = DEFAULT_MONITOR_INTERVAL_MIN,
                          apply_interval_min: int = DEFAULT_APPLY_INTERVAL_MIN,
                          notifier_interval_min: int = DEFAULT_NOTIFIER_INTERVAL_MIN,
-                         inventory_interval_min: int = DEFAULT_INVENTORY_INTERVAL_MIN) -> None:
+                         inventory_interval_min: int = DEFAULT_INVENTORY_INTERVAL_MIN,
+                         hostnet_interval_min: int = DEFAULT_HOSTNET_INTERVAL_MIN) -> None:
     """Writes all 6 review-only systemd unit files to SYSTEMD_OUT_DIR, parameterized by the
     given intervals (each validated/clamped by the caller via validate_interval_minutes
     BEFORE being passed here -- this function trusts its inputs are already safe ints, never
@@ -272,6 +308,13 @@ def write_systemd_units(monitor_interval_min: int = DEFAULT_MONITOR_INTERVAL_MIN
     Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-inventory-sync.timer")).write_text(
         INVENTORY_TIMER_UNIT_TEMPLATE.format(interval=inventory_interval_min))
 
+    Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-hostnet-sync.service")).write_text(
+        HOSTNET_SERVICE_UNIT_TEMPLATE.format(python=python_path, cli=cli_path,
+                                              workdir=os.path.abspath(WORKSPACE_ROOT), user=user,
+                                              libdir=lib_dir))
+    Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-hostnet-sync.timer")).write_text(
+        HOSTNET_TIMER_UNIT_TEMPLATE.format(interval=hostnet_interval_min))
+
 
 def cmd_install(args):
     for d in (STATE_DIR, CONFIG_DIR, BACKUP_DIR, SYSTEMD_OUT_DIR):
@@ -299,7 +342,8 @@ def cmd_install(args):
     apply_min = validate_interval_minutes(os.environ.get("TIXO_RENEWAL_APPLY_INTERVAL_MIN", DEFAULT_APPLY_INTERVAL_MIN))
     notifier_min = validate_interval_minutes(os.environ.get("TIXO_RENEWAL_NOTIFIER_INTERVAL_MIN", DEFAULT_NOTIFIER_INTERVAL_MIN))
     inventory_min = validate_interval_minutes(os.environ.get("TIXO_RENEWAL_INVENTORY_INTERVAL_MIN", DEFAULT_INVENTORY_INTERVAL_MIN))
-    write_systemd_units(monitor_min, apply_min, notifier_min, inventory_min)
+    hostnet_min = validate_interval_minutes(os.environ.get("TIXO_RENEWAL_HOSTNET_INTERVAL_MIN", DEFAULT_HOSTNET_INTERVAL_MIN))
+    write_systemd_units(monitor_min, apply_min, notifier_min, inventory_min, hostnet_min)
     service_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-monitor.service")
     timer_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-monitor.timer")
 
@@ -568,6 +612,7 @@ UNINSTALL_UNIT_NAMES = (
     "virt-renewal-apply.service", "virt-renewal-apply.timer",
     "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
     "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer",
+    "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer",
 )
 
 
@@ -1006,6 +1051,41 @@ def cmd_inventory_status(args):
     return 0
 
 
+def cmd_hostnet_sync(args):
+    """One bounded, local-only host network-traffic sample. Reads ONLY local kernel
+    interface counters -- no Virtualizor API call of any kind, never touches
+    WRITE_APPROVED, never shares a lock with inventory/renewal timers."""
+    import hostnet_sync as hns_mod
+    result = hns_mod.run_hostnet_sample(STATE_DIR, CONFIG_DIR)
+    print(f"status={result['status']}")
+    if result.get("error"):
+        print(f"error={result['error']}")
+    if result["status"] == "OK":
+        s = result["sample"]
+        print(f"interface={s['interface']} rx_delta={s['rx_delta']} tx_delta={s['tx_delta']} "
+              f"discontinuity={s['discontinuity_type']}")
+    return 0 if result["status"] in ("OK", "NOT_CONFIGURED", "ALREADY_RUNNING") else 1
+
+
+def cmd_hostnet_status(args):
+    """Read-only summary of host network accounting: configured interface, cumulative
+    totals, last sample, live throughput if available."""
+    import hostnet as hn_mod
+    import hostnet_sync as hns_mod
+    settings = hns_mod.load_settings(CONFIG_DIR)
+    interface = settings.get("interface")
+    print(f"interface={interface}")
+    if not interface:
+        print("status=NOT_CONFIGURED")
+        return 0
+    conn = hn_mod.open_db(os.path.join(STATE_DIR, "hostnet.sqlite3"))
+    cumulative = hn_mod.get_cumulative(conn, interface)
+    print(f"cumulative={cumulative}")
+    live = hn_mod.compute_live_throughput(conn, interface)
+    print(f"live_throughput_bytes_per_sec={live}")
+    return 0
+
+
 def cmd_install_ui(args):
     """Explicit, operator-initiated installation of the OPTIONAL Textual UI dependency.
     NEVER run automatically by install.sh or any other command -- the one-command installer's
@@ -1114,6 +1194,9 @@ def main():
     inv_status_p = sub.add_parser("inventory-status")
     inv_status_p.add_argument("--node", required=True)
     inv_status_p.set_defaults(func=cmd_inventory_status)
+
+    sub.add_parser("hostnet-sync").set_defaults(func=cmd_hostnet_sync)
+    sub.add_parser("hostnet-status").set_defaults(func=cmd_hostnet_status)
 
     resolve_p = sub.add_parser("resolve-operation")
     resolve_p.add_argument("--node", required=True)

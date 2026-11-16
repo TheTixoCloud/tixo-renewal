@@ -84,6 +84,7 @@ COLUMN_MIGRATIONS = (
     ("snapshots", "authoritative_total", "INTEGER"),
     ("snapshot_records", "ip_primary", "TEXT"),
     ("snapshot_records", "ip_count", "TEXT"),
+    ("snapshot_records", "ip_list", "TEXT"),
 )
 
 
@@ -120,11 +121,12 @@ def latest_snapshot_id(conn: sqlite3.Connection, node_id: str):
 def _load_snapshot_records(conn: sqlite3.Connection, snapshot_id: int) -> dict:
     rows = conn.execute(
         "SELECT vpsid, hostname, status, quota_gb, used_gb, ram_mb, cores, disk_gb, virtualization, "
-        "locked, node_serid, ip_primary, ip_count FROM snapshot_records WHERE snapshot_id=?", (snapshot_id,)
+        "locked, node_serid, ip_primary, ip_count, ip_list FROM snapshot_records WHERE snapshot_id=?", (snapshot_id,)
     ).fetchall()
     return {r[0]: {"hostname": r[1], "status": r[2], "quota_gb": r[3], "used_gb": r[4],
                    "ram_mb": r[5], "cores": r[6], "disk_gb": r[7], "virtualization": r[8],
-                   "locked": r[9], "node_serid": r[10], "ip_primary": r[11], "ip_count": r[12]}
+                   "locked": r[9], "node_serid": r[10], "ip_primary": r[11], "ip_count": r[12],
+                   "ip_list": r[13]}
             for r in rows}
 
 
@@ -160,15 +162,18 @@ def ingest_snapshot(conn: sqlite3.Connection, node_id: str, parse_result: dict,
         )
         snapshot_id = cur.lastrowid
         for r in records:
+            import json as _json
+            ip_list_raw = r.get("ip_list", "unavailable")
+            ip_list_json = _json.dumps(ip_list_raw) if isinstance(ip_list_raw, list) else str(ip_list_raw)
             conn.execute(
                 "INSERT INTO snapshot_records (snapshot_id, vpsid, hostname, status, quota_gb, "
-                "used_gb, ram_mb, cores, disk_gb, virtualization, locked, node_serid, ip_primary, ip_count) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "used_gb, ram_mb, cores, disk_gb, virtualization, locked, node_serid, ip_primary, ip_count, ip_list) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (snapshot_id, r["vpsid"], str(r["hostname"]), str(r["status"]), str(r["quota_gb"]),
                  str(r["used_gb"]), str(r["ram_mb"]), str(r["cores"]), str(r["disk_gb"]),
                  str(r["virtualization"]), str(r.get("locked", "unavailable")),
                  str(r.get("node_serid", "unavailable")), str(r.get("ip_primary", "unavailable")),
-                 str(r.get("ip_count", "unavailable"))),
+                 str(r.get("ip_count", "unavailable")), ip_list_json),
             )
             known = conn.execute(
                 "SELECT first_seen_at FROM known_vps WHERE node_id=? AND vpsid=?",
@@ -275,11 +280,18 @@ def detect_id_reuse(conn: sqlite3.Connection, node_id: str, vpsid: int, observed
 
 
 def latest_records(conn: sqlite3.Connection, node_id: str) -> list[dict]:
+    import json as _json
     snap_id = latest_snapshot_id(conn, node_id)
     if snap_id is None:
         return []
     by_id = _load_snapshot_records(conn, snap_id)
-    return [{"vpsid": vpsid, **fields} for vpsid, fields in sorted(by_id.items())]
+    records = [{"vpsid": vpsid, **fields} for vpsid, fields in sorted(by_id.items())]
+    for r in records:
+        try:
+            r["ip_list"] = _json.loads(r["ip_list"])
+        except (TypeError, ValueError):
+            pass  # leave as the raw stored string (e.g. "unavailable") if not valid JSON
+    return records
 
 
 def last_sync_info(conn: sqlite3.Connection, node_id: str):

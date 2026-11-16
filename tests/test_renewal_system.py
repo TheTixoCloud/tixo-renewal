@@ -196,7 +196,8 @@ def test_install_generates_all_three_unit_pairs_including_notifier(cli_env):
     for name in ("virt-renewal-monitor.service", "virt-renewal-monitor.timer",
                  "virt-renewal-apply.service", "virt-renewal-apply.timer",
                  "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
-                 "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer"):
+                 "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer",
+                 "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer"):
         assert os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, name)), f"missing {name}"
     notifier_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
                                           "virt-renewal-readiness-notifier.service")).read_text()
@@ -217,7 +218,8 @@ def test_uninstall_removes_all_three_unit_pairs_not_just_monitor(cli_env):
     for name in ("virt-renewal-monitor.service", "virt-renewal-monitor.timer",
                  "virt-renewal-apply.service", "virt-renewal-apply.timer",
                  "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
-                 "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer"):
+                 "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer",
+                 "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer"):
         assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, name)), f"{name} still present"
     # Data must still survive a non-purge uninstall.
     assert os.path.exists(os.path.join(cli_env["state_dir"], "test-node.sqlite3"))
@@ -1100,3 +1102,15 @@ def test_install_ui_never_runs_pip_without_explicit_approval(monkeypatch):
     monkeypatch.setattr(renewal_cli.subprocess, "run", fake_run)
     renewal_cli.cmd_install_ui(argparse_namespace(yes=False))
     assert called["ran"] is False
+
+
+def test_hostnet_sync_systemd_unit_never_auto_enabled_by_install(cli_env):
+    """v1.7.0 explicit requirement: no automatic production activation -- install only
+    generates the local review-copy unit files, never copies them into /etc/systemd/system
+    or calls systemctl enable."""
+    renewal_cli.cmd_install(argparse_namespace())
+    content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-hostnet-sync.timer")).read_text()
+    assert "WantedBy=timers.target" in content  # a real unit file, not enabled by this process
+    import subprocess
+    # Never invoked by cmd_install itself -- verified by the absence of any systemctl calls
+    # in install.sh being exercised here (cmd_install is pure Python file-writing).

@@ -34,6 +34,8 @@ import policy as pol
 import renewal_cli
 import shadow_monitor as sm
 import virtualizor_info as vinfo
+import hostnet
+import hostnet_sync
 
 GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/TheTixoCloud/tixo-renewal/releases/latest"
 DEFAULT_DISPLAY_TZ = "Asia/Tehran"
@@ -148,13 +150,23 @@ def format_local_time(iso_utc_str: str, tz_name: str = DEFAULT_DISPLAY_TZ) -> st
     """Pure display conversion -- the stored timestamp (always UTC ISO-8601 throughout this
     project) is never altered, only how it's PRINTED. Falls back to the raw UTC string if the
     timezone name or the stored timestamp is malformed, rather than raising in a dashboard
-    render (never let a display bug crash the menu)."""
+    render (never let a display bug crash the menu).
+
+    v1.7.0: when the configured display timezone is Asia/Tehran, dates are additionally shown
+    using the Jalali (Persian solar) calendar alongside the Gregorian clock time -- the
+    underlying wall-clock time (hour/minute/second, correctly DST/UTC-offset-adjusted via
+    zoneinfo) is identical either way; only the CALENDAR used for the date portion differs.
+    Any other timezone keeps the plain Gregorian format."""
     from zoneinfo import ZoneInfo
     try:
         dt = datetime.fromisoformat(iso_utc_str)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         local = dt.astimezone(ZoneInfo(tz_name))
+        if tz_name == "Asia/Tehran":
+            import jalali
+            jalali_date = jalali.format_jalali_date(local)
+            return f"{jalali_date} {local.strftime('%H:%M:%S %Z')} (Jalali)"
         return f"{local.strftime('%Y-%m-%d %H:%M:%S %Z')}"
     except Exception:
         return f"{iso_utc_str} (UTC)"
@@ -295,11 +307,23 @@ def _systemctl(*args) -> str:
 def collect_timer_status() -> dict:
     out = {}
     for unit in ("virt-renewal-monitor.timer", "virt-renewal-apply.timer",
-                 "virt-renewal-readiness-notifier.timer"):
+                 "virt-renewal-readiness-notifier.timer", "virt-renewal-inventory-sync.timer"):
         enabled = _systemctl("is-enabled", unit)
         active = _systemctl("is-active", unit)
         out[unit] = {"enabled": enabled, "active": active}
     return out
+
+
+def classify_timer_health(active: str, enabled: str) -> str:
+    """ACTIVE / INACTIVE / FAILED / UNKNOWN -- NEVER reports ACTIVE just because the unit
+    file exists or is enabled; only systemctl's own reported `active` state counts."""
+    if active == "active":
+        return "ACTIVE"
+    if active == "failed":
+        return "FAILED"
+    if active in ("inactive", "") and enabled in ("enabled", "disabled", "static"):
+        return "INACTIVE"
+    return "UNKNOWN"
 
 
 def collect_dashboard_data(config_dir: str, state_dir: str) -> dict:
@@ -355,6 +379,33 @@ def collect_dashboard_data(config_dir: str, state_dir: str) -> dict:
     except Exception as e:
         data["nodes_error"] = str(e)
     data["timers"] = collect_timer_status()
+
+    # v1.7.0: fleet inventory/analytics + auto-sync health, surfaced prominently on the
+    # dashboard itself rather than requiring a separate screen visit.
+    try:
+        inv_conn = inv.open_db(_inventory_db_path())
+        sync_info = inv.last_sync_info(inv_conn, "self")
+        sync_state = isync.load_sync_state(state_dir)
+        settings = load_dashboard_settings(config_dir)
+        records = inv.latest_records(inv_conn, "self")
+        freshness = isync.classify_freshness(
+            sync_info["captured_at"] if sync_info else None, sync_state["last_attempt_status"],
+            settings["refresh_interval_minutes"])
+        threshold = Decimal(settings["usage_threshold_percent"])
+        fleet = analytics.compute_bandwidth_analytics(records, usage_threshold_percent=threshold)
+        data["inventory"] = {
+            "sync_info": sync_info, "freshness": freshness,
+            "last_attempt_status": sync_state["last_attempt_status"],
+            "last_attempt_error": sync_state.get("last_error"),
+            "refresh_interval_minutes": settings["refresh_interval_minutes"],
+            "fleet": fleet,
+        }
+    except Exception as e:
+        data["inventory_error"] = str(e)
+
+    inv_timer = data["timers"].get("virt-renewal-inventory-sync.timer", {})
+    data["inventory_sync_timer_health"] = classify_timer_health(
+        inv_timer.get("active", ""), inv_timer.get("enabled", ""))
     return data
 
 
@@ -396,11 +447,48 @@ def render_dashboard(data: dict, style: Style, display_tz: str = "UTC") -> str:
             lines.append(f"    {style.RED}Failed/uncertain (never auto-retried):{style.RESET}")
             for vpsid, period_key, status in failed[:5]:
                 lines.append(f"      vpsid={vpsid} period={period_key} status={status}")
-    lines.append(f"\n  {style.BOLD}Timers:{style.RESET}")
+    lines.append(f"\n  {style.BOLD}Renewal timers:{style.RESET}")
     for unit, status in data.get("timers", {}).items():
+        if unit == "virt-renewal-inventory-sync.timer":
+            continue  # shown in its own Inventory/Auto-sync section below
         active = status["active"]
         color = style.GREEN if active == "active" else style.DIM
         lines.append(f"    {unit}: enabled={status['enabled']} {color}active={active}{style.RESET}")
+
+    lines.append(f"\n  {style.BOLD}{style.ACCENT}Inventory & Auto-Sync:{style.RESET}")
+    inv_data = data.get("inventory")
+    if inv_data is None:
+        lines.append(f"    {style.RED}unavailable: {data.get('inventory_error')}{style.RESET}")
+    else:
+        health = data["inventory_sync_timer_health"]
+        health_color = {"ACTIVE": style.GREEN, "FAILED": style.RED,
+                         "INACTIVE": style.YELLOW, "UNKNOWN": style.GRAY}[health]
+        timer_cfg = data["timers"].get("virt-renewal-inventory-sync.timer", {})
+        lines.append(f"    Auto-sync timer: {health_color}{health}{style.RESET} "
+                     f"(enabled={timer_cfg.get('enabled', '?')})")
+        lines.append(f"    Configured interval: {inv_data['refresh_interval_minutes']} min")
+        sync_info = inv_data["sync_info"]
+        if sync_info:
+            lines.append(f"    Last successful sync: {format_local_time(sync_info['captured_at'], display_tz)}")
+            total = sync_info.get("authoritative_total")
+            count = sync_info["record_count"]
+            complete_color = style.GREEN if (total is None or count == total) else style.RED
+            lines.append(f"    Coverage: {complete_color}{count}/{total if total is not None else '?'}{style.RESET}  "
+                         f"Freshness: {inv_data['freshness']}")
+        else:
+            lines.append(f"    {style.GRAY}No inventory sync has run yet.{style.RESET}")
+        if inv_data["last_attempt_status"] not in (None, "OK"):
+            lines.append(f"    {style.RED}Last attempt: {inv_data['last_attempt_status']} "
+                         f"-- {inv_data.get('last_attempt_error')}{style.RESET}")
+        fleet = inv_data["fleet"]
+        lines.append(f"    Current VPS count: {fleet['total_vps']}  "
+                     f"Limited: {fleet['limited_vps_count']}  Unlimited: {fleet['unlimited_vps_count']}")
+        lines.append(f"    Allocated (limited): {fleet['limited_quota_sum_gb']} GB   "
+                     f"Used (limited): {fleet['limited_used_sum_gb']} GB   "
+                     f"Remaining: {fleet['limited_remaining_sum_gb']} GB")
+        lines.append(f"    Used (unlimited): {fleet['unlimited_used_sum_gb']} GB   "
+                     f"Used (entire fleet): {fleet['total_used_all_vps_gb']} GB   "
+                     f"{style.GRAY}-- quota allocation, not sold/billed bandwidth{style.RESET}")
     return "\n".join(lines)
 
 
@@ -416,6 +504,31 @@ def render_progress_bar(percent, width: int = 20, style: Style = None) -> str:
     color = style.RED if pct >= 90 else (style.YELLOW if pct >= 70 else style.GREEN)
     bar = color + "#" * filled + style.RESET + "-" * (width - filled)
     return f"[{bar}] {pct:.1f}%"
+
+
+def _format_bytes_human(num_bytes) -> str:
+    """Decimal (SI) units -- GB/TB mean 10^9/10^12 bytes here, matching how storage/traffic
+    is conventionally marketed and billed, NOT the binary GiB/TiB (2^30/2^40) a kernel
+    sometimes reports. Documented explicitly since the two differ by ~7% at this scale."""
+    try:
+        n = float(num_bytes)
+    except (TypeError, ValueError):
+        return "unavailable"
+    for unit, divisor in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if n >= divisor:
+            return f"{n / divisor:.2f} {unit}"
+    return f"{n:.0f} B"
+
+
+def _format_bits_per_sec_human(bytes_per_sec) -> str:
+    try:
+        bps = float(bytes_per_sec) * 8
+    except (TypeError, ValueError):
+        return "unavailable"
+    for unit, divisor in (("Gbps", 1e9), ("Mbps", 1e6), ("Kbps", 1e3)):
+        if bps >= divisor:
+            return f"{bps / divisor:.2f} {unit}"
+    return f"{bps:.0f} bps"
 
 
 def _format_uptime_human(seconds) -> str:
@@ -504,18 +617,25 @@ def render_host_info(info: dict, style: Style, show_virtual_interfaces: bool = F
 
     lines.append("")
     all_ifaces = info["network_interfaces"]
-    physical = [i for i in all_ifaces if not i.get("is_virtual")]
-    virtual_count = len(all_ifaces) - len(physical)
+    # Default view: hide known-virtual (per-VM) interfaces AND interfaces that are neither
+    # virtual nor carry any usable information (state/IP/counters all unavailable) -- an
+    # unfamiliar-but-genuinely-informative interface is NEVER hidden just because its name
+    # looks unusual, only because it has nothing to show.
+    default_shown = [i for i in all_ifaces if not i.get("is_virtual") and not i.get("is_uninformative")]
+    hidden_count = len(all_ifaces) - len(default_shown)
     lines.append(_section(style, "NETWORK"))
-    shown = all_ifaces if show_virtual_interfaces else physical
+    shown = all_ifaces if show_virtual_interfaces else default_shown
     if not shown:
         lines.append(f"  {style.GRAY}(no interfaces to show){style.RESET}")
     for iface in shown:
         tag = f" {style.GRAY}[virtual]{style.RESET}" if iface.get("is_virtual") else ""
-        lines.append(f"  {iface['name']}: {iface['state']}, {iface['ipv4']}{tag}")
-    if not show_virtual_interfaces and virtual_count:
-        lines.append(f"  {style.GRAY}... {virtual_count} virtual interface(s) hidden "
-                     f"(see 'Show all network interfaces'){style.RESET}")
+        rx, tx = iface.get("rx_bytes"), iface.get("tx_bytes")
+        rx_str = f"RX {_format_bytes_human(rx)}" if isinstance(rx, int) else "RX unavailable"
+        tx_str = f"TX {_format_bytes_human(tx)}" if isinstance(tx, int) else "TX unavailable"
+        lines.append(f"  {iface['name']}: {iface['state']}, {iface['ipv4']} ({rx_str}, {tx_str}){tag}")
+    if not show_virtual_interfaces and hidden_count:
+        lines.append(f"  {style.GRAY}... {hidden_count} interface(s) hidden (virtual or "
+                     f"uninformative) -- see 'Show all network interfaces (advanced)'{style.RESET}")
 
     lines.append("")
     lines.append(_section(style, "TIMEZONE"))
@@ -578,12 +698,22 @@ def filter_and_sort_vps(records: list[dict], search: str = None, status_filter: 
     if search:
         s = search.lower()
         out = [r for r in out if s in str(r.get("vpsid", "")).lower()
-               or s in str(r.get("hostname", "")).lower()]
+               or s in str(r.get("hostname", "")).lower()
+               or s in str(r.get("ip_primary", "")).lower()]
     if status_filter:
         out = [r for r in out if str(r.get("status", "")).lower() == status_filter.lower()]
+
+    numeric_fields = ("vpsid", "quota_gb", "used_gb")
+    def sort_key(r):
+        value = r.get(sort_by)
+        if sort_by in numeric_fields:
+            try:
+                return (0, Decimal(str(value)))
+            except Exception:
+                return (1, Decimal(0))  # unparseable values sort after valid numeric ones
+        return (0, str(value or ""))
     try:
-        out = sorted(out, key=lambda r: (str(r.get(sort_by, "")) if sort_by not in
-                     ("vpsid",) else r.get(sort_by, 0)))
+        out = sorted(out, key=sort_key)
     except TypeError:
         pass
     return out
@@ -601,10 +731,21 @@ def _status_color(status, style: Style) -> str:
 
 
 def render_vps_table(records: list[dict], style: Style) -> str:
+    """VPS ID | Hostname | Primary IP | Status | Quota | Used | Usage% -- column widths
+    adapt to the terminal width (narrower hostname/IP columns on a narrow terminal rather
+    than wrapping/corrupting the table)."""
     if not records:
         return f"  {style.GRAY}(no VPS records -- run an inventory sync first){style.RESET}"
-    header = (f"  {'VPSID':>7}  {'HOSTNAME':<22}  {'STATUS':<10}  {'QUOTA_GB':>9}  "
-              f"{'USED_GB':>9}  {'USAGE':<14}")
+    try:
+        import shutil
+        term_width = shutil.get_terminal_size(fallback=(100, 24)).columns
+    except Exception:
+        term_width = 100
+    narrow = term_width < 100
+    host_w, ip_w = (16, 13) if narrow else (22, 15)
+
+    header = (f"  {'VPSID':>7}  {'HOSTNAME':<{host_w}}  {'IP':<{ip_w}}  {'STATUS':<10}  "
+              f"{'QUOTA_GB':>9}  {'USED_GB':>9}  {'USAGE':<14}")
     lines = [style.BOLD + style.ACCENT + header + style.RESET]
     for r in records:
         quota, used = r.get("quota_gb"), r.get("used_gb")
@@ -619,7 +760,9 @@ def render_vps_table(records: list[dict], style: Style) -> str:
         usage_display = "UNLIMITED" if is_unlimited else render_progress_bar(
             float(pct) if pct is not None else None, width=10, style=style)
         color = _status_color(r.get("status"), style)
-        lines.append(f"  {r['vpsid']:>7}  {str(r.get('hostname'))[:22]:<22}  "
+        ip = str(r.get("ip_primary", "unavailable"))
+        lines.append(f"  {r['vpsid']:>7}  {str(r.get('hostname'))[:host_w]:<{host_w}}  "
+                     f"{ip[:ip_w]:<{ip_w}}  "
                      f"{color}{str(r.get('status'))[:10]:<10}{style.RESET}  "
                      f"{str(quota):>9}  {str(used):>9}  {usage_display}")
     return "\n".join(lines)
@@ -640,6 +783,53 @@ def render_vps_detail(record: dict, style: Style) -> str:
     lines.append(f"  Node (serid):   {record.get('node_serid')}")
     lines.append(f"  Primary IP:     {record.get('ip_primary')}")
     lines.append(f"  IP count:       {record.get('ip_count')}")
+    ip_list = record.get("ip_list")
+    if isinstance(ip_list, list) and ip_list:
+        lines.append(f"  All assigned IPs: {', '.join(str(ip) for ip in ip_list)}")
+    return "\n".join(lines)
+
+
+def render_hostnet_panel(interface: str, cumulative: dict, live_rate: dict,
+                          recent_sample: dict, style: Style, display_tz: str = "UTC") -> str:
+    """HOST NETWORK -- <interface> panel per the spec layout. `cumulative`/`recent_sample`
+    may be None (never sampled yet); `live_rate` may be None (fewer than 2 samples, or the
+    most recent pair spans a discontinuity) -- both cases rendered honestly, never
+    fabricated as zero."""
+    lines = [f"{style.BOLD}{style.ACCENT}HOST NETWORK -- {interface}{style.RESET}"]
+    if cumulative is None:
+        lines.append(f"  {style.GRAY}No samples recorded yet for this interface.{style.RESET}")
+        return "\n".join(lines)
+
+    rx_total = cumulative["cumulative_rx_bytes"]
+    tx_total = cumulative["cumulative_tx_bytes"]
+    lines.append(f"  RX Total:       {_format_bytes_human(rx_total)}")
+    lines.append(f"  TX Total:       {_format_bytes_human(tx_total)}")
+    lines.append(f"  Combined Total: {_format_bytes_human(rx_total + tx_total)}")
+    lines.append("")
+    if live_rate is None:
+        lines.append(f"  RX Speed:       {style.GRAY}unavailable{style.RESET}")
+        lines.append(f"  TX Speed:       {style.GRAY}unavailable{style.RESET}")
+        lines.append(f"  Combined Speed: {style.GRAY}unavailable{style.RESET}")
+    else:
+        rx_bps, tx_bps = live_rate["rx_bytes_per_sec"], live_rate["tx_bytes_per_sec"]
+        lines.append(f"  RX Speed:       {_format_bits_per_sec_human(rx_bps)}")
+        lines.append(f"  TX Speed:       {_format_bits_per_sec_human(tx_bps)}")
+        lines.append(f"  Combined Speed: {_format_bits_per_sec_human(rx_bps + tx_bps)}")
+    lines.append("")
+    if recent_sample:
+        lines.append(f"  Last Sample:        {format_local_time(recent_sample['sampled_at'], display_tz)}")
+    if cumulative.get("first_sample_at"):
+        lines.append(f"  Monitoring Coverage: since {format_local_time(cumulative['first_sample_at'], display_tz)}")
+    if recent_sample and recent_sample.get("discontinuity_type") == hostnet.DISCONTINUITY_REBOOT:
+        lines.append(f"  {style.YELLOW}Last Reboot:         detected at {format_local_time(recent_sample['sampled_at'], display_tz)}{style.RESET}")
+    gap = recent_sample.get("gap_seconds") if recent_sample else None
+    if recent_sample and recent_sample.get("discontinuity_type"):
+        lines.append(f"  {style.YELLOW}Data Quality: discontinuity ({recent_sample['discontinuity_type']}) "
+                     f"at last sample -- some traffic in this gap is not observable, never invented.{style.RESET}")
+    elif gap and gap > 0:
+        lines.append(f"  Data Quality: OK (last gap {gap:.0f}s)")
+    lines.append(f"\n  {style.GRAY}RX/TX are measured from THIS HOST's interface -- not automatically "
+                 f"'customer download/upload'. GB/TB here are decimal (10^9/10^12 bytes).{style.RESET}")
     return "\n".join(lines)
 
 
@@ -801,40 +991,41 @@ def action_uninstall():
     renewal_cli.cmd_uninstall(argparse.Namespace(purge=purge))
 
 
-def action_system_info(style: Style, show_virtual_interfaces: bool = False):
-    """v1.6.0: host AND Virtualizor information are always shown together on this one
-    screen -- Virtualizor version/hypervisor no longer require a separate keypress to
-    reveal. Only the (optional, separately toggled) full virtual-interface listing stays
-    behind an explicit action, since that's the part that can flood the screen with one
-    entry per VM on a busy hypervisor."""
-    print(render_host_info(hostinfo.collect_host_info(), style,
-                            show_virtual_interfaces=show_virtual_interfaces))
-    print()
+def collect_virtualizor_info() -> dict:
     v_info = {
         "installed": vinfo.detect_virtualizor_installed(),
         "version": vinfo.detect_virtualizor_version(),
         "virtualization_technologies": vinfo.detect_virtualization_technologies(),
         "api": None,
     }
-    node_id = "self"
     try:
         import credentials as creds_mod
-        path = creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, node_id)
+        path = creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, "self")
         if os.path.exists(path):
             creds = creds_mod.load_credentials(path)
             v_info["api"] = vinfo.probe_api_latency(creds)
     except Exception:
         pass
-    print(render_virtualizor_info(v_info, style))
+    return v_info
 
-    if not show_virtual_interfaces:
-        print(f"\n{style.GRAY}Type 'v' + Enter to also show virtual network interfaces, or "
-              f"just press Enter to continue.{style.RESET}")
-        if input("> ").strip().lower() == "v":
-            clear_screen()
-            print(f"{style.GRAY}TixoCloud Control Center{style.RESET} {style.ACCENT}>{style.RESET} "
-                  f"{style.BOLD}System & Virtualizor information (all interfaces){style.RESET}\n")
-            return action_system_info(style, show_virtual_interfaces=True)
+
+def action_system_info(style: Style, show_virtual_interfaces: bool = False):
+    """v1.7.0: the obsolete 'v' sub-prompt is gone -- host info and Virtualizor info are
+    ALWAYS both printed on this one screen, unconditionally, with no extra keystroke able to
+    gate either section. The full (unfiltered) network-interface listing is now a completely
+    separate, explicitly-labeled main-menu action (see action_system_info_advanced below),
+    not a nested prompt inside this screen -- so the default and advanced views are reached
+    through two visibly different menu entries, never confusable with each other."""
+    print(render_host_info(hostinfo.collect_host_info(), style,
+                            show_virtual_interfaces=show_virtual_interfaces))
+    print()
+    print(render_virtualizor_info(collect_virtualizor_info(), style))
+
+
+def action_system_info_advanced(style: Style):
+    print(f"{style.BOLD}{style.ACCENT}=== Advanced: all network interfaces (including "
+          f"virtual) ==={style.RESET}\n")
+    action_system_info(style, show_virtual_interfaces=True)
 
 
 def _inventory_db_path() -> str:
@@ -904,28 +1095,45 @@ def action_inventory_view(style: Style, node_id: str = "self"):
         sync_info["captured_at"] if sync_info else None, state["last_attempt_status"],
         settings["refresh_interval_minutes"])
 
-    print(_render_coverage_banner(sync_info, style))
-    print(f"Freshness: {freshness}" + (f"   Last sync: {format_local_time(sync_info['captured_at'], load_display_tz(renewal_cli.CONFIG_DIR))}" if sync_info else ""))
-    print()
-
     page = 1
     page_size = 20
     search = None
     status_filter = None
+    sort_by = "vpsid"
     while True:
-        filtered = filter_and_sort_vps(records, search=search, status_filter=status_filter)
+        # v1.7.0 fix: clear and redraw the ENTIRE screen on every loop iteration -- the
+        # previous version never cleared between page/search/filter actions, so each new
+        # (often shorter, filtered) table render scrolled in underneath the previous one's
+        # leftover rows, producing exactly the "confusing output and repeated partial table
+        # rows" the operator reported. Every iteration now starts from a clean screen.
+        clear_screen()
+        print(f"{style.GRAY}TixoCloud Control Center{style.RESET} {style.ACCENT}>{style.RESET} "
+              f"{style.BOLD}View VPS inventory & analytics{style.RESET}")
+        print(f"{style.GRAY}{'-' * 60}{style.RESET}\n")
+        print(_render_coverage_banner(sync_info, style))
+        print(f"Freshness: {freshness}" + (f"   Last sync: {format_local_time(sync_info['captured_at'], load_display_tz(renewal_cli.CONFIG_DIR))}" if sync_info else ""))
+        print()
+
+        filtered = filter_and_sort_vps(records, search=search, status_filter=status_filter, sort_by=sort_by)
         page_records, page, total_pages = paginate(filtered, page=page, page_size=page_size)
         print(render_vps_table(page_records, style))
-        print(f"\n  Page {page}/{total_pages}  ({len(filtered)} matching of {len(records)} total)")
-        print(f"  {style.GRAY}[n]ext page  [p]rev page  [s]earch  [f]ilter status  "
+        print(f"\n  Page {page}/{total_pages}  ({len(filtered)} matching of {len(records)} total)  "
+              f"sorted by: {sort_by}")
+        print(f"  {style.GRAY}[n]ext page  [p]rev page  [s]earch  [f]ilter status  [o]rder/sort  "
               f"[d] VPS detail  [c]lear filters  [r]efresh now (manual override)  [0] back{style.RESET}")
         choice = input("> ").strip().lower()
         if choice in ("0", ""):
             break
+        elif choice == "o":
+            raw = input("Sort by (id/name/quota/usage), blank keeps current: ").strip().lower()
+            sort_map = {"id": "vpsid", "name": "hostname", "quota": "quota_gb", "usage": "used_gb"}
+            if raw in sort_map:
+                sort_by = sort_map[raw]
+            page = 1
         elif choice == "n":
-            page += 1
+            page = min(page + 1, total_pages)  # clamped -- never silently drifts past the real last page
         elif choice == "p":
-            page -= 1
+            page = max(page - 1, 1)
         elif choice == "s":
             search = input("Search (VPS ID, hostname): ").strip() or None
             page = 1
@@ -944,7 +1152,7 @@ def action_inventory_view(style: Style, node_id: str = "self"):
             freshness = isync.classify_freshness(
                 sync_info["captured_at"] if sync_info else None, state["last_attempt_status"],
                 settings["refresh_interval_minutes"])
-            print(_render_coverage_banner(sync_info, style))
+            input(f"{style.GRAY}Press Enter to continue.{style.RESET}")
         elif choice == "d":
             vpsid_raw = input("VPS ID to view: ").strip()
             try:
@@ -981,10 +1189,67 @@ def action_configure_dashboard_settings():
     print("Dashboard settings updated.")
 
 
+def action_configure_hostnet_interface():
+    """Requires explicit operator confirmation before saving -- never auto-selects an
+    interface, matching the 'clear operator confirmation' requirement."""
+    candidates = hostnet_sync.suggest_interfaces()
+    current = hostnet_sync.load_settings(renewal_cli.CONFIG_DIR).get("interface")
+    print(f"Currently monitored interface: {current or '(none configured)'}")
+    if not candidates:
+        print("No physical/management candidate interfaces detected.")
+        return
+    print("Candidates (most active first):")
+    for i, c in enumerate(candidates, 1):
+        rx = c.get("rx_bytes"); tx = c.get("tx_bytes")
+        print(f"  {i}. {c['name']}  state={c['state']}  ipv4={c['ipv4']}  "
+              f"rx={rx if rx != 'unavailable' else '?'} tx={tx if tx != 'unavailable' else '?'}")
+    raw = input("Select a number to monitor, or type an interface name, blank to cancel: ").strip()
+    if not raw:
+        print("Cancelled.")
+        return
+    try:
+        idx = int(raw) - 1
+        chosen = candidates[idx]["name"]
+    except (ValueError, IndexError):
+        chosen = raw
+    if not _confirm(f"Monitor interface '{chosen}' for host network accounting?"):
+        print("Cancelled.")
+        return
+    try:
+        hostnet_sync.save_monitored_interface(renewal_cli.CONFIG_DIR, chosen, confirmed=True)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+    print(f"Now monitoring '{chosen}'. Sampling runs on its own schedule, independent of "
+          f"renewal/inventory timers; use 'Host network traffic' to view it, or run a "
+          f"sample manually with the hostnet-sync CLI command.")
+
+
+def action_view_hostnet(style: Style):
+    settings = hostnet_sync.load_settings(renewal_cli.CONFIG_DIR)
+    interface = settings.get("interface")
+    tz = load_display_tz(renewal_cli.CONFIG_DIR)
+    if not interface:
+        print(f"{style.YELLOW}No interface configured yet -- use 'Configure host network "
+              f"monitoring interface' first.{style.RESET}")
+        return
+    conn = hostnet.open_db(os.path.join(renewal_cli.STATE_DIR, "hostnet.sqlite3"))
+    cumulative = hostnet.get_cumulative(conn, interface)
+    live_rate = hostnet.compute_live_throughput(conn, interface)
+    recent = hostnet.get_recent_samples(conn, interface, limit=1)
+    recent_sample = recent[-1] if recent else None
+    print(render_hostnet_panel(interface, cumulative, live_rate, recent_sample, style, display_tz=tz))
+    print(f"\n  {style.GRAY}[r] force one manual sample now, or press Enter to continue.{style.RESET}")
+    if input("> ").strip().lower() == "r":
+        result = hostnet_sync.run_hostnet_sample(renewal_cli.STATE_DIR, renewal_cli.CONFIG_DIR)
+        print(f"Sample result: {result['status']}")
+
+
 MENU_ITEMS = [
     ("Install / Initial Setup", action_install),
     ("Dashboard", None),  # needs style, wired specially below
     ("System & Virtualizor information", None),  # needs style, wired specially below
+    ("Show all network interfaces (advanced)", None),  # needs style, wired specially below
     # v1.6.0: manual "Sync VPS inventory" removed from the main menu -- inventory now
     # refreshes automatically on its own systemd timer (virt-renewal-inventory-sync.timer,
     # configurable interval, entirely independent of the renewal engine's own timers). A
@@ -997,6 +1262,8 @@ MENU_ITEMS = [
     ("Configure monitor/apply/notifier intervals", action_configure_intervals),
     ("Configure dashboard refresh interval & usage threshold", action_configure_dashboard_settings),
     ("Configure display timezone (default Asia/Tehran)", action_configure_timezone),
+    ("Configure host network monitoring interface", action_configure_hostnet_interface),
+    ("Host network traffic (live)", None),  # needs style, wired specially below
     ("Enable automatic renewal", lambda: action_toggle_auto_renewal(True)),
     ("Disable automatic renewal", lambda: action_toggle_auto_renewal(False)),
     ("View logs and renewal history", action_view_logs),
@@ -1059,8 +1326,12 @@ def run_menu():
                     action_dashboard(style)
                 elif label == "System & Virtualizor information":
                     action_system_info(style)
+                elif label == "Show all network interfaces (advanced)":
+                    action_system_info_advanced(style)
                 elif label == "View VPS inventory & analytics":
                     action_inventory_view(style)
+                elif label == "Host network traffic (live)":
+                    action_view_hostnet(style)
                 else:
                     fn()
             except Exception as e:
