@@ -1,0 +1,14 @@
+[Unit]
+Description=Tixo Renewal readiness notifier (read-only; reads existing monitor ledger only)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/tixo-renewal/lib/readiness_notifier.py \
+    --db /opt/tixo-renewal/shadow-monitor-state/self.sqlite3 \
+    --node self \
+    --policy-config /opt/tixo-renewal/renewal-config/policy.json \
+    --notified-state /opt/tixo-renewal/shadow-monitor-state/readiness-notified.json \
+    --alert-log /opt/tixo-renewal/shadow-monitor-state/readiness-alerts.log
+WorkingDirectory=/opt/tixo-renewal
+User=root

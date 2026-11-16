@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the Tixo Renewal readiness notifier every 30 minutes (read-only, local data only)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target
