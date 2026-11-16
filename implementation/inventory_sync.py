@@ -125,7 +125,11 @@ def run_inventory_sync(conn, node_id: str, creds, state_dir: str, call_listvs_ap
     WRITE_APPROVED -- this path performs no write of any kind to Virtualizor, ever."""
     import inventory as inv
     import virtualizor_info as vinfo
-    call_listvs_api = call_listvs_api or __import__("writer").call_listvs_api
+    # NOTE: despite the parameter's historical name, the real default is writer.call_vs_api
+    # (`act=vs`) -- confirmed empirically to be the actual per-VPS listing endpoint; the
+    # similarly-named call_listvs_api (`act=listvs`) lists physical servers/nodes, not VPSs,
+    # on the installation this was verified against. See writer.call_listvs_api's docstring.
+    call_listvs_api = call_listvs_api or __import__("writer").call_vs_api
     parse_listvs_response = parse_listvs_response or vinfo.parse_listvs_response
 
     try:

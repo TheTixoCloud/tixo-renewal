@@ -12,10 +12,10 @@ def make_parse_result(records, complete=True, error=None):
 
 
 def rec(vpsid, hostname="h", status="running", quota="100", used="10", ram="1024",
-        cores="1", disk="20", virt="kvm"):
+        cores="1", disk="20", virt="kvm", locked="unavailable", node_serid="unavailable"):
     return {"vpsid": vpsid, "hostname": hostname, "status": status, "quota_gb": Decimal(quota),
             "used_gb": Decimal(used), "ram_mb": ram, "cores": cores, "disk_gb": disk,
-            "virtualization": virt}
+            "virtualization": virt, "locked": locked, "node_serid": node_serid}
 
 
 def test_ingest_rejects_incomplete_snapshot_without_writing(tmp_path):

@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS snapshot_records (
     cores TEXT,
     disk_gb TEXT,
     virtualization TEXT,
+    locked TEXT,
+    node_serid TEXT,
     PRIMARY KEY (snapshot_id, vpsid)
 );
 
@@ -72,11 +74,12 @@ def latest_snapshot_id(conn: sqlite3.Connection, node_id: str):
 
 def _load_snapshot_records(conn: sqlite3.Connection, snapshot_id: int) -> dict:
     rows = conn.execute(
-        "SELECT vpsid, hostname, status, quota_gb, used_gb, ram_mb, cores, disk_gb, virtualization "
-        "FROM snapshot_records WHERE snapshot_id=?", (snapshot_id,)
+        "SELECT vpsid, hostname, status, quota_gb, used_gb, ram_mb, cores, disk_gb, virtualization, "
+        "locked, node_serid FROM snapshot_records WHERE snapshot_id=?", (snapshot_id,)
     ).fetchall()
     return {r[0]: {"hostname": r[1], "status": r[2], "quota_gb": r[3], "used_gb": r[4],
-                   "ram_mb": r[5], "cores": r[6], "disk_gb": r[7], "virtualization": r[8]}
+                   "ram_mb": r[5], "cores": r[6], "disk_gb": r[7], "virtualization": r[8],
+                   "locked": r[9], "node_serid": r[10]}
             for r in rows}
 
 
@@ -106,10 +109,12 @@ def ingest_snapshot(conn: sqlite3.Connection, node_id: str, parse_result: dict,
         for r in records:
             conn.execute(
                 "INSERT INTO snapshot_records (snapshot_id, vpsid, hostname, status, quota_gb, "
-                "used_gb, ram_mb, cores, disk_gb, virtualization) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "used_gb, ram_mb, cores, disk_gb, virtualization, locked, node_serid) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (snapshot_id, r["vpsid"], str(r["hostname"]), str(r["status"]), str(r["quota_gb"]),
                  str(r["used_gb"]), str(r["ram_mb"]), str(r["cores"]), str(r["disk_gb"]),
-                 str(r["virtualization"])),
+                 str(r["virtualization"]), str(r.get("locked", "unavailable")),
+                 str(r.get("node_serid", "unavailable"))),
             )
             known = conn.execute(
                 "SELECT first_seen_at FROM known_vps WHERE node_id=? AND vpsid=?",
@@ -150,7 +155,7 @@ def _diff_snapshots(prev: dict, current: dict) -> dict:
     for vpsid in sorted(prev_ids & current_ids):
         old, new = prev[vpsid], current[vpsid]
         changed_fields = {}
-        for field in ("hostname", "status", "quota_gb", "used_gb", "ram_mb", "cores", "disk_gb"):
+        for field in ("hostname", "status", "quota_gb", "used_gb", "ram_mb", "cores", "disk_gb", "locked"):
             old_val = old.get(field)
             new_val = str(new.get(field))
             if old_val is not None and old_val != new_val:

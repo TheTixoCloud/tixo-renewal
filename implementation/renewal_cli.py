@@ -20,7 +20,7 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 # Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
 # apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
@@ -963,6 +963,38 @@ def cmd_inventory_status(args):
     return 0
 
 
+def cmd_install_ui(args):
+    """Explicit, operator-initiated installation of the OPTIONAL Textual UI dependency.
+    NEVER run automatically by install.sh or any other command -- the one-command installer's
+    zero-third-party-dependency guarantee stays intact for everyone who doesn't run this.
+    Requires either an interactive 'yes' confirmation or --yes; installs into the current
+    user's site-packages via `pip install --user textual` (list-of-args subprocess, never
+    shell=True). If Textual is already importable, this is a no-op."""
+    try:
+        import textual  # noqa: F401
+        print(f"Textual is already installed (version {getattr(textual, '__version__', '?')}).")
+        return 0
+    except ImportError:
+        pass
+    print("This will install the optional 'textual' package (and its own dependencies) via:")
+    print(f"  {sys.executable} -m pip install --user textual")
+    print("This is NEVER done automatically -- it only runs because you explicitly asked for it.")
+    if not getattr(args, "yes", False):
+        reply = input("Proceed? [y/N]: ").strip().lower()
+        if reply != "y":
+            print("Cancelled.")
+            return 1
+    result = subprocess.run([sys.executable, "-m", "pip", "install", "--user", "textual"])
+    if result.returncode != 0:
+        print("pip install failed -- the lightweight CLI menu remains fully functional "
+              "without Textual.")
+        return 1
+    print("Textual installed. The TUI will be used automatically next time you run "
+          "`tixo-renewal` in an interactive terminal (use `tixo-renewal --cli` to force the "
+          "lightweight menu).")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="renewal_cli.py")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -1021,6 +1053,10 @@ def main():
     apply_due_p.add_argument("--node", required=True)
     apply_due_p.add_argument("--non-interactive", action="store_true")
     apply_due_p.set_defaults(func=cmd_apply_due)
+
+    install_ui_p = sub.add_parser("install-ui")
+    install_ui_p.add_argument("--yes", action="store_true")
+    install_ui_p.set_defaults(func=cmd_install_ui)
 
     sub.add_parser("hostinfo").set_defaults(func=cmd_hostinfo)
 

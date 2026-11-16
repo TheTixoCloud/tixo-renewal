@@ -790,6 +790,18 @@ def main():
     if "--version" in sys.argv:
         print(renewal_cli.VERSION)
         return 0
+    force_cli = "--cli" in sys.argv
+    try:
+        import tui_textual
+    except Exception:
+        tui_textual = None
+    if tui_textual is not None and tui_textual.should_use_textual(
+            force_cli=force_cli, is_interactive=is_interactive()):
+        try:
+            return tui_textual.run_textual_app(renewal_cli, sys.modules[__name__])
+        except Exception as e:
+            print(f"Textual UI failed to start ({e}) -- falling back to the lightweight "
+                  f"CLI menu.")
     return run_menu()
 
 

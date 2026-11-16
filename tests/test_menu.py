@@ -390,3 +390,29 @@ def test_render_dashboard_shows_expired_and_failed_entries():
     assert "vpsid=60" in out
     assert "vpsid=61" in out
     assert "API_REPORTED_ERROR" in out
+
+
+# ---------- v1.4: Textual TUI startup/fallback wiring in menu.main() ----------------------
+
+def test_main_falls_back_to_cli_menu_when_textual_unavailable(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["menu.py"])
+    monkeypatch.setitem(sys.modules, "tui_textual", None)
+    called = {}
+    def fake_run_menu():
+        called["ran"] = True
+        return 0
+    monkeypatch.setattr(menu, "run_menu", fake_run_menu)
+    rc = menu.main()
+    assert called.get("ran") is True
+    assert rc == 0
+
+
+def test_main_cli_flag_forces_lightweight_menu(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["menu.py", "--cli"])
+    called = {}
+    def fake_run_menu():
+        called["ran"] = True
+        return 0
+    monkeypatch.setattr(menu, "run_menu", fake_run_menu)
+    rc = menu.main()
+    assert called.get("ran") is True

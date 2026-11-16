@@ -1061,3 +1061,36 @@ def test_write_systemd_units_is_the_single_shared_generator(cli_env):
     assert "OnUnitActiveSec=20min" in content
     notifier_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-readiness-notifier.timer")).read_text()
     assert "OnUnitActiveSec=45min" in notifier_content
+
+
+# ---------- v1.4: optional Textual UI install flow -- never automatic -------------------
+
+def test_install_ui_noop_when_already_importable(monkeypatch, capsys):
+    import types
+    fake_textual = types.ModuleType("textual")
+    fake_textual.__version__ = "1.2.3"
+    monkeypatch.setitem(sys.modules, "textual", fake_textual)
+    rc = renewal_cli.cmd_install_ui(argparse_namespace(yes=True))
+    assert rc == 0
+    assert "already installed" in capsys.readouterr().out
+
+
+def test_install_ui_requires_confirmation_without_yes_flag(monkeypatch):
+    monkeypatch.setitem(sys.modules, "textual", None)
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    rc = renewal_cli.cmd_install_ui(argparse_namespace(yes=False))
+    assert rc == 1
+
+
+def test_install_ui_never_runs_pip_without_explicit_approval(monkeypatch):
+    monkeypatch.setitem(sys.modules, "textual", None)
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    called = {"ran": False}
+    def fake_run(*a, **k):
+        called["ran"] = True
+        class R:
+            returncode = 0
+        return R()
+    monkeypatch.setattr(renewal_cli.subprocess, "run", fake_run)
+    renewal_cli.cmd_install_ui(argparse_namespace(yes=False))
+    assert called["ran"] is False

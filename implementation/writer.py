@@ -362,11 +362,20 @@ def diagnose_listvs_response(creds: ApiCredentials, timeout: int = 20, http_get_
 
 def call_listvs_api(creds: ApiCredentials, timeout: int = 20, http_get=None) -> dict:
     """Calls Virtualizor's `act=listvs` admin API action -- a pure LISTING/read action with
-    NO vpsid, NO `editvps`, NO `theme_edit`, and NO POST body of any kind. This is the
-    documented read-only counterpart to `managevps`'s edit action; it cannot mutate any VPS
-    under any response behavior, because the request itself carries no mutation parameter --
-    unlike probing `managevps` with a sentinel vpsid, which is still a write-shaped request
-    and would only be safe if Virtualizor happens to reject it correctly.
+    NO vpsid, NO `editvps`, NO `theme_edit`, and NO POST body of any kind. It cannot mutate
+    any VPS under any response behavior, because the request itself carries no mutation
+    parameter -- unlike probing `managevps` with a sentinel vpsid, which is still a write-
+    shaped request and would only be safe if Virtualizor happens to reject it correctly.
+
+    NAMING CAVEAT (found empirically on the real ir1 installation in v1.4.0 development,
+    read-only, key-names-only inspection -- never customer values): despite its name,
+    `act=listvs` on this Virtualizor version returns PHYSICAL-SERVER/NODE listing data
+    (`servers`/`stats` keys), NOT individual VPS records. It has been kept, unrenamed, purely
+    because it has always only ever been used as a lightweight "are these credentials/this
+    URL valid" smoke test (validate-credentials/diagnose-api) -- for which any authenticated,
+    error-free JSON response works equally well regardless of which admin entity it lists.
+    For actual per-VPS inventory data, use `call_vs_api()` below (`act=vs`), which was
+    confirmed by the same empirical inspection to return the real per-VPS listing.
 
     Method: HTTP GET. Endpoint: `{base_url}?act=listvs&api=json&adminapikey=...&adminapipass=...`.
     No request body. `http_get` is injectable for tests; defaults to a real GET (never called
@@ -374,6 +383,35 @@ def call_listvs_api(creds: ApiCredentials, timeout: int = 20, http_get=None) -> 
     safe_base_url = credentials_mod.validate_and_normalize_base_url(creds.base_url)
     params = urllib.parse.urlencode({
         "act": "listvs", "api": "json",
+        "adminapikey": creds.api_key, "adminapipass": creds.api_pass,
+    })
+    url = f"{safe_base_url}?{params}"
+    if http_get is None:
+        def http_get(url, timeout):
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode()
+    raw = _safe_call(creds, http_get, url, timeout)
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        parsed = None
+    return {"raw": raw, "parsed": parsed}
+
+
+def call_vs_api(creds: ApiCredentials, timeout: int = 20, http_get=None) -> dict:
+    """Calls Virtualizor's `act=vs` admin API action -- the REAL per-VPS listing endpoint
+    (confirmed empirically, read-only key-names-only, against the real ir1 installation in
+    v1.4.0 development: top-level `vs` dict keyed by vpsid, one entry per VPS, with fields
+    including vpsid/hostname/vps_name/ram/cores/space/bandwidth/used_bandwidth/virt/suspended/
+    machine_status/locked/serid). Same safety shape as call_listvs_api: pure GET, api=json,
+    NO vpsid/editvps/theme_edit/POST body -- cannot mutate anything.
+
+    Method: HTTP GET. Endpoint: `{base_url}?act=vs&api=json&adminapikey=...&adminapipass=...`.
+    `http_get` is injectable for tests; defaults to a real GET (never called by tests)."""
+    safe_base_url = credentials_mod.validate_and_normalize_base_url(creds.base_url)
+    params = urllib.parse.urlencode({
+        "act": "vs", "api": "json",
         "adminapikey": creds.api_key, "adminapipass": creds.api_pass,
     })
     url = f"{safe_base_url}?{params}"
