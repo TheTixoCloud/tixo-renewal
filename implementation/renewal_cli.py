@@ -50,6 +50,16 @@ BACKUP_DIR = os.path.join(WORKSPACE_ROOT, "backups")
 SYSTEMD_OUT_DIR = os.path.join(WORKSPACE_ROOT, "systemd")
 WRITE_APPROVAL_MARKER = os.path.join(CONFIG_DIR, "WRITE_APPROVED")
 
+# TIXO_RENEWAL_LOCK_PATH is shared between the monitor and apply services (NOT the notifier,
+# which only reads and is lower-urgency) -- both touch the same per-node SQLite ledger
+# (snapshots + operations tables). systemd itself already guarantees a single unit can never
+# have two concurrent instances of ITSELF, but monitor and apply are two DIFFERENT units and
+# could otherwise run at once. `flock -n` (non-blocking: skip this run rather than queue/
+# block, since a missed 5-minute tick is harmless and queuing could cause drift/backlog)
+# mirrors the exact pattern already used by this same host's pre-existing virt-carryover-*
+# cron jobs (/run/virt-carryover-guard.lock etc.) -- not a new convention, the established one.
+TIXO_RENEWAL_LOCK_PATH = "/run/tixo-renewal.lock"
+
 SERVICE_UNIT_TEMPLATE = """[Unit]
 Description=Virtualizor Bandwidth Rollover monitor (read-only dry-run)
 After=network-online.target
@@ -58,17 +68,17 @@ After=network-online.target
 Type=oneshot
 Environment=PYTHONPATH={libdir}
 Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
-ExecStart={python} {cli} dry-run
+ExecStart=/usr/bin/flock -n {lockpath} {python} {cli} dry-run
 WorkingDirectory={workdir}
 User={user}
 """
 
 TIMER_UNIT_TEMPLATE = """[Unit]
-Description=Run the Virtualizor Bandwidth Rollover dry-run every 30 minutes
+Description=Run the Virtualizor Bandwidth Rollover dry-run approximately every 5 minutes
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=30min
+OnBootSec=2min
+OnUnitActiveSec=5min
 Unit=virt-renewal-monitor.service
 
 [Install]
@@ -89,17 +99,53 @@ After=network-online.target
 Type=oneshot
 Environment=PYTHONPATH={libdir}
 Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
-ExecStart={python} {cli} apply-due --node self --non-interactive
+ExecStart=/usr/bin/flock -n {lockpath} {python} {cli} apply-due --node self --non-interactive
 WorkingDirectory={workdir}
 User={user}
 """
 
+# OnBootSec=4min (two minutes after the monitor's own OnBootSec=2min) is a deliberate stagger,
+# not load-bearing for correctness (the shared flock above is what actually guarantees no
+# concurrent run) -- it just reduces how often the two even CONTEND for the lock in the first
+# place. OnCalendar=daily was the original safe-by-default placeholder; approximately 5
+# minutes is what "prompt, unattended renewal after a genuine reset" actually requires, now
+# that this is a reviewed, explicitly-approved activation rather than a review-only template.
 RENEWAL_TIMER_UNIT_TEMPLATE = """[Unit]
-Description=NOT ENABLED BY DEFAULT -- unattended renewal apply, once explicitly approved
+Description=Unattended renewal apply, approximately every 5 minutes (writes to production once WRITE_APPROVED exists)
 
 [Timer]
-OnCalendar=daily
+OnBootSec=4min
+OnUnitActiveSec=5min
 Unit=virt-renewal-apply.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+# Readiness notifier: strictly read-only (never touches Virtualizor, never writes to the
+# renewal ledger beyond its own separate notified-state/alert-log files -- see
+# implementation/readiness_notifier.py). Deliberately NOT locked with TIXO_RENEWAL_LOCK_PATH:
+# it only reads the SQLite ledger (WAL mode already supports concurrent readers against a
+# writer) and missing a 30-minute tick under rare lock contention is harmless, unlike skipping
+# a monitor poll or an apply attempt. Kept at 30 minutes -- no technical reason to change it.
+NOTIFIER_SERVICE_UNIT_TEMPLATE = """[Unit]
+Description=Tixo Renewal readiness notifier (read-only; reads existing monitor ledger only)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={python} {libdir}/readiness_notifier.py --db {workdir}/shadow-monitor-state/{db_filename} --node {node_id} --policy-config {workdir}/renewal-config/policy.json --notified-state {workdir}/shadow-monitor-state/readiness-notified.json --alert-log {workdir}/shadow-monitor-state/readiness-alerts.log
+WorkingDirectory={workdir}
+User={user}
+"""
+
+NOTIFIER_TIMER_UNIT_TEMPLATE = """[Unit]
+Description=Run the Tixo Renewal readiness notifier every 30 minutes (read-only, local data only)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+Unit=virt-renewal-readiness-notifier.service
 
 [Install]
 WantedBy=timers.target
@@ -147,7 +193,7 @@ def cmd_install(args):
     lib_dir = os.path.abspath(os.path.join(WORKSPACE_ROOT, "lib"))
     Path(service_path).write_text(SERVICE_UNIT_TEMPLATE.format(
         python=python_path, cli=cli_path, workdir=os.path.abspath(WORKSPACE_ROOT),
-        user=user, libdir=lib_dir))
+        user=user, libdir=lib_dir, lockpath=TIXO_RENEWAL_LOCK_PATH))
     Path(timer_path).write_text(TIMER_UNIT_TEMPLATE)
 
     # Generated for review only -- see the big comment on RENEWAL_SERVICE_UNIT_TEMPLATE above.
@@ -157,8 +203,18 @@ def cmd_install(args):
     renewal_timer_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-apply.timer")
     Path(renewal_service_path).write_text(RENEWAL_SERVICE_UNIT_TEMPLATE.format(
         python=python_path, cli=cli_path, workdir=os.path.abspath(WORKSPACE_ROOT),
-        user=user, libdir=lib_dir))
+        user=user, libdir=lib_dir, lockpath=TIXO_RENEWAL_LOCK_PATH))
     Path(renewal_timer_path).write_text(RENEWAL_TIMER_UNIT_TEMPLATE)
+
+    # Readiness notifier -- generated for review alongside the other two, same idempotent
+    # local-review-only convention (install.sh never copies/enables any of these itself).
+    first_node = nodes_mod.load_nodes(_node_config_path())[0]
+    notifier_service_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-readiness-notifier.service")
+    notifier_timer_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-readiness-notifier.timer")
+    Path(notifier_service_path).write_text(NOTIFIER_SERVICE_UNIT_TEMPLATE.format(
+        python=python_path, workdir=os.path.abspath(WORKSPACE_ROOT), user=user, libdir=lib_dir,
+        node_id=first_node.node_id, db_filename=first_node.db_filename))
+    Path(notifier_timer_path).write_text(NOTIFIER_TIMER_UNIT_TEMPLATE)
 
     print("Install complete (idempotent -- safe to re-run).")
     print(f"  State dir:   {STATE_DIR}")
@@ -418,16 +474,25 @@ def cmd_rollback(args):
 
 # ---------- uninstall ----------
 
+UNINSTALL_UNIT_NAMES = (
+    "virt-renewal-monitor.service", "virt-renewal-monitor.timer",
+    "virt-renewal-apply.service", "virt-renewal-apply.timer",
+    "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
+)
+
+
 def cmd_uninstall(args):
-    for name in ("virt-renewal-monitor.service", "virt-renewal-monitor.timer"):
+    for name in UNINSTALL_UNIT_NAMES:
         local_path = os.path.join(SYSTEMD_OUT_DIR, name)
         if os.path.exists(local_path):
             os.remove(local_path)
     print("Local systemd unit files removed from", SYSTEMD_OUT_DIR)
-    print("If you installed them system-wide, also run (as root, your own explicit action):")
-    print("  sudo systemctl disable --now virt-renewal-monitor.timer")
-    print("  sudo rm /etc/systemd/system/virt-renewal-monitor.{service,timer}")
+    print("If any were installed system-wide, also run (as root, your own explicit action --")
+    print("the apply timer is write-capable, disable it FIRST if it was ever enabled):")
+    print("  sudo systemctl disable --now virt-renewal-apply.timer virt-renewal-monitor.timer virt-renewal-readiness-notifier.timer")
+    print("  sudo rm /etc/systemd/system/virt-renewal-{apply,monitor,readiness-notifier}.{service,timer}")
     print("  sudo systemctl daemon-reload")
+    print("  rm -f " + WRITE_APPROVAL_MARKER + "  # belt-and-suspenders: ensure no write capability survives uninstall")
     if args.purge:
         import shutil
         for d in (STATE_DIR, CONFIG_DIR):
