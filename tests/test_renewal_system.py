@@ -195,12 +195,17 @@ def test_install_generates_all_three_unit_pairs_including_notifier(cli_env):
     renewal_cli.cmd_install(argparse_namespace())
     for name in ("virt-renewal-monitor.service", "virt-renewal-monitor.timer",
                  "virt-renewal-apply.service", "virt-renewal-apply.timer",
-                 "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer"):
+                 "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
+                 "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer"):
         assert os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, name)), f"missing {name}"
     notifier_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
                                           "virt-renewal-readiness-notifier.service")).read_text()
     assert "readiness_notifier.py" in notifier_content
     assert "--node test-node" in notifier_content
+    inventory_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
+                                           "virt-renewal-inventory-sync.service")).read_text()
+    assert "inventory-sync" in inventory_content
+    assert "--node test-node" in inventory_content
 
 
 def test_uninstall_removes_all_three_unit_pairs_not_just_monitor(cli_env):
@@ -211,7 +216,8 @@ def test_uninstall_removes_all_three_unit_pairs_not_just_monitor(cli_env):
     renewal_cli.cmd_uninstall(argparse_namespace(purge=False))
     for name in ("virt-renewal-monitor.service", "virt-renewal-monitor.timer",
                  "virt-renewal-apply.service", "virt-renewal-apply.timer",
-                 "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer"):
+                 "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
+                 "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer"):
         assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, name)), f"{name} still present"
     # Data must still survive a non-purge uninstall.
     assert os.path.exists(os.path.join(cli_env["state_dir"], "test-node.sqlite3"))

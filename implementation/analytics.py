@@ -63,13 +63,25 @@ def compute_bandwidth_analytics(records: list[dict], usage_threshold_percent: De
     unlimited_used = [r for r in unlimited if _is_known_decimal(r.get("used_gb"))]
     unlimited_used_sum = sum((Decimal(str(r["used_gb"])) for r in unlimited_used), Decimal(0))
 
-    over_threshold = []
+    # Near-limit (approaching the threshold but not yet over it) vs over-limit (at/above it,
+    # or already over 100%) -- two distinct operator-actionable categories, never merged.
+    near_threshold, over_threshold, over_limit = [], [], []
     if usage_threshold_percent is not None:
         for r in limited_used:
             quota = Decimal(str(r["quota_gb"]))
             used = Decimal(str(r["used_gb"]))
-            if quota > 0 and (used / quota) * 100 >= usage_threshold_percent:
+            if quota <= 0:
+                continue
+            pct = (used / quota) * 100
+            if pct >= usage_threshold_percent:
                 over_threshold.append(r["vpsid"])
+            elif pct >= usage_threshold_percent * Decimal("0.9"):
+                near_threshold.append(r["vpsid"])
+            if pct >= 100:
+                over_limit.append(r["vpsid"])
+
+    all_used = [r for r in records if _is_known_decimal(r.get("used_gb"))]
+    total_used_all_vps = sum((Decimal(str(r["used_gb"])) for r in all_used), Decimal(0))
 
     top_consumers = sorted(
         (r for r in records if _is_known_decimal(r.get("used_gb"))),
@@ -92,6 +104,10 @@ def compute_bandwidth_analytics(records: list[dict], usage_threshold_percent: De
         "unlimited_used_sum_gb": unlimited_used_sum if unlimited_used else UNAVAILABLE,
         "unlimited_used_sum_coverage": f"{len(unlimited_used)}/{len(unlimited)}",
         "vps_over_threshold": over_threshold,
+        "vps_near_threshold": near_threshold,
+        "vps_over_limit": over_limit,
+        "total_used_all_vps_gb": total_used_all_vps if all_used else UNAVAILABLE,
+        "total_used_all_vps_coverage": f"{len(all_used)}/{len(records)}",
         "top_consumers": [{"vpsid": r["vpsid"], "used_gb": str(r["used_gb"])} for r in top_consumers],
     }
 

@@ -20,7 +20,7 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
 # apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
@@ -175,6 +175,38 @@ Unit=virt-renewal-readiness-notifier.service
 WantedBy=timers.target
 """
 
+# Inventory sync: strictly read-only (act=vs only, never managevps), entirely independent of
+# the renewal engine's own lock/timer/API-budget (see inventory_sync.py's own non-overlapping
+# flock on a SEPARATE lock file -- this unit intentionally does NOT share
+# TIXO_RENEWAL_LOCK_PATH with monitor/apply, so a slow/locked inventory sync can never block a
+# renewal apply, and vice versa). run_inventory_sync() already refuses to start a second
+# overlapping run itself (status=ALREADY_RUNNING), so no external `flock` wrapper is needed
+# here the way the other units use one.
+INVENTORY_SERVICE_UNIT_TEMPLATE = """[Unit]
+Description=Tixo Renewal VPS inventory sync (strictly read-only; independent of renewal timers)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH={libdir}
+Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
+ExecStart={python} {cli} inventory-sync --node {node_id}
+WorkingDirectory={workdir}
+User={user}
+"""
+
+INVENTORY_TIMER_UNIT_TEMPLATE = """[Unit]
+Description=Run the Tixo Renewal VPS inventory sync approximately every {interval}min
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec={interval}min
+Unit=virt-renewal-inventory-sync.service
+
+[Install]
+WantedBy=timers.target
+"""
+
 
 # ---------- install ----------
 
@@ -192,11 +224,13 @@ def _policy_config_path():
 DEFAULT_MONITOR_INTERVAL_MIN = 5
 DEFAULT_APPLY_INTERVAL_MIN = 5
 DEFAULT_NOTIFIER_INTERVAL_MIN = 30
+DEFAULT_INVENTORY_INTERVAL_MIN = 15
 
 
 def write_systemd_units(monitor_interval_min: int = DEFAULT_MONITOR_INTERVAL_MIN,
                          apply_interval_min: int = DEFAULT_APPLY_INTERVAL_MIN,
-                         notifier_interval_min: int = DEFAULT_NOTIFIER_INTERVAL_MIN) -> None:
+                         notifier_interval_min: int = DEFAULT_NOTIFIER_INTERVAL_MIN,
+                         inventory_interval_min: int = DEFAULT_INVENTORY_INTERVAL_MIN) -> None:
     """Writes all 6 review-only systemd unit files to SYSTEMD_OUT_DIR, parameterized by the
     given intervals (each validated/clamped by the caller via validate_interval_minutes
     BEFORE being passed here -- this function trusts its inputs are already safe ints, never
@@ -231,6 +265,13 @@ def write_systemd_units(monitor_interval_min: int = DEFAULT_MONITOR_INTERVAL_MIN
     Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-readiness-notifier.timer")).write_text(
         NOTIFIER_TIMER_UNIT_TEMPLATE.format(interval=notifier_interval_min))
 
+    Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-inventory-sync.service")).write_text(
+        INVENTORY_SERVICE_UNIT_TEMPLATE.format(python=python_path, cli=cli_path,
+                                                workdir=os.path.abspath(WORKSPACE_ROOT), user=user,
+                                                libdir=lib_dir, node_id=first_node.node_id))
+    Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-inventory-sync.timer")).write_text(
+        INVENTORY_TIMER_UNIT_TEMPLATE.format(interval=inventory_interval_min))
+
 
 def cmd_install(args):
     for d in (STATE_DIR, CONFIG_DIR, BACKUP_DIR, SYSTEMD_OUT_DIR):
@@ -257,7 +298,8 @@ def cmd_install(args):
     monitor_min = validate_interval_minutes(os.environ.get("TIXO_RENEWAL_MONITOR_INTERVAL_MIN", DEFAULT_MONITOR_INTERVAL_MIN))
     apply_min = validate_interval_minutes(os.environ.get("TIXO_RENEWAL_APPLY_INTERVAL_MIN", DEFAULT_APPLY_INTERVAL_MIN))
     notifier_min = validate_interval_minutes(os.environ.get("TIXO_RENEWAL_NOTIFIER_INTERVAL_MIN", DEFAULT_NOTIFIER_INTERVAL_MIN))
-    write_systemd_units(monitor_min, apply_min, notifier_min)
+    inventory_min = validate_interval_minutes(os.environ.get("TIXO_RENEWAL_INVENTORY_INTERVAL_MIN", DEFAULT_INVENTORY_INTERVAL_MIN))
+    write_systemd_units(monitor_min, apply_min, notifier_min, inventory_min)
     service_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-monitor.service")
     timer_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-monitor.timer")
 
@@ -525,6 +567,7 @@ UNINSTALL_UNIT_NAMES = (
     "virt-renewal-monitor.service", "virt-renewal-monitor.timer",
     "virt-renewal-apply.service", "virt-renewal-apply.timer",
     "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
+    "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer",
 )
 
 
@@ -536,8 +579,8 @@ def cmd_uninstall(args):
     print("Local systemd unit files removed from", SYSTEMD_OUT_DIR)
     print("If any were installed system-wide, also run (as root, your own explicit action --")
     print("the apply timer is write-capable, disable it FIRST if it was ever enabled):")
-    print("  sudo systemctl disable --now virt-renewal-apply.timer virt-renewal-monitor.timer virt-renewal-readiness-notifier.timer")
-    print("  sudo rm /etc/systemd/system/virt-renewal-{apply,monitor,readiness-notifier}.{service,timer}")
+    print("  sudo systemctl disable --now virt-renewal-apply.timer virt-renewal-monitor.timer virt-renewal-readiness-notifier.timer virt-renewal-inventory-sync.timer")
+    print("  sudo rm /etc/systemd/system/virt-renewal-{apply,monitor,readiness-notifier,inventory-sync}.{service,timer}")
     print("  sudo systemctl daemon-reload")
     print("  rm -f " + WRITE_APPROVAL_MARKER + "  # belt-and-suspenders: ensure no write capability survives uninstall")
     if args.purge:

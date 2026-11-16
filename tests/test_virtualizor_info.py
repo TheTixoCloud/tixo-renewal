@@ -302,3 +302,35 @@ def test_fetch_vs_inventory_rate_limits_between_pages():
     vinfo.fetch_vs_inventory("fake-creds", call_vs_api=fake_call_vs_api,
                               sleep_fn=lambda s: sleeps.append(s))
     assert len(sleeps) >= 1
+
+
+# ---------- v1.6.0: real 'ips' field shape (numeric-id keys, IP-string values) -----------
+
+def test_parse_listvs_response_ips_dict_keyed_by_internal_id_not_by_ip():
+    """Real confirmed shape on ir1: 'ips' is a dict keyed by an internal numeric id, with
+    each VALUE being the actual IP string -- the opposite of what an earlier (unverified)
+    assumption might guess. Never inferred from vpsid or any interface name."""
+    parsed = {"vs": {"5": {"vpsid": "5", "bandwidth": "10",
+                           "ips": {"101": "192.0.2.10", "102": "192.0.2.11"}}}}
+    result = vinfo.parse_listvs_response(parsed)
+    rec = result["records"][0]
+    assert rec["ip_count"] == 2
+    assert rec["ip_primary"] == "192.0.2.10"
+    assert set(rec["ip_list"]) == {"192.0.2.10", "192.0.2.11"}
+
+
+def test_parse_listvs_response_empty_ips_dict_reports_zero_not_unavailable():
+    parsed = {"vs": {"5": {"vpsid": "5", "bandwidth": "10", "ips": {}}}}
+    result = vinfo.parse_listvs_response(parsed)
+    rec = result["records"][0]
+    assert rec["ip_count"] == 0
+    assert rec["ip_primary"] == vinfo.UNAVAILABLE
+
+
+def test_parse_listvs_response_missing_ips_field_marked_unavailable():
+    parsed = {"vs": {"5": {"vpsid": "5", "bandwidth": "10"}}}
+    result = vinfo.parse_listvs_response(parsed)
+    rec = result["records"][0]
+    assert rec["ip_count"] == vinfo.UNAVAILABLE
+    assert rec["ip_primary"] == vinfo.UNAVAILABLE
+    assert rec["ip_list"] == vinfo.UNAVAILABLE

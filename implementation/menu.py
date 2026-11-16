@@ -435,6 +435,24 @@ def _format_uptime_human(seconds) -> str:
     return " ".join(parts)
 
 
+def _dedupe_temperature_labels(zones: list[dict]) -> list[str]:
+    """Multiple thermal zones sharing the same generic 'type' (e.g. two zones both reporting
+    a plain acpi label) previously rendered as confusing duplicate-looking entries. Appends
+    a disambiguating index only when a type string actually repeats."""
+    from collections import Counter
+    type_counts = Counter(z["type"] for z in zones)
+    seen = Counter()
+    labels = []
+    for z in zones:
+        t = z["type"]
+        if type_counts[t] > 1:
+            seen[t] += 1
+            labels.append(f"{t} #{seen[t]}={z['celsius']}°C")
+        else:
+            labels.append(f"{t}={z['celsius']}°C")
+    return labels
+
+
 def _section(style, title) -> str:
     return f"{style.BOLD}{style.ACCENT}{title}{style.RESET}"
 
@@ -480,7 +498,7 @@ def render_host_info(info: dict, style: Style, show_virtual_interfaces: bool = F
     lines.append("")
     lines.append(_section(style, "TEMPERATURE"))
     if temp["available"]:
-        lines.append("  " + ", ".join(f"{z['type']}={z['celsius']}°C" for z in temp["zones"]))
+        lines.append("  " + ", ".join(_dedupe_temperature_labels(temp["zones"])))
     else:
         lines.append(f"  {style.GRAY}unavailable ({temp['reason']}){style.RESET}")
 
@@ -525,14 +543,22 @@ def render_analytics_summary(result: dict, style: Style) -> str:
     lines = [f"{style.BOLD}{style.ACCENT}=== Bandwidth Analytics ==={style.RESET}"]
     lines.append(f"  Total VPS: {result['total_vps']}  Limited: {result['limited_vps_count']}  "
                  f"Unlimited: {result['unlimited_vps_count']}  Unknown quota: {result['unknown_quota_vps_count']}")
-    lines.append(f"  Running: {result['running_count']}  Stopped/suspended: {result['stopped_count']}")
+    lines.append(f"  Status: running={result['running_count']} stopped={result['stopped_count']} "
+                 f"suspended={result['suspended_count']} unknown={result['unknown_status_count']}")
     lines.append(f"  Limited fleet: {result['limited_used_sum_gb']} / {result['limited_quota_sum_gb']} GB used "
                  f"(coverage {result['limited_used_sum_coverage']}), "
                  f"{result['limited_remaining_sum_gb']} GB remaining")
     lines.append(f"  Unlimited fleet actual usage: {result['unlimited_used_sum_gb']} GB "
                  f"(coverage {result['unlimited_used_sum_coverage']})")
+    lines.append(f"  Entire fleet total USED: {result['total_used_all_vps_gb']} GB "
+                 f"(coverage {result['total_used_all_vps_coverage']}) "
+                 f"{style.GRAY}-- quota allocation, not sold/billed bandwidth{style.RESET}")
+    if result.get("vps_near_threshold"):
+        lines.append(f"  {style.YELLOW}Near usage threshold: {result['vps_near_threshold']}{style.RESET}")
     if result["vps_over_threshold"]:
-        lines.append(f"  {style.YELLOW}Over usage threshold: {result['vps_over_threshold']}{style.RESET}")
+        lines.append(f"  {style.RED}Over usage threshold: {result['vps_over_threshold']}{style.RESET}")
+    if result.get("vps_over_limit"):
+        lines.append(f"  {style.BOLD}{style.RED}Over 100% of quota: {result['vps_over_limit']}{style.RESET}")
     if result["top_consumers"]:
         lines.append("  Top consumers: " + ", ".join(
             f"vpsid={c['vpsid']} ({c['used_gb']} GB)" for c in result["top_consumers"][:5]))
@@ -612,6 +638,8 @@ def render_vps_detail(record: dict, style: Style) -> str:
     lines.append(f"  Virtualization: {record.get('virtualization')}")
     lines.append(f"  Locked:         {record.get('locked')}")
     lines.append(f"  Node (serid):   {record.get('node_serid')}")
+    lines.append(f"  Primary IP:     {record.get('ip_primary')}")
+    lines.append(f"  IP count:       {record.get('ip_count')}")
     return "\n".join(lines)
 
 
@@ -774,16 +802,14 @@ def action_uninstall():
 
 
 def action_system_info(style: Style, show_virtual_interfaces: bool = False):
+    """v1.6.0: host AND Virtualizor information are always shown together on this one
+    screen -- Virtualizor version/hypervisor no longer require a separate keypress to
+    reveal. Only the (optional, separately toggled) full virtual-interface listing stays
+    behind an explicit action, since that's the part that can flood the screen with one
+    entry per VM on a busy hypervisor."""
     print(render_host_info(hostinfo.collect_host_info(), style,
                             show_virtual_interfaces=show_virtual_interfaces))
-    if not show_virtual_interfaces:
-        print(f"\n{style.GRAY}Type 'v' + Enter to also show virtual interfaces, or just "
-              f"press Enter to continue.{style.RESET}")
-        if input("> ").strip().lower() == "v":
-            clear_screen()
-            print(f"{style.GRAY}TixoCloud Control Center{style.RESET} {style.ACCENT}>{style.RESET} "
-                  f"{style.BOLD}System & Virtualizor information (all interfaces){style.RESET}\n")
-            return action_system_info(style, show_virtual_interfaces=True)
+    print()
     v_info = {
         "installed": vinfo.detect_virtualizor_installed(),
         "version": vinfo.detect_virtualizor_version(),
@@ -800,6 +826,15 @@ def action_system_info(style: Style, show_virtual_interfaces: bool = False):
     except Exception:
         pass
     print(render_virtualizor_info(v_info, style))
+
+    if not show_virtual_interfaces:
+        print(f"\n{style.GRAY}Type 'v' + Enter to also show virtual network interfaces, or "
+              f"just press Enter to continue.{style.RESET}")
+        if input("> ").strip().lower() == "v":
+            clear_screen()
+            print(f"{style.GRAY}TixoCloud Control Center{style.RESET} {style.ACCENT}>{style.RESET} "
+                  f"{style.BOLD}System & Virtualizor information (all interfaces){style.RESET}\n")
+            return action_system_info(style, show_virtual_interfaces=True)
 
 
 def _inventory_db_path() -> str:
@@ -883,7 +918,7 @@ def action_inventory_view(style: Style, node_id: str = "self"):
         print(render_vps_table(page_records, style))
         print(f"\n  Page {page}/{total_pages}  ({len(filtered)} matching of {len(records)} total)")
         print(f"  {style.GRAY}[n]ext page  [p]rev page  [s]earch  [f]ilter status  "
-              f"[d] VPS detail  [c]lear filters  [0] back{style.RESET}")
+              f"[d] VPS detail  [c]lear filters  [r]efresh now (manual override)  [0] back{style.RESET}")
         choice = input("> ").strip().lower()
         if choice in ("0", ""):
             break
@@ -899,6 +934,17 @@ def action_inventory_view(style: Style, node_id: str = "self"):
             page = 1
         elif choice == "c":
             search, status_filter, page = None, None, 1
+        elif choice == "r":
+            print(f"{style.GRAY}Inventory normally refreshes automatically on its own "
+                  f"schedule -- this forces one extra read-only sync right now.{style.RESET}")
+            action_inventory_sync(node_id, style=style)
+            records = inv.latest_records(conn, node_id)
+            sync_info = inv.last_sync_info(conn, node_id)
+            state = isync.load_sync_state(renewal_cli.STATE_DIR)
+            freshness = isync.classify_freshness(
+                sync_info["captured_at"] if sync_info else None, state["last_attempt_status"],
+                settings["refresh_interval_minutes"])
+            print(_render_coverage_banner(sync_info, style))
         elif choice == "d":
             vpsid_raw = input("VPS ID to view: ").strip()
             try:
@@ -939,7 +985,11 @@ MENU_ITEMS = [
     ("Install / Initial Setup", action_install),
     ("Dashboard", None),  # needs style, wired specially below
     ("System & Virtualizor information", None),  # needs style, wired specially below
-    ("Sync VPS inventory (read-only)", action_inventory_sync),
+    # v1.6.0: manual "Sync VPS inventory" removed from the main menu -- inventory now
+    # refreshes automatically on its own systemd timer (virt-renewal-inventory-sync.timer,
+    # configurable interval, entirely independent of the renewal engine's own timers). A
+    # manual override ('r' refresh now) remains available from inside the inventory screen
+    # itself for an operator who wants to force an immediate read-only check.
     ("View VPS inventory & analytics", None),  # needs style, wired specially below
     ("Configure/rotate Virtualizor API credentials", lambda: renewal_cli.cmd_store_credentials(
         argparse.Namespace(node=input("Node id: ").strip() or "self"))),

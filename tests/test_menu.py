@@ -519,3 +519,12 @@ def test_render_vps_table_marks_unlimited_quota():
     records = [{"vpsid": 1, "hostname": "h", "status": "running", "quota_gb": "0", "used_gb": "500"}]
     out = menu.render_vps_table(records, menu.Style(enabled=False))
     assert "UNLIMITED" in out
+
+
+def test_menu_items_no_longer_has_standalone_manual_inventory_sync():
+    """v1.6.0: inventory sync became automatic (its own systemd timer); the manual action
+    moved inside the inventory view screen as an explicit override, no longer a top-level
+    main-menu item."""
+    labels = [label for label, _ in menu.MENU_ITEMS]
+    assert "Sync VPS inventory (read-only)" not in labels
+    assert "View VPS inventory & analytics" in labels

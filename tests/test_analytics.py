@@ -89,3 +89,31 @@ def test_compute_renewal_outcome_counts_reads_existing_ledger(tmp_path):
     assert counts["applied"] == 1
     assert counts["deferred_locked"] == 1
     assert counts["unknown_needs_verification"] == 0
+
+
+def test_total_used_all_vps_includes_limited_and_unlimited():
+    records = [rec(1, "100", "50"), rec(2, "0", "9999")]
+    result = analytics.compute_bandwidth_analytics(records)
+    assert result["total_used_all_vps_gb"] == Decimal("10049")
+    assert result["total_used_all_vps_coverage"] == "2/2"
+
+
+def test_total_used_all_vps_unavailable_when_no_data():
+    records = [rec(1, "100", analytics.UNAVAILABLE)]
+    result = analytics.compute_bandwidth_analytics(records)
+    assert result["total_used_all_vps_gb"] == analytics.UNAVAILABLE
+
+
+def test_near_threshold_vs_over_threshold_vs_over_limit():
+    records = [
+        rec(1, "100", "95"),   # over_limit candidate? 95% < 100%, but >= 90% threshold -> over_threshold
+        rec(2, "100", "82"),   # near threshold (>=81% of 90 threshold = 0.9*90=81)
+        rec(3, "100", "150"),  # over limit (>100%)
+        rec(4, "100", "10"),   # neither
+    ]
+    result = analytics.compute_bandwidth_analytics(records, usage_threshold_percent=Decimal("90"))
+    assert 1 in result["vps_over_threshold"]
+    assert 2 in result["vps_near_threshold"]
+    assert 3 in result["vps_over_threshold"]
+    assert 3 in result["vps_over_limit"]
+    assert 4 not in result["vps_over_threshold"] + result["vps_near_threshold"] + result["vps_over_limit"]

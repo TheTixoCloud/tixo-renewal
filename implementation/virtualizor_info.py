@@ -168,13 +168,27 @@ def parse_listvs_response(parsed: dict) -> dict:
         else:
             status = "unknown"
 
+        # IP FIELD MAPPING (v1.6.0, confirmed empirically against ir1, read-only, shape-only
+        # inspection -- never bulk-logged): `ips` is a dict keyed by an internal numeric ID
+        # (Virtualizor's own ip-record id, NOT the IP itself), with each VALUE being the
+        # actual IPv4 address string. There is no separate API-confirmed "primary IP" flag --
+        # the first entry (dict insertion order, as JSON preserves it) is used as a best-
+        # effort "primary" convention, documented as such, never asserted as authoritative.
+        # IPs are never inferred from the vpsid or any host interface name.
         ips_raw = raw.get("ips")
-        if isinstance(ips_raw, dict):
-            ip_count = len(ips_raw)
+        ip_list = UNAVAILABLE
+        ip_primary = UNAVAILABLE
+        ip_count = UNAVAILABLE
+        if isinstance(ips_raw, dict) and ips_raw:
+            ip_list = list(ips_raw.values())
+            ip_primary = ip_list[0]
+            ip_count = len(ip_list)
+        elif isinstance(ips_raw, dict):
+            ip_list, ip_count = [], 0
         elif isinstance(ips_raw, list):
-            ip_count = len(ips_raw)
-        else:
-            ip_count = UNAVAILABLE
+            ip_list = ips_raw
+            ip_primary = ip_list[0] if ip_list else UNAVAILABLE
+            ip_count = len(ip_list)
 
         records.append({
             "vpsid": vpsid,
@@ -182,6 +196,8 @@ def parse_listvs_response(parsed: dict) -> dict:
             "status": status,
             "locked": locked if locked is not None else UNAVAILABLE,
             "ip_count": ip_count,
+            "ip_primary": ip_primary,
+            "ip_list": ip_list,
             "ram_mb": raw.get("ram", UNAVAILABLE),
             "cores": raw.get("cores", UNAVAILABLE),
             "disk_gb": raw.get("space", UNAVAILABLE),
