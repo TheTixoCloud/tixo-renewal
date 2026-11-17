@@ -154,3 +154,11 @@ echo
 echo "Production WRITE capability remains permanently blocked until you deliberately create:"
 echo "  $INSTALL_DIR/renewal-config/WRITE_APPROVED"
 echo "...and even then, 'apply' requires --execute and live interactive credentials every time."
+echo
+echo "Optional modules (ALL disabled by default; each needs its own explicit enable step"
+echo "from the 'tixo-renewal' menu before its generated systemd unit does anything):"
+echo "  Telegram bot          -> menu: 'Configure Telegram bot (optional)'"
+echo "  Web Control Center    -> menu: 'Configure Web Control Center (optional)'"
+echo "  Relay worker          -> runs on a SEPARATE host; see 'Configure Relay Worker' there"
+echo "  Remote agent          -> menu: 'Configure Remote Agent (optional, read-only)'"
+echo "Their generated-but-not-installed systemd units are at $INSTALL_DIR/systemd/virt-renewal-{telegram-bot,web,relay-worker,agent}.service"

@@ -198,7 +198,8 @@ def test_install_generates_all_three_unit_pairs_including_notifier(cli_env):
                  "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
                  "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer",
                  "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer",
-                 "virt-renewal-telegram-bot.service"):
+                 "virt-renewal-telegram-bot.service", "virt-renewal-web.service",
+                 "virt-renewal-relay-worker.service", "virt-renewal-agent.service"):
         assert os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, name)), f"missing {name}"
     notifier_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
                                           "virt-renewal-readiness-notifier.service")).read_text()
@@ -221,7 +222,8 @@ def test_uninstall_removes_all_three_unit_pairs_not_just_monitor(cli_env):
                  "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
                  "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer",
                  "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer",
-                 "virt-renewal-telegram-bot.service"):
+                 "virt-renewal-telegram-bot.service", "virt-renewal-web.service",
+                 "virt-renewal-relay-worker.service", "virt-renewal-agent.service"):
         assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, name)), f"{name} still present"
     # Data must still survive a non-purge uninstall.
     assert os.path.exists(os.path.join(cli_env["state_dir"], "test-node.sqlite3"))
@@ -1165,3 +1167,21 @@ def test_telegram_bot_unit_is_simple_restart_always_not_a_timer(cli_env):
     assert "telegram-bot-run" in content
     assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
                                             "virt-renewal-telegram-bot.timer"))
+
+
+@pytest.mark.parametrize("unit_name,cli_command", [
+    ("virt-renewal-web.service", "web-run"),
+    ("virt-renewal-relay-worker.service", "relay-worker-run"),
+    ("virt-renewal-agent.service", "agent-run"),
+])
+def test_optional_persistent_units_are_simple_restart_always_not_timers(cli_env, unit_name,
+                                                                          cli_command):
+    """Same shape as the Telegram bot unit -- each of these three runs a persistent
+    http.server loop (web_server.py/relay_worker.py/agent_server.py), not a periodic task."""
+    renewal_cli.cmd_install(argparse_namespace())
+    content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, unit_name)).read_text()
+    assert "Type=simple" in content
+    assert "Restart=always" in content
+    assert cli_command in content
+    timer_name = unit_name.replace(".service", ".timer")
+    assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, timer_name))

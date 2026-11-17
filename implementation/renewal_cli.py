@@ -264,6 +264,68 @@ User={user}
 WantedBy=multi-user.target
 """
 
+# Same Type=simple/Restart=always shape as the Telegram bot unit above -- each of these three
+# runs a persistent http.server loop (web_server.py/relay_worker.py/agent_server.py), not a
+# periodic task. Generated-but-never-installed/enabled; each process also independently
+# refuses to start unless explicitly enabled via its own menu "Configure..." screen, so
+# installing these units alone activates nothing.
+WEB_SERVICE_UNIT_TEMPLATE = """[Unit]
+Description=TixoCloud Web Control Center (optional -- also requires enabling via the menu)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+Environment=PYTHONPATH={libdir}
+Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
+ExecStart={python} {cli} web-run
+WorkingDirectory={workdir}
+User={user}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+RELAY_WORKER_SERVICE_UNIT_TEMPLATE = """[Unit]
+Description=TixoCloud relay worker (optional -- runs on a SEPARATE host; also requires enabling via the menu THERE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+Environment=PYTHONPATH={libdir}
+Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
+ExecStart={python} {cli} relay-worker-run
+WorkingDirectory={workdir}
+User={user}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+AGENT_SERVICE_UNIT_TEMPLATE = """[Unit]
+Description=TixoCloud remote management agent (optional, read-only -- also requires enabling via the menu)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+Environment=PYTHONPATH={libdir}
+Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
+ExecStart={python} {cli} agent-run
+WorkingDirectory={workdir}
+User={user}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
 
 # ---------- install ----------
 
@@ -346,6 +408,20 @@ def write_systemd_units(monitor_interval_min: int = DEFAULT_MONITOR_INTERVAL_MIN
         TELEGRAM_BOT_SERVICE_UNIT_TEMPLATE.format(python=python_path, cli=cli_path,
                                                    workdir=os.path.abspath(WORKSPACE_ROOT),
                                                    user=user, libdir=lib_dir))
+
+    # Same "generated but never installed/enabled" discipline as every unit above.
+    Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-web.service")).write_text(
+        WEB_SERVICE_UNIT_TEMPLATE.format(python=python_path, cli=cli_path,
+                                           workdir=os.path.abspath(WORKSPACE_ROOT),
+                                           user=user, libdir=lib_dir))
+    Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-relay-worker.service")).write_text(
+        RELAY_WORKER_SERVICE_UNIT_TEMPLATE.format(python=python_path, cli=cli_path,
+                                                    workdir=os.path.abspath(WORKSPACE_ROOT),
+                                                    user=user, libdir=lib_dir))
+    Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-agent.service")).write_text(
+        AGENT_SERVICE_UNIT_TEMPLATE.format(python=python_path, cli=cli_path,
+                                             workdir=os.path.abspath(WORKSPACE_ROOT),
+                                             user=user, libdir=lib_dir))
 
 
 def cmd_install(args):
@@ -694,6 +770,7 @@ UNINSTALL_UNIT_NAMES = (
     "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer",
     "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer",
     "virt-renewal-telegram-bot.service",
+    "virt-renewal-web.service", "virt-renewal-relay-worker.service", "virt-renewal-agent.service",
 )
 
 
@@ -705,8 +782,8 @@ def cmd_uninstall(args):
     print("Local systemd unit files removed from", SYSTEMD_OUT_DIR)
     print("If any were installed system-wide, also run (as root, your own explicit action --")
     print("the apply timer is write-capable, disable it FIRST if it was ever enabled):")
-    print("  sudo systemctl disable --now virt-renewal-apply.timer virt-renewal-monitor.timer virt-renewal-readiness-notifier.timer virt-renewal-inventory-sync.timer virt-renewal-telegram-bot.service")
-    print("  sudo rm /etc/systemd/system/virt-renewal-{apply,monitor,readiness-notifier,inventory-sync}.{service,timer} /etc/systemd/system/virt-renewal-telegram-bot.service")
+    print("  sudo systemctl disable --now virt-renewal-apply.timer virt-renewal-monitor.timer virt-renewal-readiness-notifier.timer virt-renewal-inventory-sync.timer virt-renewal-telegram-bot.service virt-renewal-web.service virt-renewal-relay-worker.service virt-renewal-agent.service")
+    print("  sudo rm /etc/systemd/system/virt-renewal-{apply,monitor,readiness-notifier,inventory-sync}.{service,timer} /etc/systemd/system/virt-renewal-{telegram-bot,web,relay-worker,agent}.service")
     print("  sudo systemctl daemon-reload")
     print("  rm -f " + WRITE_APPROVAL_MARKER + "  # belt-and-suspenders: ensure no write capability survives uninstall")
     if args.purge:

@@ -492,10 +492,33 @@ by-default surface, not a replacement.
   `query_agent()` success/unknown-query/tamper-rejection/reported-error, the real-socket
   end-to-end test, 3 CLI wiring tests, 1 menu-wiring test).
 
+### 14. Installer coverage for all optional modules — DONE (generation only, same safety discipline)
+`write_systemd_units()` (the ALREADY-shared generator used by both `cmd_install` and the
+menu, so there is exactly one code path, never two to keep in sync) now also generates
+`virt-renewal-web.service`, `virt-renewal-relay-worker.service`, and
+`virt-renewal-agent.service` -- the same `Type=simple`/`Restart=always`, generated-but-
+never-installed-or-enabled shape already used for `virt-renewal-telegram-bot.service`. Each
+process still independently refuses to start unless explicitly enabled via its own menu
+screen, so generating these files activates nothing by itself. `cmd_uninstall`'s cleanup
+list and printed system-wide removal commands were extended to match (previously would have
+silently left these three behind). `deploy/install.sh`'s final output now also names all
+four optional modules and exactly which menu screen enables each one, rather than only ever
+mentioning the core monitor timer.
+- **Tests:** extended `tests/test_renewal_system.py`'s existing install/uninstall
+  completeness regression tests to cover the three new units, plus a new parametrized
+  `test_optional_persistent_units_are_simple_restart_always_not_timers` (3 cases).
+- **NOT done:** this is unit-file GENERATION coverage only, not the full "unified
+  installer" the mission describes -- no interactive/noninteractive mode selection
+  (local/remote), no domain/subdomain or HTTPS/cert setup, no timezone/Jalali-calendar
+  selection at install time (that remains a post-install menu action), no repair/upgrade-
+  in-place logic beyond what the already-idempotent `cmd_install`/`write_default_config`
+  provide. See "Exact next steps" below for the real remaining scope.
+
 ### Combined test count
-- **Total: 1088 passing** (verified by running the full suite), up from 1057 after the
-  relay worker milestone, 1032 after the backup milestone, 1012 after the Web Control
-  Center milestone, and 923 at the start of this sprint.
+- **Total: 1091 passing** (verified by running the full suite), up from 1088 after the
+  remote agent milestone, 1057 after the relay worker milestone, 1032 after the backup
+  milestone, 1012 after the Web Control Center milestone, and 923 at the start of this
+  sprint.
 
 ---
 
@@ -563,8 +586,11 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
 7. ~~Remote management/agent mode...~~ **DONE as a read-only MVP, locally simulated** (see
    section 13 above). **Still open:** a real cross-host validation, and a real multi-host
    aggregating management-server program (only the protocol + client helper exist so far).
-8. The unified installer (local/remote mode, optional component install/upgrade/repair/
-   reconfigure/uninstall for Web/Telegram/relay-worker/remote-agent).
+8. ~~Installer systemd-unit coverage for every optional module...~~ **DONE** (see section 14
+   above). **Still genuinely open, the real remaining scope of this item:** no interactive
+   mode-selection flow, no domain/HTTPS/cert setup, no install-time timezone/Jalali-calendar
+   prompt, no explicit repair/upgrade-in-place command distinct from the already-idempotent
+   `install`.
 
 ## Known limitations of what WAS built
 
