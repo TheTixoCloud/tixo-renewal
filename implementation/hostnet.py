@@ -243,12 +243,18 @@ def compute_live_throughput(conn: sqlite3.Connection, interface: str):
 
 
 def get_samples_in_range(conn: sqlite3.Connection, interface: str, start_iso: str, end_iso: str) -> list[dict]:
+    """`gap_seconds` was added (v1.8.0, additive -- every existing caller already only reads
+    the keys it names, so this is backward compatible) so analytics built on top of this
+    accounting layer (see traffic_analytics.py) can compute a genuine PEAK instantaneous rate
+    per sample (delta/gap) without this module growing any rate-computation logic of its
+    own -- hostnet.py stays strictly the accounting/persistence layer."""
     rows = conn.execute(
-        "SELECT sampled_at, rx_delta, tx_delta, discontinuity_type FROM hostnet_samples "
+        "SELECT sampled_at, rx_delta, tx_delta, discontinuity_type, gap_seconds FROM hostnet_samples "
         "WHERE interface=? AND sampled_at >= ? AND sampled_at < ? ORDER BY sampled_at",
         (interface, start_iso, end_iso),
     ).fetchall()
-    return [{"sampled_at": r[0], "rx_delta": r[1], "tx_delta": r[2], "discontinuity_type": r[3]}
+    return [{"sampled_at": r[0], "rx_delta": r[1], "tx_delta": r[2], "discontinuity_type": r[3],
+             "gap_seconds": r[4]}
             for r in rows]
 
 

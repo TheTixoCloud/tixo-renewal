@@ -37,6 +37,7 @@ import shadow_monitor as sm
 import virtualizor_info as vinfo
 import hostnet
 import hostnet_sync
+import traffic_analytics
 
 GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/TheTixoCloud/tixo-renewal/releases/latest"
 DEFAULT_DISPLAY_TZ = "Asia/Tehran"
@@ -1520,6 +1521,67 @@ def action_view_hostnet(style: Style):
         pass
 
 
+_TRAFFIC_ANALYTICS_LABELS = (
+    ("today", "Today"),
+    ("yesterday", "Yesterday"),
+    ("last_24_hours", "Last 24 Hours"),
+    ("current_week", "Current Week (Mon start)"),
+    ("last_7_days", "Last 7 Days"),
+    ("current_gregorian_month", "Current Month (Gregorian)"),
+    ("previous_gregorian_month", "Previous Month (Gregorian)"),
+    ("current_jalali_month", "Current Month (Jalali)"),
+    ("previous_jalali_month", "Previous Month (Jalali)"),
+    ("all_time", "All-Time Recorded"),
+)
+
+
+def render_traffic_analytics_report(bundle: dict, style: Style, display_tz: str = "UTC") -> str:
+    """Renders traffic_analytics.all_periods()'s bundle as a readable report (v1.8.0). Every
+    period's coverage_status/coverage_note is always shown alongside its numbers -- a period
+    with NO_DATA or PARTIAL_COVERAGE must never be visually indistinguishable from one with
+    genuinely-observed zero traffic (see traffic_analytics.py's module docstring)."""
+    lines = [f"{style.BOLD}{style.ACCENT}HOST NETWORK -- HISTORICAL TRAFFIC ANALYTICS{style.RESET}"]
+    for key, label in _TRAFFIC_ANALYTICS_LABELS:
+        r = bundle.get(key)
+        if r is None:
+            continue
+        lines.append(f"\n  {style.BOLD}{label}{style.RESET}")
+        if r["coverage_status"] == traffic_analytics.COVERAGE_NO_DATA:
+            lines.append(f"    {style.GRAY}No data -- {r['coverage_note']}{style.RESET}")
+            continue
+        lines.append(f"    Download (RX):   {_format_bytes_human(r['rx_bytes'])}")
+        lines.append(f"    Upload (TX):      {_format_bytes_human(r['tx_bytes'])}")
+        lines.append(f"    Combined:         {_format_bytes_human(r['combined_bytes'])}")
+        if r["avg_combined_bytes_per_sec"] is not None:
+            lines.append(f"    Average throughput: {_format_bytes_per_sec_human(r['avg_combined_bytes_per_sec'])}")
+        if r.get("peak_combined_bytes_per_sec"):
+            lines.append(f"    Peak throughput:     {_format_bytes_per_sec_human(r['peak_combined_bytes_per_sec'])}")
+        if r["period_start"]:
+            lines.append(f"    Period:           {format_local_time(r['period_start'], display_tz)} "
+                          f"-> {format_local_time(r['period_end'], display_tz)}"
+                          f"{' (in progress)' if not r['complete'] else ''}")
+        if r["coverage_status"] == traffic_analytics.COVERAGE_PARTIAL:
+            lines.append(f"    {style.YELLOW}Partial coverage: {r['coverage_note']}{style.RESET}")
+    lines.append(f"\n  {style.GRAY}Decimal (SI) byte units. Week starts Monday. Jalali months use "
+                 f"the same calendar-boundary logic as this menu's date displays. These are HOST "
+                 f"interface totals -- a separate accounting system from Virtualizor VPS bandwidth "
+                 f"usage (see VPS inventory).{style.RESET}")
+    return "\n".join(lines)
+
+
+def action_view_traffic_analytics(style: Style):
+    settings = hostnet_sync.load_settings(renewal_cli.CONFIG_DIR)
+    interface = settings.get("interface")
+    tz = load_display_tz(renewal_cli.CONFIG_DIR)
+    if not interface:
+        print(f"{style.YELLOW}No interface configured yet -- use 'Configure host network "
+              f"monitoring interface' first.{style.RESET}")
+        return
+    conn = hostnet.open_db(os.path.join(renewal_cli.STATE_DIR, "hostnet.sqlite3"))
+    bundle = traffic_analytics.all_periods(conn, interface, tz_name=tz)
+    print(render_traffic_analytics_report(bundle, style, display_tz=tz))
+
+
 MENU_ITEMS = [
     ("Install / Initial Setup", action_install),
     ("Dashboard", None),  # needs style, wired specially below
@@ -1539,6 +1601,7 @@ MENU_ITEMS = [
     ("Configure display timezone (default Asia/Tehran)", action_configure_timezone),
     ("Configure host network monitoring interface", action_configure_hostnet_interface),
     ("Host network traffic (live)", None),  # needs style, wired specially below
+    ("Host network traffic analytics (historical)", None),  # needs style, wired specially below
     ("Enable automatic renewal", lambda: action_toggle_auto_renewal(True)),
     ("Disable automatic renewal", lambda: action_toggle_auto_renewal(False)),
     ("View logs and renewal history", action_view_logs),
@@ -1607,6 +1670,8 @@ def run_menu():
                     action_inventory_view(style)
                 elif label == "Host network traffic (live)":
                     action_view_hostnet(style)
+                elif label == "Host network traffic analytics (historical)":
+                    action_view_traffic_analytics(style)
                 else:
                     fn()
             except Exception as e:

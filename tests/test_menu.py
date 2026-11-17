@@ -540,6 +540,33 @@ def test_menu_items_no_longer_has_standalone_manual_inventory_sync():
     assert "View VPS inventory & analytics" in labels
 
 
+def test_menu_items_includes_traffic_analytics_screen():
+    labels = [label for label, _ in menu.MENU_ITEMS]
+    assert "Host network traffic analytics (historical)" in labels
+
+
+def test_render_traffic_analytics_report_shows_each_period_and_distinguishes_no_data():
+    import traffic_analytics as ta
+    bundle = {
+        "today": {"label": "today", "coverage_status": ta.COVERAGE_FULL, "coverage_note": None,
+                   "rx_bytes": 1_000_000_000, "tx_bytes": 500_000_000, "combined_bytes": 1_500_000_000,
+                   "avg_combined_bytes_per_sec": 1234.5, "peak_combined_bytes_per_sec": 9999.0,
+                   "period_start": "2026-01-01T00:00:00+00:00", "period_end": "2026-01-01T12:00:00+00:00",
+                   "complete": False},
+        "yesterday": {"label": "yesterday", "coverage_status": ta.COVERAGE_NO_DATA,
+                      "coverage_note": "Host network monitoring has never recorded a sample for this interface.",
+                      "rx_bytes": 0, "tx_bytes": 0, "combined_bytes": 0,
+                      "avg_combined_bytes_per_sec": None, "peak_combined_bytes_per_sec": None,
+                      "period_start": None, "period_end": "2026-01-01T00:00:00+00:00", "complete": False},
+    }
+    out = menu.render_traffic_analytics_report(bundle, menu.Style(enabled=False))
+    assert "Today" in out
+    assert "1.50 GB" in out  # combined
+    assert "Yesterday" in out
+    assert "No data" in out
+    assert "never recorded" in out
+
+
 # ---------- v1.7.0: dashboard auto-sync health, verified via actual systemd state ----------
 
 def test_classify_timer_health_active():
