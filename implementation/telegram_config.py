@@ -99,6 +99,7 @@ class TelegramSettings:
     report_hour: int = 0
     report_minute: int = 0
     report_timezone: str = "Asia/Tehran"
+    reports_enabled: bool = False
 
     def __post_init__(self):
         if self.connectivity_mode not in VALID_CONNECTIVITY_MODES:
@@ -132,6 +133,7 @@ def load_telegram_settings(config_dir: str) -> TelegramSettings:
             report_hour=int(data.get("report_hour", 0)),
             report_minute=int(data.get("report_minute", 0)),
             report_timezone=data.get("report_timezone", "Asia/Tehran"),
+            reports_enabled=bool(data.get("reports_enabled", False)),
         )
     except (OSError, ValueError, TypeError, KeyError):
         return TelegramSettings()
@@ -152,6 +154,7 @@ def save_telegram_settings(config_dir: str, settings: TelegramSettings) -> None:
         "report_hour": settings.report_hour,
         "report_minute": settings.report_minute,
         "report_timezone": settings.report_timezone,
+        "reports_enabled": settings.reports_enabled,
     }
     tmp = path + ".tmp"
     Path(tmp).write_text(json.dumps(data, indent=2) + "\n")

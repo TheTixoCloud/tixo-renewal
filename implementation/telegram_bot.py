@@ -245,9 +245,14 @@ def _handle_alerts(config_dir, state_dir) -> str:
 
 
 def _handle_reports(config_dir, state_dir, settings) -> str:
-    return (f"Scheduled reports are not yet implemented (see docs/DEVELOPMENT_PROGRESS.md). "
-            f"Configured schedule (not yet active): "
-            f"{settings.report_hour:02d}:{settings.report_minute:02d} {settings.report_timezone}.")
+    import reports as reports_mod
+    last_sent = reports_mod.load_last_report_sent_date(state_dir)
+    schedule = f"{settings.report_hour:02d}:{settings.report_minute:02d} {settings.report_timezone}"
+    if last_sent:
+        return (f"Scheduled report delivery is active (checked every bot polling iteration, "
+                f"not a separate timer). Schedule: {schedule}. Last sent: {last_sent}.")
+    return (f"Scheduled report delivery is active (checked every bot polling iteration, not "
+            f"a separate timer) but has not sent one yet. Schedule: {schedule}.")
 
 
 def _handle_backup(config_dir, state_dir) -> str:
@@ -259,7 +264,8 @@ def _handle_settings(settings) -> str:
             f"Enabled: {settings.enabled}\n"
             f"Admins: {len(settings.admin_ids)}  Viewers: {len(settings.viewer_ids)}\n"
             f"Report schedule: {settings.report_hour:02d}:{settings.report_minute:02d} "
-            f"{settings.report_timezone}")
+            f"{settings.report_timezone}\n"
+            f"Scheduled reports enabled: {settings.reports_enabled}")
 
 
 COMMANDS = ("/start", "/help", "/status", "/host", "/network", "/traffic", "/vps",
@@ -416,6 +422,24 @@ def run_polling_loop(transport, settings, config_dir: str, state_dir: str,
             save_last_update_id(state_dir, offset)
         total_processed += processed_this_iteration
         iterations_run += 1
+
+        if settings.reports_enabled and settings.admin_ids:
+            import reports as reports_mod
+            last_sent = reports_mod.load_last_report_sent_date(state_dir)
+            if reports_mod.should_send_scheduled_report(settings, last_sent):
+                report_text = reports_mod.generate_report_text(config_dir, state_dir)
+                delivery = reports_mod.send_report_to_admins(transport, settings.admin_ids, report_text)
+                # Marked sent for today only if EVERY admin received it -- a partial failure
+                # must not be silently treated as "done for today," or an admin whose
+                # delivery failed would simply never get that day's report.
+                if all(r["ok"] for r in delivery.values()):
+                    import datetime as _dt
+                    from zoneinfo import ZoneInfo as _ZoneInfo
+                    today_str = _dt.datetime.now(_dt.timezone.utc).astimezone(
+                        _ZoneInfo(settings.report_timezone)
+                    ).strftime("%Y-%m-%d")
+                    reports_mod.save_last_report_sent_date(state_dir, today_str)
+
         if on_iteration:
             on_iteration({"error": None, "processed": processed_this_iteration})
         if max_iterations is None and not updates:

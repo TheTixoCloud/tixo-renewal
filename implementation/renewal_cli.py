@@ -1182,6 +1182,43 @@ def cmd_check_exhausted(args):
     return 0
 
 
+def cmd_send_report(args):
+    """Manually generates and sends one report to all configured admins right now --
+    useful for testing report content/delivery without waiting for the schedule. Does NOT
+    require reports_enabled (that flag only gates the AUTOMATIC per-iteration check inside
+    telegram-bot-run); it DOES require the bot to be enabled and configured, same as
+    telegram-bot-run, since it needs a working transport."""
+    import reports as reports_mod
+    import telegram_bot as tbot
+    import telegram_config as tgc_mod
+
+    settings = tgc_mod.load_telegram_settings(CONFIG_DIR)
+    if not settings.enabled:
+        print("BLOCKED: Telegram bot is not enabled.")
+        return 1
+    if not settings.admin_ids:
+        print("BLOCKED: no admin_ids configured -- nothing to send to.")
+        return 1
+    try:
+        secrets = tgc_mod.load_telegram_secrets(tgc_mod.default_secrets_path(CONFIG_DIR))
+    except (FileNotFoundError, tgc_mod.TelegramConfigSecurityError) as e:
+        print(f"BLOCKED: cannot load Telegram secrets: {e}")
+        return 1
+    try:
+        transport = tbot.build_transport(settings, secrets)
+    except ValueError as e:
+        print(f"BLOCKED: cannot build transport: {e}")
+        return 1
+
+    report_text = reports_mod.generate_report_text(CONFIG_DIR, STATE_DIR,
+                                                     period_label=getattr(args, "period", "Manual"))
+    delivery = reports_mod.send_report_to_admins(transport, settings.admin_ids, report_text)
+    for admin_id, result in delivery.items():
+        status = "delivered" if result["ok"] else f"FAILED ({result['error']})"
+        print(f"  admin {admin_id}: {status}")
+    return 0 if all(r["ok"] for r in delivery.values()) else 1
+
+
 def cmd_telegram_bot_run(args):
     """Runs the Telegram long-polling loop (see telegram_bot.run_polling_loop). Blocks
     forever by default (the real deployment shape for a systemd service, Type=simple,
@@ -1292,6 +1329,14 @@ def main():
              "disabled)")
     check_exhausted_p.add_argument("--node")
     check_exhausted_p.set_defaults(func=cmd_check_exhausted)
+
+    send_report_p = sub.add_parser(
+        "send-report",
+        help="Manually generate and send one report to all configured Telegram admins now "
+             "(for testing; does not require reports_enabled)")
+    send_report_p.add_argument("--period", default="Manual",
+                                help="Display label for the report (e.g. Daily/Weekly/Manual)")
+    send_report_p.set_defaults(func=cmd_send_report)
 
     telegram_bot_run_p = sub.add_parser(
         "telegram-bot-run",

@@ -1814,6 +1814,36 @@ def action_configure_telegram_bot(style: Style):
     enable_raw = input(f"Enable the bot module now? [y/N] (enabled={settings.enabled}): ").strip().lower()
     new_settings.enabled = enable_raw == "y"
 
+    reports_raw = input(f"Enable scheduled daily reports? [y/N] "
+                         f"(currently {settings.reports_enabled}): ").strip().lower()
+    reports_enabled = reports_raw == "y"
+    report_hour, report_minute, report_timezone = (settings.report_hour, settings.report_minute,
+                                                     settings.report_timezone)
+    if reports_enabled:
+        hour_raw = input(f"Report hour (0-23) [{report_hour}]: ").strip()
+        minute_raw = input(f"Report minute (0-59) [{report_minute}]: ").strip()
+        tz_raw = input(f"Report timezone [{report_timezone}]: ").strip()
+        try:
+            report_hour = int(hour_raw) if hour_raw else report_hour
+            report_minute = int(minute_raw) if minute_raw else report_minute
+            report_timezone = tz_raw or report_timezone
+        except ValueError:
+            print("Rejected: report hour/minute must be numeric.")
+            return
+        print(f"{style.GRAY}Reports are checked once per Telegram polling-loop iteration -- "
+              f"no new systemd timer is created for this.{style.RESET}")
+    try:
+        new_settings = tgc.TelegramSettings(
+            enabled=new_settings.enabled, connectivity_mode=new_settings.connectivity_mode,
+            admin_ids=new_settings.admin_ids, viewer_ids=new_settings.viewer_ids,
+            socks5_host=new_settings.socks5_host, socks5_port=new_settings.socks5_port,
+            socks5_username=new_settings.socks5_username, relay_host=new_settings.relay_host,
+            report_hour=report_hour, report_minute=report_minute,
+            report_timezone=report_timezone, reports_enabled=reports_enabled)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+
     import getpass
     secrets_path = tgc.default_secrets_path(renewal_cli.CONFIG_DIR)
     set_token = input("Set/update the bot token now? [y/N]: ").strip().lower() == "y"

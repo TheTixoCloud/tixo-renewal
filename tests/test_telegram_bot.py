@@ -183,11 +183,22 @@ def test_alerts_command_shows_real_pending_review(tmp_path):
     assert "VPS 7" in result["reply"]
 
 
-def test_reports_command_is_honest_about_not_implemented(tmp_path):
-    settings = tc.TelegramSettings(admin_ids=[111])
+def test_reports_command_shows_schedule_and_last_sent_status(tmp_path):
+    settings = tc.TelegramSettings(admin_ids=[111], report_hour=9, report_minute=30,
+                                    report_timezone="UTC")
     result = bot.process_update(_message_update("/reports", user_id=111), settings,
                                  _config_dir(tmp_path), _state_dir(tmp_path))
-    assert "not yet implemented" in result["reply"].lower()
+    assert "09:30 UTC" in result["reply"]
+    assert "has not sent one yet" in result["reply"]
+
+
+def test_reports_command_shows_last_sent_date_once_recorded(tmp_path):
+    import reports as reports_mod
+    settings = tc.TelegramSettings(admin_ids=[111])
+    reports_mod.save_last_report_sent_date(_state_dir(tmp_path), "2026-01-01")
+    result = bot.process_update(_message_update("/reports", user_id=111), settings,
+                                 _config_dir(tmp_path), _state_dir(tmp_path))
+    assert "2026-01-01" in result["reply"]
 
 
 def test_backup_command_is_honest_about_not_implemented(tmp_path):
@@ -563,3 +574,107 @@ def test_cmd_check_exhausted_evaluates_real_inventory(tmp_path, capsys):
     assert rc == 0
     assert "VPS 9" in out
     assert "QUEUED_FOR_REVIEW" in out
+
+
+# ---------- run_polling_loop: scheduled report integration (no new timer, checked per tick) --
+
+def test_polling_loop_sends_scheduled_report_when_due(tmp_path):
+    import reports as reports_mod
+    from datetime import datetime, timezone as _tz
+    settings = tc.TelegramSettings(admin_ids=[111], reports_enabled=True, report_hour=0,
+                                    report_minute=0, report_timezone="UTC")
+    transport = _FakeTransport([{"ok": True, "result": []}])
+    now = datetime(2026, 1, 1, 12, 0, tzinfo=_tz.utc)
+    import unittest.mock as mock
+    with mock.patch("reports.datetime") as mock_dt:
+        mock_dt.now.return_value = now
+        mock_dt.timezone = _tz
+        bot.run_polling_loop(transport, settings, _config_dir(tmp_path), _state_dir(tmp_path),
+                              max_iterations=1, sleep_fn=lambda s: None)
+    send_calls = [c for c in transport.calls if c[0] == "sendMessage"]
+    assert len(send_calls) >= 1
+    assert send_calls[0][1]["chat_id"] == 111
+    assert reports_mod.load_last_report_sent_date(_state_dir(tmp_path)) is not None
+
+
+def test_polling_loop_does_not_send_report_when_disabled(tmp_path):
+    import reports as reports_mod
+    settings = tc.TelegramSettings(admin_ids=[111], reports_enabled=False)
+    transport = _FakeTransport([{"ok": True, "result": []}])
+    bot.run_polling_loop(transport, settings, _config_dir(tmp_path), _state_dir(tmp_path),
+                          max_iterations=1, sleep_fn=lambda s: None)
+    assert reports_mod.load_last_report_sent_date(_state_dir(tmp_path)) is None
+
+
+def test_polling_loop_does_not_resend_report_same_day(tmp_path):
+    import reports as reports_mod
+    settings = tc.TelegramSettings(admin_ids=[111], reports_enabled=True, report_hour=0,
+                                    report_minute=0, report_timezone="UTC")
+    reports_mod.save_last_report_sent_date(
+        _state_dir(tmp_path),
+        reports_mod.datetime.now(reports_mod.timezone.utc).strftime("%Y-%m-%d"))
+    transport = _FakeTransport([{"ok": True, "result": []}])
+    bot.run_polling_loop(transport, settings, _config_dir(tmp_path), _state_dir(tmp_path),
+                          max_iterations=1, sleep_fn=lambda s: None)
+    send_calls = [c for c in transport.calls if c[0] == "sendMessage"]
+    assert len(send_calls) == 0
+
+
+# ---------- renewal_cli.py: send-report subcommand -------------------------------------------
+
+def test_cmd_send_report_blocked_when_disabled(tmp_path, capsys):
+    import renewal_cli
+    renewal_cli.CONFIG_DIR = str(tmp_path / "config")
+    renewal_cli.STATE_DIR = str(tmp_path / "state")
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    os.makedirs(renewal_cli.STATE_DIR, exist_ok=True)
+
+    class _Args:
+        period = "Manual"
+    rc = renewal_cli.cmd_send_report(_Args())
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "BLOCKED" in out
+
+
+def test_cmd_send_report_blocked_when_no_admins(tmp_path, capsys):
+    import renewal_cli
+    renewal_cli.CONFIG_DIR = str(tmp_path / "config")
+    renewal_cli.STATE_DIR = str(tmp_path / "state")
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    os.makedirs(renewal_cli.STATE_DIR, exist_ok=True)
+    tc.save_telegram_settings(renewal_cli.CONFIG_DIR,
+                               tc.TelegramSettings(enabled=True, admin_ids=[]))
+
+    class _Args:
+        period = "Manual"
+    rc = renewal_cli.cmd_send_report(_Args())
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "no admin_ids" in out.lower()
+
+
+def test_cmd_send_report_delivers_and_reports_per_admin(tmp_path, capsys):
+    import renewal_cli
+    import telegram_transport as tt
+
+    renewal_cli.CONFIG_DIR = str(tmp_path / "config")
+    renewal_cli.STATE_DIR = str(tmp_path / "state")
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    os.makedirs(renewal_cli.STATE_DIR, exist_ok=True)
+    tc.save_telegram_settings(renewal_cli.CONFIG_DIR,
+                               tc.TelegramSettings(enabled=True, admin_ids=[111, 222]))
+    tc.store_telegram_secrets(tc.default_secrets_path(renewal_cli.CONFIG_DIR), bot_token="t")
+
+    def fake_call(self, method, params=None, http_post=None):
+        return {"ok": True, "result": {}}
+
+    import unittest.mock as mock
+    with mock.patch.object(tt.DirectTransport, "call", fake_call):
+        class _Args:
+            period = "Manual"
+        rc = renewal_cli.cmd_send_report(_Args())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "admin 111: delivered" in out
+    assert "admin 222: delivered" in out

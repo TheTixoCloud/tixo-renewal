@@ -205,16 +205,43 @@ process is not — see "Deliberately NOT done" below)*
   `renewal_cli.py` wiring (argparse registration, both blocked-start cases, a full
   start-and-stop run with a mocked transport).
 
+### 7. Scheduled reports — DONE
+- **File:** `implementation/reports.py` (new). `generate_report_text()` builds a full
+  text report from `control_center_api.get_full_snapshot()` alone (host health, network
+  traffic -- today/week/month, explicitly separating the raw live kernel counter reading
+  from persistent recorded totals and never adding one into the other, VPS inventory,
+  renewals, emergency-policy queue/grants) — every section says so honestly when there's
+  no data yet, and the backup section still says "not yet implemented" (see above). VPS
+  restarts are never mentioned at all (no reliable source wired), matching the explicit
+  "never infer a restart from current running status" instruction.
+- `chunk_telegram_message()` splits a report that exceeds Telegram's 4096-character limit
+  on line boundaries (hard-splitting only a single overlong line as a last resort) —
+  tested for lossless reconstruction.
+- `send_report_to_admins()` sends to every admin independently; a report is marked
+  delivered for a given admin **only if Telegram's own API response says `ok: true`** for
+  every chunk sent to them — one admin's failure never blocks or falsifies another's
+  result, and a transport-level exception is caught and recorded, never raised.
+- **No new systemd timer.** Scheduling (`should_send_scheduled_report()`, idempotent once
+  per local calendar day in the configured `report_timezone`, never backlogs missed days)
+  is checked once per iteration of the ALREADY-RUNNING `telegram_bot.run_polling_loop` —
+  gated by a new, separate `TelegramSettings.reports_enabled` flag (default `False`), so
+  simply enabling the bot does not silently start pushing daily reports. The report is
+  only marked "sent today" if delivery succeeded for every configured admin.
+- Wired into the CLI as a `send-report` subcommand (manual, immediate, for testing —
+  independent of `reports_enabled`) and into `/reports`' bot command (now shows the real
+  configured schedule and last-sent date instead of a placeholder) and `/settings`.
+  `menu.py`'s "Configure Telegram bot" screen now also configures the report schedule.
+- **Tests:** `tests/test_reports.py` (21) + 8 more in `tests/test_telegram_bot.py` (loop
+  integration + `send-report` CLI wiring) + 2 updated `/reports` tests.
+
 ### Combined test count
 - Pre-existing (as of v1.7.3): 675 passing.
-- New this session: 172, across `tests/test_traffic_analytics.py`,
+- New this session: 206, across `tests/test_traffic_analytics.py`,
   `tests/test_emergency_policy.py`, `tests/test_security.py`,
   `tests/test_control_center_api.py`, `tests/test_telegram_transport.py`,
-  `tests/test_telegram_config.py`, `tests/test_telegram_bot.py`, and several new cases added
-  to `tests/test_menu.py` for CLI wiring.
-- **Total: 853 passing** (verified by running the full suite; +6 more from the
-  `check-exhausted` CLI wiring and `check_fleet_exhaustion` shared-logic tests added
-  right after this checkpoint), no skips, no mocked-away
+  `tests/test_telegram_config.py`, `tests/test_telegram_bot.py`, `tests/test_reports.py`,
+  and several new cases added to `tests/test_menu.py` for CLI wiring.
+- **Total: 881 passing** (verified by running the full suite), no skips, no mocked-away
   failures.
 
 ---
@@ -235,8 +262,11 @@ These are honestly reported as **not implemented**, not "mostly done" or "mocked
   external VPS (receiving signed envelopes, calling Telegram, signing results back) does not
   exist, and there is no second host available this session to validate an end-to-end
   two-host integration even if it did.
-- **Scheduled reports and backup delivery.** `/reports` and `/backup` commands exist and
-  correctly report "not yet implemented" rather than fabricating output.
+- **Encrypted/scheduled backup delivery via Telegram.** The `/backup` command still
+  honestly reports "not yet implemented" — this is genuinely not built (no backup content
+  generation, no encryption, no delivery). Scheduled REPORTS, by contrast, ARE now done
+  (see section 7 below) — these were previously bundled together in this checkpoint's
+  wording but are different features at different states of completion.
 - **Web dashboard (backend + frontend, all 17 pages, SSE/WebSocket live updates, auth/RBAC,
   TLS).** Not started.
 - **Remote management/agent mode.** Not started.
@@ -275,8 +305,10 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
    new/modified timer this session) and the emergency-grant *auto-apply* step still
    requires the separate `EMERGENCY_GRANTS_APPROVED` marker and is only reachable
    interactively from the menu, never from a noninteractive command yet.
-3. Reporting/alerts/backup scheduling (builds on `control_center_api.get_full_snapshot` for
-   report content, and the now-working Telegram transports for delivery).
+3. ~~Reporting/alerts scheduling...~~ **DONE** (see section 7 above: `reports.py`,
+   checked per polling-loop iteration, no new timer). **Backup delivery is still not
+   done** — no backup content generation, no encryption, no delivery mechanism at all.
+   This is the current next step.
 4. The relay worker process + an end-to-end two-host validation (needs a second host).
 5. Web dashboard backend (reusing `control_center_api.py` + `security.py` directly), then
    frontend.
