@@ -371,3 +371,98 @@ def save_policy_settings(config_dir: str, policy: ExhaustedBandwidthPolicy) -> N
     tmp = path + ".tmp"
     Path(tmp).write_text(json.dumps(data, indent=2) + "\n")
     os.replace(tmp, path)
+
+
+# ---------- apply wiring: turns a PROPOSED grant into a real quota write --------------------
+#
+# SAFETY, EXPLICIT (this is the ONE function in this project that lets this module's output
+# reach a real customer quota): reuses writer.apply_renewal() COMPLETELY UNCHANGED -- this
+# module never duplicates, re-derives, or bypasses any of its structural gates (WRITE_APPROVED,
+# confirm=True, unresolved-prior-operation dedup, write-cooldown, the <=0-means-unlimited
+# guard, the live pre/post-write verification reads, the false-success settle-delay re-read).
+# On top of ALL of that, a SECOND, SEPARATE, explicitly-operator-created approval marker
+# (EMERGENCY_GRANTS_APPROVED) is required -- per explicit instruction, the pre-existing
+# WRITE_APPROVED marker alone must NEVER be sufficient to activate this newer, independently
+# -risky feature. An operator who approved regular scheduled renewals has not thereby approved
+# automatic emergency top-ups.
+
+EMERGENCY_GRANTS_APPROVAL_FILENAME = "EMERGENCY_GRANTS_APPROVED"
+
+
+def emergency_grants_approval_path(config_dir: str) -> str:
+    return os.path.join(config_dir, EMERGENCY_GRANTS_APPROVAL_FILENAME)
+
+
+def is_emergency_grants_approved(config_dir: str) -> bool:
+    return os.path.exists(emergency_grants_approval_path(config_dir))
+
+
+def apply_proposed_grant(conn_ep: sqlite3.Connection, conn_ledger, grant_id: int, node_id: str,
+                          vpsid: int, creds, config_dir: str, write_approval_marker_path: str,
+                          read_live_quota_fn, writer_apply_fn=None, now_fn=None,
+                          **writer_kwargs) -> dict:
+    """Applies ONE already-PROPOSED emergency grant. `conn_ep` is this module's own database
+    (emergency_policy.sqlite3); `conn_ledger` is the EXISTING renewal ledger connection
+    (shadow_monitor's `self.sqlite3`-shaped DB, already carrying writer.py's `operations`
+    table) -- passed straight through to writer_apply_fn unchanged, never a new table.
+
+    IDEMPOTENCY is writer.py's OWN mechanism, not reimplemented here: `period_key =
+    f"emergency-grant:{grant_id}"` is unique per grant row, so writer.apply_renewal's
+    existing find_any_prior_operation() dedup already blocks any accidental double-apply for
+    the same grant -- exactly the same guarantee the regular scheduled-renewal path relies
+    on, extended to a new period_key namespace rather than given a second implementation.
+
+    The new quota written is CURRENT LIVE QUOTA (read fresh, right here, right before
+    computing the target) PLUS the grant's amount_gb -- an increment, never an absolute
+    value computed from stale/cached data, so a VPS that already renewed normally in the
+    meantime is topped up from its CURRENT allowance, not reset to some earlier number.
+
+    Never raises on a normal blocked/unverified outcome (returns writer.py's own result dict
+    merged with `grant_id`); only marks the grant row APPLIED when writer.py's result status
+    is the literal string "APPLIED" -- any other outcome (blocked, cooldown, unknown-needs-
+    verification, etc.) leaves the grant row PROPOSED so a future retry can be attempted,
+    identical in spirit to how an unresolved scheduled-renewal operation is left for the
+    operator's existing `resolve-operation` tooling."""
+    now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+    if writer_apply_fn is None:
+        import writer as writer_mod
+        writer_apply_fn = writer_mod.apply_renewal
+
+    row = conn_ep.execute(
+        "SELECT vpsid, amount_gb, status FROM emergency_grants WHERE id=?", (grant_id,)
+    ).fetchone()
+    if row is None:
+        return {"status": "GRANT_NOT_FOUND", "grant_id": grant_id}
+    row_vpsid, amount_gb_str, status = row
+    if row_vpsid != vpsid:
+        return {"status": "VPSID_MISMATCH", "grant_id": grant_id, "expected_vpsid": row_vpsid,
+                "given_vpsid": vpsid}
+    if status != STATUS_PROPOSED:
+        return {"status": "GRANT_NOT_PROPOSED", "grant_id": grant_id, "current_status": status}
+
+    if not is_emergency_grants_approved(config_dir):
+        return {"status": "BLOCKED_EMERGENCY_GRANTS_NOT_APPROVED", "grant_id": grant_id,
+                "note": f"create {emergency_grants_approval_path(config_dir)} to enable this "
+                        f"feature -- the existing WRITE_APPROVED marker alone is never "
+                        f"sufficient for emergency grants"}
+
+    try:
+        current_quota_gb = Decimal(str(read_live_quota_fn(vpsid)))
+    except Exception as e:
+        return {"status": "UNKNOWN_NEEDS_VERIFICATION", "grant_id": grant_id,
+                "note": f"failed reading current live quota before computing grant target: {e}"}
+
+    amount_gb = Decimal(amount_gb_str)
+    new_quota_gb = current_quota_gb + amount_gb
+    period_key = f"emergency-grant:{grant_id}"
+
+    result = writer_apply_fn(
+        conn_ledger, node_id, vpsid, period_key, new_quota_gb, creds,
+        write_approval_marker_path, confirm=True, read_live_quota_fn=read_live_quota_fn,
+        **writer_kwargs,
+    )
+    result = dict(result)
+    result["grant_id"] = grant_id
+    if result.get("status") == STATUS_APPLIED:
+        mark_grant_applied(conn_ep, grant_id, applied_at=now_fn().isoformat())
+    return result

@@ -9,6 +9,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "implementation"))
 
 import emergency_policy as ep
@@ -305,3 +307,204 @@ def test_load_settings_malformed_file_falls_back_to_disabled(tmp_path):
     path.write_text("{not valid json")
     policy = ep.load_policy_settings(str(tmp_path))
     assert policy.mode == ep.MODE_DISABLED
+
+
+# ---------- apply wiring: real writer.apply_renewal, fully mocked network/read ----------------
+
+import writer as w
+import sqlite3 as _sqlite3
+
+
+def _ledger_conn(tmp_path):
+    c = _sqlite3.connect(str(tmp_path / "ledger.sqlite3"))
+    w.ensure_operations_schema(c)
+    return c
+
+
+CREDS = w.ApiCredentials(base_url="https://example.invalid/index.php", api_key="k", api_pass="p")
+
+
+def _write_approved_marker(tmp_path):
+    p = tmp_path / "WRITE_APPROVED"
+    p.write_text("approved")
+    return str(p)
+
+
+def _emergency_grants_approved_marker(tmp_path):
+    (tmp_path / ep.EMERGENCY_GRANTS_APPROVAL_FILENAME).write_text("approved")
+
+
+def _propose_grant(conn_ep, vpsid=42, amount="1", now=None):
+    policy = ep.ExhaustedBandwidthPolicy(mode=ep.MODE_EMERGENCY_GRANT,
+                                          emergency_grant_amount_gb=Decimal(amount))
+    result = ep.evaluate_exhaustion(conn_ep, vpsid, quota_gb="100", used_gb="150", policy=policy,
+                                     now=now or datetime(2026, 1, 15, tzinfo=timezone.utc))
+    return result["grant_id"]
+
+
+def test_emergency_grants_require_separate_approval_marker_write_approved_alone_insufficient(tmp_path):
+    """The explicit, critical safety requirement: WRITE_APPROVED existing alone must NEVER
+    activate emergency grants."""
+    conn_ep = _db(tmp_path)
+    conn_ledger = _ledger_conn(tmp_path)
+    grant_id = _propose_grant(conn_ep)
+    marker = _write_approved_marker(tmp_path)  # WRITE_APPROVED present...
+    # ...but EMERGENCY_GRANTS_APPROVED is deliberately NOT created.
+    result = ep.apply_proposed_grant(
+        conn_ep, conn_ledger, grant_id, "self", 42, CREDS, str(tmp_path), marker,
+        read_live_quota_fn=lambda v: Decimal("100"),
+    )
+    assert result["status"] == "BLOCKED_EMERGENCY_GRANTS_NOT_APPROVED"
+    # nothing was written -- no operation row created at all
+    assert conn_ledger.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 0
+    row = conn_ep.execute("SELECT status FROM emergency_grants WHERE id=?", (grant_id,)).fetchone()
+    assert row[0] == ep.STATUS_PROPOSED  # untouched
+
+
+def test_emergency_grant_blocked_without_write_approved_even_with_emergency_marker(tmp_path):
+    """And the reverse: EMERGENCY_GRANTS_APPROVED alone, without WRITE_APPROVED, must also
+    not be enough -- writer.apply_renewal's own gate still applies untouched."""
+    conn_ep = _db(tmp_path)
+    conn_ledger = _ledger_conn(tmp_path)
+    grant_id = _propose_grant(conn_ep)
+    _emergency_grants_approved_marker(tmp_path)
+    unapproved_write_marker = str(tmp_path / "WRITE_APPROVED")  # never created
+    with pytest.raises(w.WriteBlockedError):
+        ep.apply_proposed_grant(
+            conn_ep, conn_ledger, grant_id, "self", 42, CREDS, str(tmp_path),
+            unapproved_write_marker, read_live_quota_fn=lambda v: Decimal("100"),
+        )
+
+
+def test_emergency_grant_applies_successfully_with_both_markers(tmp_path):
+    conn_ep = _db(tmp_path)
+    conn_ledger = _ledger_conn(tmp_path)
+    grant_id = _propose_grant(conn_ep, amount="1")
+    marker = _write_approved_marker(tmp_path)
+    _emergency_grants_approved_marker(tmp_path)
+
+    # writer.apply_renewal reads live quota 3x: pre-write, post-write, confirm re-read.
+    # Our wrapper reads it once more FIRST to compute the target (100 -> 101).
+    reads = iter([Decimal("100"), Decimal("100"), Decimal("101"), Decimal("101")])
+    result = ep.apply_proposed_grant(
+        conn_ep, conn_ledger, grant_id, "self", 42, CREDS, str(tmp_path), marker,
+        read_live_quota_fn=lambda v: next(reads),
+        http_post=lambda url, data, timeout: '{"done":1}',
+        confirm_read_delay_seconds=0,
+    )
+    assert result["status"] == "APPLIED"
+    assert result["verified_after_quota_gb"] == Decimal("101")
+    row = conn_ep.execute("SELECT status, applied_at FROM emergency_grants WHERE id=?",
+                           (grant_id,)).fetchone()
+    assert row[0] == ep.STATUS_APPLIED
+    assert row[1] is not None
+    # the ledger got exactly one real operation row, period_key namespaced for this grant
+    op = conn_ledger.execute("SELECT period_key, requested_new_quota_gb FROM operations").fetchone()
+    assert op == (f"emergency-grant:{grant_id}", "101")
+
+
+def test_emergency_grant_new_quota_is_increment_not_absolute(tmp_path):
+    """A VPS that already has 250 GB (e.g. from a prior unrelated top-up) and gets a 1 GB
+    emergency grant must end up at 251, never reset to some fixed absolute number."""
+    conn_ep = _db(tmp_path)
+    conn_ledger = _ledger_conn(tmp_path)
+    grant_id = _propose_grant(conn_ep, amount="1")
+    marker = _write_approved_marker(tmp_path)
+    _emergency_grants_approved_marker(tmp_path)
+    reads = iter([Decimal("250"), Decimal("250"), Decimal("251"), Decimal("251")])
+    result = ep.apply_proposed_grant(
+        conn_ep, conn_ledger, grant_id, "self", 42, CREDS, str(tmp_path), marker,
+        read_live_quota_fn=lambda v: next(reads),
+        http_post=lambda url, data, timeout: '{"done":1}',
+        confirm_read_delay_seconds=0,
+    )
+    assert result["status"] == "APPLIED"
+    op = conn_ledger.execute("SELECT requested_new_quota_gb FROM operations").fetchone()
+    assert op == ("251",)
+
+
+def test_emergency_grant_duplicate_apply_blocked_by_writers_own_idempotency(tmp_path):
+    conn_ep = _db(tmp_path)
+    conn_ledger = _ledger_conn(tmp_path)
+    grant_id = _propose_grant(conn_ep, amount="1")
+    marker = _write_approved_marker(tmp_path)
+    _emergency_grants_approved_marker(tmp_path)
+    reads1 = iter([Decimal("100"), Decimal("100"), Decimal("101"), Decimal("101")])
+    r1 = ep.apply_proposed_grant(
+        conn_ep, conn_ledger, grant_id, "self", 42, CREDS, str(tmp_path), marker,
+        read_live_quota_fn=lambda v: next(reads1),
+        http_post=lambda url, data, timeout: '{"done":1}',
+        confirm_read_delay_seconds=0,
+    )
+    assert r1["status"] == "APPLIED"
+
+    # grant is now APPLIED, not PROPOSED -- calling apply again must refuse before writer
+    # is even reached
+    r2 = ep.apply_proposed_grant(
+        conn_ep, conn_ledger, grant_id, "self", 42, CREDS, str(tmp_path), marker,
+        read_live_quota_fn=lambda v: Decimal("999"),  # would be wrong if ever reached
+    )
+    assert r2["status"] == "GRANT_NOT_PROPOSED"
+    assert conn_ledger.execute("SELECT COUNT(*) FROM operations").fetchone()[0] == 1
+
+
+def test_emergency_grant_not_marked_applied_when_writer_reports_unverified(tmp_path):
+    conn_ep = _db(tmp_path)
+    conn_ledger = _ledger_conn(tmp_path)
+    grant_id = _propose_grant(conn_ep, amount="1")
+    marker = _write_approved_marker(tmp_path)
+    _emergency_grants_approved_marker(tmp_path)
+
+    def failing_pre_read(_v):
+        raise OSError("host unreachable")
+
+    # our wrapper's OWN pre-read (to compute target) succeeds via a different fn than what's
+    # passed to writer -- simulate: the wrapper reads fine, but writer's internal reads fail.
+    call_count = {"n": 0}
+    def flaky(v):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return Decimal("100")  # wrapper's own pre-read
+        raise OSError("host unreachable")  # writer's internal pre-write read fails
+
+    result = ep.apply_proposed_grant(
+        conn_ep, conn_ledger, grant_id, "self", 42, CREDS, str(tmp_path), marker,
+        read_live_quota_fn=flaky,
+    )
+    assert result["status"] == "UNKNOWN_NEEDS_VERIFICATION"
+    row = conn_ep.execute("SELECT status FROM emergency_grants WHERE id=?", (grant_id,)).fetchone()
+    assert row[0] == ep.STATUS_PROPOSED  # left PROPOSED, not falsely marked APPLIED
+
+
+def test_emergency_grant_not_found_reports_cleanly(tmp_path):
+    conn_ep = _db(tmp_path)
+    conn_ledger = _ledger_conn(tmp_path)
+    marker = _write_approved_marker(tmp_path)
+    _emergency_grants_approved_marker(tmp_path)
+    result = ep.apply_proposed_grant(
+        conn_ep, conn_ledger, 9999, "self", 42, CREDS, str(tmp_path), marker,
+        read_live_quota_fn=lambda v: Decimal("100"),
+    )
+    assert result["status"] == "GRANT_NOT_FOUND"
+
+
+def test_emergency_grant_vpsid_mismatch_refused(tmp_path):
+    conn_ep = _db(tmp_path)
+    conn_ledger = _ledger_conn(tmp_path)
+    grant_id = _propose_grant(conn_ep, vpsid=42)
+    marker = _write_approved_marker(tmp_path)
+    _emergency_grants_approved_marker(tmp_path)
+    result = ep.apply_proposed_grant(
+        conn_ep, conn_ledger, grant_id, "self", 999, CREDS, str(tmp_path), marker,
+        read_live_quota_fn=lambda v: Decimal("100"),
+    )
+    assert result["status"] == "VPSID_MISMATCH"
+
+
+def test_is_emergency_grants_approved_false_when_file_absent(tmp_path):
+    assert ep.is_emergency_grants_approved(str(tmp_path)) is False
+
+
+def test_is_emergency_grants_approved_true_when_file_present(tmp_path):
+    _emergency_grants_approved_marker(tmp_path)
+    assert ep.is_emergency_grants_approved(str(tmp_path)) is True

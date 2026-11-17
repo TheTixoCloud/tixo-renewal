@@ -1693,12 +1693,14 @@ def action_view_manual_review_queue(style: Style):
 
 
 def action_view_emergency_grants(style: Style):
-    """Read-only view of PROPOSED emergency grants -- deliberately does NOT offer an
-    'apply' action here: actually applying a grant to a live customer quota must go through
-    writer.py's existing WRITE_APPROVED-gated, idempotent apply path (not yet wired to this
-    feature, see docs/DEVELOPMENT_PROGRESS.md), never a shortcut from this review screen."""
-    conn = emp.open_db(_emergency_policy_db_path())
-    proposed = emp.list_proposed_grants(conn)
+    """Views PROPOSED emergency grants and, as an explicit operator-initiated action,
+    offers to apply ONE of them via emergency_policy.apply_proposed_grant -- which reuses
+    writer.py's existing WRITE_APPROVED-gated, idempotent apply path UNCHANGED, plus a
+    SEPARATE EMERGENCY_GRANTS_APPROVED marker this feature alone requires. Mirrors
+    renewal_cli.cmd_apply's own interactive confirmation shape (type-APPLY + live-typed
+    credentials) -- never a shortcut around either gate."""
+    conn_ep = emp.open_db(_emergency_policy_db_path())
+    proposed = emp.list_proposed_grants(conn_ep)
     tz = load_display_tz(renewal_cli.CONFIG_DIR)
     if not proposed:
         print(f"{style.GRAY}No proposed emergency grants.{style.RESET}")
@@ -1706,8 +1708,58 @@ def action_view_emergency_grants(style: Style):
     for item in proposed:
         print(f"  [{item['id']}] VPS {item['vpsid']} -- {item['amount_gb']} GB -- "
               f"detected {format_local_time(item['detected_at'], tz)}")
-    print(f"\n{style.GRAY}These are PROPOSED only -- applying them to a live quota is not "
-          f"yet wired into this menu (see docs/DEVELOPMENT_PROGRESS.md).{style.RESET}")
+
+    if not emp.is_emergency_grants_approved(renewal_cli.CONFIG_DIR):
+        print(f"\n{style.YELLOW}Applying emergency grants is blocked: "
+              f"{emp.emergency_grants_approval_path(renewal_cli.CONFIG_DIR)} does not exist. "
+              f"WRITE_APPROVED alone is never sufficient for this feature.{style.RESET}")
+        return
+
+    choice = input("\nEnter a grant id to apply, or blank to go back: ").strip()
+    if not choice:
+        return
+    try:
+        grant_id = int(choice)
+    except ValueError:
+        print("Invalid id.")
+        return
+    row = next((g for g in proposed if g["id"] == grant_id), None)
+    if row is None:
+        print("That id is not in the PROPOSED list above.")
+        return
+
+    confirm_text = input(f"About to WRITE +{row['amount_gb']} GB to VPS {row['vpsid']}'s live "
+                          f"quota on production Virtualizor. Type EXACTLY 'APPLY' to proceed, "
+                          f"anything else cancels: ")
+    if confirm_text != "APPLY":
+        print("Cancelled.")
+        return
+
+    import getpass
+    import local_source as ls
+    import writer as writer_mod
+    node_id = input("Node id [self]: ").strip() or "self"
+    node = next((n for n in nodes_mod.load_nodes(renewal_cli._node_config_path())
+                 if n.node_id == node_id), None)
+    if node is None:
+        print(f"Unknown node: {node_id}")
+        return
+    base_url = input("Virtualizor admin API base URL (e.g. https://host:4085/index.php): ").strip()
+    api_key = getpass.getpass("Admin API key: ")
+    api_pass = getpass.getpass("Admin API password: ")
+    creds = writer_mod.ApiCredentials(base_url=base_url, api_key=api_key, api_pass=api_pass)
+
+    conn_ledger = sm.open_db(node.db_path(renewal_cli.STATE_DIR))
+    result = emp.apply_proposed_grant(
+        conn_ep, conn_ledger, grant_id, node_id, row["vpsid"], creds,
+        renewal_cli.CONFIG_DIR, renewal_cli.WRITE_APPROVAL_MARKER,
+        read_live_quota_fn=lambda v: ls.fetch_single_vps_quota(v),
+    )
+    conn_ledger.close()
+    print(f"Result: {result}")
+    if result.get("status") != "APPLIED":
+        print(f"{style.YELLOW}Not confirmed as applied -- the grant remains PROPOSED. See "
+              f"`resolve-operation` if a ledger operation was created but is stuck.{style.RESET}")
 
 
 MENU_ITEMS = [

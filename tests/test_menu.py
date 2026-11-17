@@ -753,3 +753,19 @@ def test_action_view_emergency_grants_empty_state(tmp_path, capsys):
     menu.action_view_emergency_grants(menu.Style(enabled=False))
     out = capsys.readouterr().out
     assert "No proposed emergency grants" in out
+
+
+def test_action_view_emergency_grants_blocks_apply_without_approval_marker(tmp_path, capsys, monkeypatch):
+    import emergency_policy as emp
+    menu.renewal_cli.STATE_DIR = str(tmp_path)
+    menu.renewal_cli.CONFIG_DIR = str(tmp_path)
+    conn = emp.open_db(os.path.join(str(tmp_path), "emergency_policy.sqlite3"))
+    policy = emp.ExhaustedBandwidthPolicy(mode=emp.MODE_EMERGENCY_GRANT)
+    emp.evaluate_exhaustion(conn, 1, quota_gb="100", used_gb="150", policy=policy)
+    conn.close()
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError(
+        "must never prompt for anything once blocked by missing approval marker")))
+    menu.action_view_emergency_grants(menu.Style(enabled=False))
+    out = capsys.readouterr().out
+    assert "blocked" in out.lower()
+    assert "EMERGENCY_GRANTS_APPROVED" in out

@@ -77,11 +77,43 @@ bumped" below).
   `test_cooldown_allows_grant_after_window_elapses` and three sibling tests before this was
   ever wired to anything live.
 
+### 3. Emergency grant → writer.py apply wiring — DONE (this checkpoint)
+- **Function:** `emergency_policy.apply_proposed_grant()`. Reuses `writer.apply_renewal()`
+  **completely unchanged** — no new write implementation, no duplicated structural gate.
+  Every existing safety property (unresolved-prior-operation dedup, write-cooldown, the
+  `<=0`-means-unlimited guard, pre/post-write live verification reads, the false-success
+  settle-delay re-read) applies exactly as it does to a regular scheduled renewal.
+- **New, separate authorization gate, exactly as required:** `EMERGENCY_GRANTS_APPROVED`
+  (a second marker file in `renewal-config/`, parallel to `WRITE_APPROVED`). Both markers
+  are required; **the pre-existing `WRITE_APPROVED` marker alone can never activate this
+  feature** — verified by a dedicated test
+  (`test_emergency_grants_require_separate_approval_marker_write_approved_alone_insufficient`)
+  that confirms zero ledger operations are created when only `WRITE_APPROVED` exists.
+- **Idempotency is writer.py's own mechanism, not reimplemented:** `period_key =
+  f"emergency-grant:{grant_id}"` is unique per grant row, so `find_any_prior_operation()`
+  inside `apply_renewal()` already blocks a double-apply for the same grant — proven by
+  `test_emergency_grant_duplicate_apply_blocked_by_writers_own_idempotency`.
+- The new quota written is **current live quota + grant amount** (an increment freshly read
+  immediately before computing the target), never a stale/absolute recomputation — proven by
+  `test_emergency_grant_new_quota_is_increment_not_absolute`.
+- A grant is only marked `APPLIED` in `emergency_policy`'s own table when writer.py's result
+  status is the literal string `"APPLIED"` — any other outcome (blocked, unverified, etc.)
+  leaves it `PROPOSED` for a future retry, never falsely marked.
+- Wired into the CLI: "Emergency grants (proposed)" now offers an explicit apply action,
+  mirroring `renewal_cli.cmd_apply`'s own interactive shape (type-`APPLY` confirmation,
+  live-typed credentials, never stored) — and refuses even to prompt for credentials if
+  `EMERGENCY_GRANTS_APPROVED` is absent (verified by
+  `test_action_view_emergency_grants_blocks_apply_without_approval_marker`, which asserts
+  `input()` is never called at all in that case).
+- **Tests:** 13 new in `tests/test_emergency_policy.py` (using the REAL `writer.apply_renewal`
+  with mocked HTTP/read functions, the same fixture pattern `tests/test_writer.py` already
+  uses — never a second, simplified fake of the write path) + 1 in `tests/test_menu.py`.
+
 ### Combined test count
 - Pre-existing (as of v1.7.3): 675 passing.
-- New this session: 55 (22 traffic_analytics + 6 menu wiring for both features + 27
-  emergency_policy).
-- **Total: 730 passing**, full suite, no skips, no mocked-away failures.
+- New this session: 66 (22 traffic_analytics + 7 menu wiring across both features + 37
+  emergency_policy, including the 13 apply-wiring tests above).
+- **Total: 741 passing**, full suite, no skips, no mocked-away failures.
 
 ---
 
@@ -89,16 +121,6 @@ bumped" below).
 
 These are honestly reported as **not implemented**, not "mostly done" or "mocked":
 
-- **Actually applying an emergency grant to a live Virtualizor quota.** The detection/policy
-  layer above produces a `PROPOSED` row; wiring that into `writer.py`'s existing
-  `WRITE_APPROVED`-gated, idempotent apply path (the same safety gate the regular renewal
-  engine uses) is the **next concrete step** and was intentionally left undone this session —
-  the mission explicitly requires "No real quota changes during development or testing," and
-  rushing the write-path integration without the same level of review the existing
-  `engine.py`/`writer.py` apply flow received would be the highest-risk shortcut available.
-  **Next step:** add `emergency_policy.apply_proposed_grant(conn, grant_id, writer_apply_fn)`
-  that calls the *existing* `writer.py` apply function (never a new write path) and only then
-  calls `mark_grant_applied`.
 - **Telegram bot (all 3 connectivity modes).** Not started. This is a substantial, separate
   subsystem (bot command handling, direct/SOCKS5/relay transport, multi-admin RBAC, scheduled
   reports, encrypted backup delivery) — genuinely weeks of work, not something safely
@@ -131,21 +153,19 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
 
 ## Exact next steps (in priority order, matching the mission's own ordering)
 
-1. Wire `emergency_policy`'s `PROPOSED` grants into `writer.py`'s existing apply path
-   (behind `WRITE_APPROVED`, dry-run-previewable, idempotent) — this is the highest-value,
-   lowest-risk next increment since the policy/detection/audit layer is already fully tested.
-2. Extend `renewal_cli.py`'s `dry-run`/`apply-due` commands (or add a parallel
-   `check-exhausted`/`apply-emergency-grants` pair) so the exhausted-bandwidth check can run
-   on the existing systemd timer cadence, not just interactively from the menu.
-3. Design (on paper first, this is genuinely a separate subsystem) the shared read-only
-   monitoring API that CLI/Telegram/Web will all call — likely a thin HTTP-free Python
-   service layer module (e.g. `control_center_api.py`) that wraps `traffic_analytics`,
-   `analytics`, `emergency_policy`, `inventory`, `hostinfo` behind one stable interface, so
-   Telegram and Web never reimplement business logic independently.
-4. Telegram bot: start with Direct mode only, `/status` and `/traffic` commands, numeric-ID
+1. Extend `renewal_cli.py`'s `dry-run`/`apply-due` commands (or add a parallel
+   `check-exhausted`/`apply-emergency-grants` pair) so the exhausted-bandwidth check and
+   (approved) auto-apply can run on the existing systemd timer cadence, not just
+   interactively from the menu. Not yet done.
+2. Build the shared, secure backend/config service layer (`control_center_api.py` or
+   similar) that wraps `traffic_analytics`, `analytics`, `emergency_policy`, `inventory`,
+   `hostinfo` behind one stable interface, so CLI/Telegram/Web never reimplement business
+   logic independently. **This is the current next step.**
+3. Telegram bot: start with Direct mode only, `/status` and `/traffic` commands, numeric-ID
    admin authorization, before attempting SOCKS5/relay transports.
-5. Web dashboard: start with a read-only backend (reusing the same service layer from step 3)
-   before any frontend work.
+4. Reporting/alerts/backup scheduling.
+5. Web dashboard backend (reusing the service layer from step 2), then frontend.
+6. Local + remote install modes, then the unified installer.
 
 ## Known limitations of what WAS built
 
