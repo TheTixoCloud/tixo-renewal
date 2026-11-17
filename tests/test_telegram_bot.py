@@ -269,3 +269,227 @@ def test_transport_connectivity_reports_ok_false_on_transport_error(monkeypatch)
     result = bot.test_transport_connectivity(transport)
     assert result["ok"] is False
     assert "connection failed" in result["detail"]
+
+
+# ---------- run_polling_loop --------------------------------------------------------------------
+
+class _FakeTransport:
+    """Records every call made and returns scripted responses -- real network never
+    touched. Mirrors the shape of a real transport's .call(method, params) interface."""
+
+    def __init__(self, get_updates_responses):
+        self.get_updates_responses = list(get_updates_responses)
+        self.calls = []
+
+    def call(self, method, params=None):
+        self.calls.append((method, params))
+        if method == "getUpdates":
+            if self.get_updates_responses:
+                return self.get_updates_responses.pop(0)
+            return {"ok": True, "result": []}
+        if method == "sendMessage":
+            return {"ok": True, "result": {}}
+        raise AssertionError(f"unexpected method: {method}")
+
+
+def _update(update_id, text, user_id=111, chat_id=999):
+    return {"update_id": update_id,
+            "message": {"text": text, "from": {"id": user_id}, "chat": {"id": chat_id}}}
+
+
+def test_polling_loop_processes_updates_and_advances_offset(tmp_path):
+    settings = tc.TelegramSettings(admin_ids=[111])
+    transport = _FakeTransport([
+        {"ok": True, "result": [_update(5, "/help"), _update(6, "/status")]},
+    ])
+    result = bot.run_polling_loop(transport, settings, _config_dir(tmp_path), _state_dir(tmp_path),
+                                   max_iterations=1)
+    assert result["total_processed"] == 2
+    assert result["final_offset"] == 6
+    assert bot.load_last_update_id(_state_dir(tmp_path)) == 6
+
+
+def test_polling_loop_sends_reply_via_transport(tmp_path):
+    settings = tc.TelegramSettings(admin_ids=[])
+    transport = _FakeTransport([{"ok": True, "result": [_update(1, "/help", chat_id=555)]}])
+    bot.run_polling_loop(transport, settings, _config_dir(tmp_path), _state_dir(tmp_path),
+                          max_iterations=1)
+    send_calls = [c for c in transport.calls if c[0] == "sendMessage"]
+    assert len(send_calls) == 1
+    assert send_calls[0][1]["chat_id"] == 555
+    assert send_calls[0][1]["text"] == bot.HELP_TEXT
+
+
+def test_polling_loop_requests_offset_plus_one_next_time(tmp_path):
+    settings = tc.TelegramSettings(admin_ids=[111])
+    transport = _FakeTransport([
+        {"ok": True, "result": [_update(10, "/help")]},
+        {"ok": True, "result": []},
+    ])
+    bot.run_polling_loop(transport, settings, _config_dir(tmp_path), _state_dir(tmp_path),
+                          max_iterations=2, sleep_fn=lambda s: None)
+    get_updates_calls = [c for c in transport.calls if c[0] == "getUpdates"]
+    assert get_updates_calls[1][1]["offset"] == 11
+
+
+def test_polling_loop_resumes_from_persisted_offset_across_restarts(tmp_path):
+    state_dir = _state_dir(tmp_path)
+    bot.save_last_update_id(state_dir, 42)
+    settings = tc.TelegramSettings(admin_ids=[111])
+    transport = _FakeTransport([{"ok": True, "result": []}])
+    bot.run_polling_loop(transport, settings, _config_dir(tmp_path), state_dir, max_iterations=1)
+    assert transport.calls[0][1]["offset"] == 43
+
+
+def test_polling_loop_survives_transport_error_and_continues(tmp_path):
+    import telegram_transport as tt
+
+    class _FlakyTransport(_FakeTransport):
+        def call(self, method, params=None):
+            if method == "getUpdates" and not self.calls:
+                self.calls.append((method, params))
+                raise tt.TelegramTransportError("timeout")
+            return super().call(method, params)
+
+    settings = tc.TelegramSettings(admin_ids=[111])
+    transport = _FlakyTransport([{"ok": True, "result": [_update(1, "/help")]}])
+    result = bot.run_polling_loop(transport, settings, _config_dir(tmp_path), _state_dir(tmp_path),
+                                   max_iterations=2, sleep_fn=lambda s: None)
+    assert result["iterations_run"] == 2
+    assert result["total_processed"] == 1
+
+
+def test_polling_loop_reports_errors_via_on_iteration_callback(tmp_path):
+    import telegram_transport as tt
+
+    class _AlwaysFailsTransport:
+        def call(self, method, params=None):
+            raise tt.TelegramTransportError("network down")
+
+    settings = tc.TelegramSettings(admin_ids=[111])
+    events = []
+    bot.run_polling_loop(_AlwaysFailsTransport(), settings, _config_dir(tmp_path),
+                          _state_dir(tmp_path), max_iterations=2,
+                          on_iteration=lambda e: events.append(e))
+    assert len(events) == 2
+    assert all(e["error"] == "network down" for e in events)
+
+
+def test_polling_loop_does_not_advance_offset_on_empty_batch(tmp_path):
+    state_dir = _state_dir(tmp_path)
+    bot.save_last_update_id(state_dir, 5)
+    settings = tc.TelegramSettings(admin_ids=[111])
+    transport = _FakeTransport([{"ok": True, "result": []}])
+    bot.run_polling_loop(transport, settings, _config_dir(tmp_path), state_dir, max_iterations=1)
+    assert bot.load_last_update_id(state_dir) == 5
+
+
+def test_load_last_update_id_defaults_to_zero(tmp_path):
+    assert bot.load_last_update_id(str(tmp_path)) == 0
+
+
+def test_save_and_load_last_update_id_roundtrips(tmp_path):
+    bot.save_last_update_id(str(tmp_path), 999)
+    assert bot.load_last_update_id(str(tmp_path)) == 999
+
+
+def test_load_last_update_id_malformed_file_falls_back_to_zero(tmp_path):
+    path = os.path.join(str(tmp_path), "telegram-offset.json")
+    with open(path, "w") as f:
+        f.write("{not valid json")
+    assert bot.load_last_update_id(str(tmp_path)) == 0
+
+
+# ---------- renewal_cli.py CLI wiring (argparse registration + cmd_telegram_bot_run) --------
+
+def test_renewal_cli_registers_telegram_bot_run_subcommand():
+    """Confirms main()'s argparse wiring: the subcommand parses, dispatches to the right
+    handler, and passes through --max-iterations -- without actually running the handler
+    (main() always calls sys.exit(), so we intercept the handler itself, letting the real
+    parser/dispatch logic run unmodified)."""
+    import renewal_cli
+    import sys
+    import pytest
+
+    captured = {}
+    def capture(args):
+        captured["args"] = args
+        return 0
+    orig = renewal_cli.cmd_telegram_bot_run
+    renewal_cli.cmd_telegram_bot_run = capture
+    old_argv = sys.argv
+    sys.argv = ["renewal_cli.py", "telegram-bot-run", "--max-iterations", "3"]
+    try:
+        with pytest.raises(SystemExit) as exc_info:
+            renewal_cli.main()
+        assert exc_info.value.code == 0
+    finally:
+        sys.argv = old_argv
+        renewal_cli.cmd_telegram_bot_run = orig
+
+    assert captured["args"].max_iterations == 3
+
+
+def test_cmd_telegram_bot_run_blocked_when_disabled(tmp_path, capsys):
+    import renewal_cli
+    renewal_cli.CONFIG_DIR = str(tmp_path / "config")
+    renewal_cli.STATE_DIR = str(tmp_path / "state")
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    os.makedirs(renewal_cli.STATE_DIR, exist_ok=True)
+
+    class _Args:
+        max_iterations = 1
+    rc = renewal_cli.cmd_telegram_bot_run(_Args())
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "BLOCKED" in out
+    assert "not enabled" in out
+
+
+def test_cmd_telegram_bot_run_blocked_when_secrets_missing(tmp_path, capsys):
+    import renewal_cli
+    renewal_cli.CONFIG_DIR = str(tmp_path / "config")
+    renewal_cli.STATE_DIR = str(tmp_path / "state")
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    os.makedirs(renewal_cli.STATE_DIR, exist_ok=True)
+    enabled_settings = tc.TelegramSettings(enabled=True, connectivity_mode=tc.MODE_DIRECT)
+    tc.save_telegram_settings(renewal_cli.CONFIG_DIR, enabled_settings)
+
+    class _Args:
+        max_iterations = 1
+    rc = renewal_cli.cmd_telegram_bot_run(_Args())
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "BLOCKED" in out
+    assert "secrets" in out.lower()
+
+
+def test_cmd_telegram_bot_run_starts_and_stops_with_max_iterations(tmp_path, capsys):
+    import renewal_cli
+    renewal_cli.CONFIG_DIR = str(tmp_path / "config")
+    renewal_cli.STATE_DIR = str(tmp_path / "state")
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    os.makedirs(renewal_cli.STATE_DIR, exist_ok=True)
+    enabled_settings = tc.TelegramSettings(enabled=True, connectivity_mode=tc.MODE_DIRECT)
+    tc.save_telegram_settings(renewal_cli.CONFIG_DIR, enabled_settings)
+    tc.store_telegram_secrets(tc.default_secrets_path(renewal_cli.CONFIG_DIR), bot_token="t")
+
+    import telegram_transport as tt
+    captured_transport = {}
+    def fake_post(url, data, timeout):
+        return '{"ok": true, "result": []}'
+    orig_direct_call = tt.DirectTransport.call
+    def patched_call(self, method, params=None, http_post=None):
+        captured_transport["called"] = True
+        return orig_direct_call(self, method, params, http_post=fake_post)
+
+    import unittest.mock as mock
+    with mock.patch.object(tt.DirectTransport, "call", patched_call):
+        class _Args:
+            max_iterations = 1
+        rc = renewal_cli.cmd_telegram_bot_run(_Args())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert captured_transport.get("called") is True
+    assert "Starting Telegram bot polling loop" in out
+    assert "Stopped:" in out

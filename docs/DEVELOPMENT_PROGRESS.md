@@ -183,14 +183,36 @@ process is not — see "Deliberately NOT done" below)*
   server), `tests/test_telegram_config.py` (14), `tests/test_telegram_bot.py` (27) + 1 CLI
   wiring test in `tests/test_menu.py`.
 
+### 6. Telegram long-polling loop — DONE (this checkpoint; recovered from an interrupted session)
+- **Functions:** `telegram_bot.run_polling_loop()`, `load_last_update_id()`/
+  `save_last_update_id()` (atomic offset persistence so a restart never re-delivers already-
+  processed updates), and `renewal_cli.cmd_telegram_bot_run` wired to a new
+  `telegram-bot-run` subcommand (`--max-iterations` bounds it for manual smoke-testing; the
+  real deployment shape runs forever, matching a `Type=simple, Restart=always` systemd
+  service rather than the existing timer-triggered-oneshot units).
+- Calls `getUpdates` (long-polling, so the host needs no inbound port), feeds each update to
+  the already-tested `process_update()`, sends any reply back via the same transport's
+  `sendMessage`, and persists the offset after every non-empty batch.
+- **Refuses to start at all** unless `enabled: true` is set (via the menu's "Configure
+  Telegram bot" screen) and both settings and secrets load successfully — verified by
+  dedicated tests for each blocked case (`test_cmd_telegram_bot_run_blocked_when_disabled`,
+  `test_cmd_telegram_bot_run_blocked_when_secrets_missing`).
+- A `getUpdates` transport failure is logged and the loop continues (Telegram being briefly
+  unreachable must never crash a long-running process); an unexpected non-transport
+  exception is left to propagate, since that indicates a real bug worth stopping for.
+- **Tests:** 9 new in `tests/test_telegram_bot.py` for the polling loop itself (offset
+  resume across restarts, reply delivery, error survival, empty-batch no-op) + 4 for the
+  `renewal_cli.py` wiring (argparse registration, both blocked-start cases, a full
+  start-and-stop run with a mocked transport).
+
 ### Combined test count
 - Pre-existing (as of v1.7.3): 675 passing.
-- New this session: 158, across `tests/test_traffic_analytics.py`,
+- New this session: 172, across `tests/test_traffic_analytics.py`,
   `tests/test_emergency_policy.py`, `tests/test_security.py`,
   `tests/test_control_center_api.py`, `tests/test_telegram_transport.py`,
   `tests/test_telegram_config.py`, `tests/test_telegram_bot.py`, and several new cases added
   to `tests/test_menu.py` for CLI wiring.
-- **Total: 833 passing** (verified by running the full suite), no skips, no mocked-away
+- **Total: 847 passing** (verified by running the full suite), no skips, no mocked-away
   failures.
 
 ---
@@ -199,10 +221,13 @@ process is not — see "Deliberately NOT done" below)*
 
 These are honestly reported as **not implemented**, not "mostly done" or "mocked":
 
-- **The Telegram long-polling loop / systemd service.** `process_update()` is fully
-  implemented and tested, but nothing yet calls Telegram's `getUpdates` in a loop and feeds
-  results to it — there is no running bot process, no systemd unit for it, and no
-  `renewal_cli.py` subcommand to start one. This is explicitly the next step (see below).
+- **A systemd service unit for the Telegram bot.** The long-polling loop itself is now
+  fully implemented, tested, and reachable via `renewal_cli.py telegram-bot-run` (see the
+  new "6. Telegram long-polling loop" section below) — what's still missing is a
+  `.service` unit template (Type=simple, Restart=always — NOT a `.timer`-triggered oneshot
+  like the existing 5 production timers, since this holds a persistent long-poll
+  connection) and wiring it into `renewal_cli.py`'s `install` command the same way the
+  existing timer templates are generated-but-never-installed. Not yet done.
 - **The relay worker process.** The signing/verification *protocol* (`sign_relay_request`/
   `verify_relay_request`) is done and tested; the actual second program meant to run on an
   external VPS (receiving signed envelopes, calling Telegram, signing results back) does not
@@ -237,12 +262,10 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
 
 ## Exact next steps (in priority order, matching the mission's own ordering)
 
-1. Build the actual Telegram long-polling loop: a `renewal_cli.py` subcommand (e.g.
-   `telegram-bot-run`) that calls `getUpdates` in a loop via `telegram_bot.build_transport()`
-   and feeds each update to `telegram_bot.process_update()`, sending back any `reply` via
-   the same transport's `call("sendMessage", ...)`. Needs an `offset` cursor persisted
-   somewhere (a new tiny SQLite table or a settings-file field) so a restart doesn't
-   re-deliver old updates. Not yet done. **This is the current next step.**
+1. Add a systemd `.service` unit template for `telegram-bot-run` (Type=simple,
+   Restart=always), generated-but-never-installed the same way the existing 5 timer
+   templates are — wire it into `renewal_cli.py install`'s existing
+   `write_systemd_units`-style output. **This is the current next step.**
 2. Extend `renewal_cli.py`'s `dry-run`/`apply-due` commands (or add a parallel
    `check-exhausted`/`apply-emergency-grants` pair) so the exhausted-bandwidth check and
    (approved) auto-apply can run on the existing systemd timer cadence, not just

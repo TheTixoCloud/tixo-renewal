@@ -1154,6 +1154,46 @@ def cmd_install_ui(args):
     return 0
 
 
+def cmd_telegram_bot_run(args):
+    """Runs the Telegram long-polling loop (see telegram_bot.run_polling_loop). Blocks
+    forever by default (the real deployment shape for a systemd service, Type=simple,
+    Restart=always -- NOT a timer-triggered oneshot like hostnet-sync/inventory-sync,
+    since this needs to hold a persistent long-poll connection) -- `--max-iterations`
+    bounds it for a manual smoke-test run. Refuses to start at all unless the bot is
+    explicitly enabled (`enabled: true` in telegram/settings.json, set via the menu's
+    'Configure Telegram bot' screen) -- never auto-activates just because secrets happen
+    to exist on disk."""
+    import telegram_bot as tbot
+    import telegram_config as tgc_mod
+    import security as sec
+
+    settings = tgc_mod.load_telegram_settings(CONFIG_DIR)
+    if not settings.enabled:
+        print("BLOCKED: Telegram bot is not enabled. Enable it via the menu's "
+              "'Configure Telegram bot (optional)' screen first.")
+        return 1
+    try:
+        secrets = tgc_mod.load_telegram_secrets(tgc_mod.default_secrets_path(CONFIG_DIR))
+    except (FileNotFoundError, tgc_mod.TelegramConfigSecurityError) as e:
+        print(f"BLOCKED: cannot load Telegram secrets: {e}")
+        return 1
+    try:
+        transport = tbot.build_transport(settings, secrets)
+    except ValueError as e:
+        print(f"BLOCKED: cannot build transport: {e}")
+        return 1
+
+    rate_limit_conn = sec.open_rate_limit_db(os.path.join(STATE_DIR, "telegram-ratelimit.sqlite3"))
+    max_iterations = getattr(args, "max_iterations", None)
+    print(f"Starting Telegram bot polling loop (mode={settings.connectivity_mode}"
+          f"{', max_iterations=' + str(max_iterations) if max_iterations else ''})...")
+    result = tbot.run_polling_loop(transport, settings, CONFIG_DIR, STATE_DIR,
+                                    rate_limit_conn=rate_limit_conn,
+                                    max_iterations=max_iterations)
+    print(f"Stopped: {result}")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(prog="renewal_cli.py")
     sub = ap.add_subparsers(dest="command", required=True)
@@ -1216,6 +1256,16 @@ def main():
     install_ui_p = sub.add_parser("install-ui")
     install_ui_p.add_argument("--yes", action="store_true")
     install_ui_p.set_defaults(func=cmd_install_ui)
+
+    telegram_bot_run_p = sub.add_parser(
+        "telegram-bot-run",
+        help="Run the Telegram bot long-polling loop (blocks; requires the bot to be "
+             "enabled via the menu's 'Configure Telegram bot' screen first)")
+    telegram_bot_run_p.add_argument(
+        "--max-iterations", type=int, default=None,
+        help="Bound the loop to N getUpdates iterations then exit (for manual smoke-testing; "
+             "omit for the real deployment shape, which runs forever)")
+    telegram_bot_run_p.set_defaults(func=cmd_telegram_bot_run)
 
     sub.add_parser("hostinfo").set_defaults(func=cmd_hostinfo)
 

@@ -321,3 +321,105 @@ def process_update(update: dict, settings, config_dir: str, state_dir: str,
         reply = f"Error handling {command}: {e}"
     return {"reply": reply, "chat_id": chat_id, "authorized": True, "rate_limited": False,
             "command": command}
+
+
+# ---------- long-polling loop (getUpdates) -------------------------------------------------
+
+DEFAULT_POLL_TIMEOUT_SECONDS = 30
+
+
+def _offset_path(state_dir: str) -> str:
+    return os.path.join(state_dir, "telegram-offset.json")
+
+
+def load_last_update_id(state_dir: str) -> int:
+    """Returns the last processed Telegram update_id, or 0 if none has ever been processed
+    (0 is never a real update_id -- Telegram's IDs start much higher -- so it unambiguously
+    means 'nothing processed yet' without needing a separate sentinel)."""
+    import json
+    path = _offset_path(state_dir)
+    if not os.path.exists(path):
+        return 0
+    try:
+        return int(json.loads(open(path).read()).get("last_update_id", 0))
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def save_last_update_id(state_dir: str, update_id: int) -> None:
+    """Atomic write -- a crash mid-write must never leave a corrupt offset file that would
+    make the next run re-request update_id 0 (re-delivering every update ever sent)."""
+    import json
+    path = _offset_path(state_dir)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"last_update_id": update_id}, f)
+    os.replace(tmp, path)
+
+
+def run_polling_loop(transport, settings, config_dir: str, state_dir: str,
+                      rate_limit_conn=None, max_iterations: int = None,
+                      poll_timeout: int = DEFAULT_POLL_TIMEOUT_SECONDS, sleep_fn=None,
+                      on_iteration=None) -> dict:
+    """Repeatedly calls Telegram's `getUpdates` (long-polling, so this never needs an
+    inbound port) and feeds each update to `process_update()`, sending back any non-None
+    reply via the SAME transport's `sendMessage`. The processed offset is persisted after
+    EVERY successful batch (not just at shutdown) so a crash never re-delivers already-
+    handled updates on restart, and never silently skips ones it hasn't gotten to yet.
+
+    `max_iterations` bounds the loop for tests/manual single-shot runs (`None` = run
+    forever, the real deployment shape). `on_iteration` is an optional callback invoked
+    once per iteration (count of updates processed that iteration) -- used by tests to
+    observe progress without needing a real timed loop.
+
+    Never raises on a getUpdates transport failure -- logs it into the returned
+    `iterations` detail and continues (Telegram being briefly unreachable must not crash a
+    long-running bot process); DOES let an unexpected non-transport exception propagate,
+    since that indicates a real bug worth stopping for."""
+    import time
+    import telegram_transport as tt
+
+    sleep_fn = sleep_fn or time.sleep
+    offset = load_last_update_id(state_dir)
+    iterations_run = 0
+    total_processed = 0
+
+    while max_iterations is None or iterations_run < max_iterations:
+        try:
+            result = transport.call("getUpdates", {"offset": offset + 1, "timeout": poll_timeout})
+        except tt.TelegramTransportError as e:
+            iterations_run += 1
+            if on_iteration:
+                on_iteration({"error": str(e), "processed": 0})
+            if max_iterations is not None:
+                continue
+            sleep_fn(poll_timeout)
+            continue
+
+        updates = result.get("result", []) if isinstance(result, dict) else []
+        processed_this_iteration = 0
+        for update in updates:
+            update_id = update.get("update_id")
+            dispatch_result = process_update(update, settings, config_dir, state_dir,
+                                              rate_limit_conn=rate_limit_conn)
+            if dispatch_result.get("reply") and dispatch_result.get("chat_id") is not None:
+                try:
+                    transport.call("sendMessage", {"chat_id": dispatch_result["chat_id"],
+                                                     "text": dispatch_result["reply"]})
+                except tt.TelegramTransportError:
+                    pass  # delivery failure must not block advancing the offset for THIS update
+            if isinstance(update_id, int) and update_id > offset:
+                offset = update_id
+            processed_this_iteration += 1
+        if updates:
+            save_last_update_id(state_dir, offset)
+        total_processed += processed_this_iteration
+        iterations_run += 1
+        if on_iteration:
+            on_iteration({"error": None, "processed": processed_this_iteration})
+        if max_iterations is None and not updates:
+            sleep_fn(1)
+
+    return {"iterations_run": iterations_run, "total_processed": total_processed,
+            "final_offset": offset}
