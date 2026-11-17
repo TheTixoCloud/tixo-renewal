@@ -2052,6 +2052,57 @@ def action_configure_relay_worker(style: Style):
     print("Saved. Start it with: renewal_cli.py relay-worker-run (only works while enabled).")
 
 
+def action_configure_remote_agent(style: Style):
+    """Configures the optional, read-only remote management agent -- DISABLED and
+    localhost-only by default. Runs ON this same host (local install mode is unaffected);
+    lets a SEPARATE central management server query this host's status without ever
+    receiving this host's Virtualizor API credentials. Never starts the process itself (see
+    renewal_cli.py's `agent-run`); only writes settings/secrets."""
+    import agent_config as ac
+    settings = ac.load_agent_settings(renewal_cli.CONFIG_DIR)
+    print(f"Enabled: {settings.enabled}")
+    print(f"Bind: {settings.bind_host}:{settings.bind_port}")
+    print(f"{style.GRAY}This agent is READ-ONLY -- it can never trigger a renewal, approve "
+          f"an emergency grant, or rotate a credential. It speaks plain HTTP with "
+          f"HMAC-authenticated envelopes (authentic + tamper-evident) but NOT transport "
+          f"encryption -- put a TLS reverse proxy or VPN in front if binding beyond "
+          f"127.0.0.1.{style.RESET}")
+
+    host_raw = input(f"Bind host [{settings.bind_host}] (0.0.0.0 to accept a remote "
+                      f"management server's connections): ").strip() or settings.bind_host
+    port_raw = input(f"Bind port [{settings.bind_port}]: ").strip()
+    try:
+        new_settings = ac.AgentSettings(
+            enabled=settings.enabled, bind_host=host_raw,
+            bind_port=int(port_raw) if port_raw else settings.bind_port,
+            max_envelope_age_seconds=settings.max_envelope_age_seconds)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+
+    enable_raw = input(f"Enable the remote agent now? [y/N] "
+                        f"(enabled={settings.enabled}): ").strip().lower()
+    new_settings.enabled = enable_raw == "y"
+
+    import getpass
+    secrets_path = ac.default_secrets_path(renewal_cli.CONFIG_DIR)
+    rotate = input("Set/rotate the shared secret now? [y/N]: ").strip().lower() == "y"
+    if rotate:
+        shared_secret = getpass.getpass(
+            "Shared secret (must match what the management server is configured with, "
+            "never echoed): ")
+        ac.rotate_agent_secret(secrets_path, shared_secret)
+        print(f"Secret stored at {secrets_path} (0600 permissions). Any management server "
+              f"still using a previous secret will immediately stop being able to "
+              f"authenticate until updated.")
+
+    if not _confirm("Save these remote agent settings?"):
+        print("Cancelled.")
+        return
+    ac.save_agent_settings(renewal_cli.CONFIG_DIR, new_settings)
+    print("Saved. Start it with: renewal_cli.py agent-run (only works while enabled).")
+
+
 MENU_ITEMS = [
     ("Install / Initial Setup", action_install),
     ("Dashboard", None),  # needs style, wired specially below
@@ -2079,6 +2130,7 @@ MENU_ITEMS = [
     ("Configure Telegram bot (optional)", None),  # needs style, wired specially below
     ("Configure Web Control Center (optional)", None),  # needs style, wired specially below
     ("Configure Relay Worker (optional, run on a SEPARATE host)", None),  # wired specially below
+    ("Configure Remote Agent (optional, read-only)", None),  # wired specially below
     ("Enable automatic renewal", lambda: action_toggle_auto_renewal(True)),
     ("Disable automatic renewal", lambda: action_toggle_auto_renewal(False)),
     ("View logs and renewal history", action_view_logs),
@@ -2163,6 +2215,8 @@ def run_menu():
                     action_configure_web(style)
                 elif label == "Configure Relay Worker (optional, run on a SEPARATE host)":
                     action_configure_relay_worker(style)
+                elif label == "Configure Remote Agent (optional, read-only)":
+                    action_configure_remote_agent(style)
                 else:
                     fn()
             except Exception as e:

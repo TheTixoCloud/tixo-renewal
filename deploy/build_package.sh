@@ -19,7 +19,7 @@ for f in engine.py models.py storage.py policy.py policy_integration.py local_so
          hostnet.py hostnet_sync.py jalali.py net_topology.py traffic_analytics.py \
          emergency_policy.py security.py control_center_api.py telegram_transport.py \
          telegram_config.py telegram_bot.py reports.py host_time.py web_auth.py audit_log.py \
-         web_config.py web_server.py relay_worker.py; do
+         web_config.py web_server.py relay_worker.py agent_config.py agent_server.py; do
   cp -f "$IMPL/$f" "$HERE/lib/$f"
 done
 cp -f "$IMPL/renewal_cli.py" "$HERE/bin/renewal_cli.py"

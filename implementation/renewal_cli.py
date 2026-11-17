@@ -1375,6 +1375,47 @@ def cmd_relay_worker_run(args):
     return 0
 
 
+def cmd_agent_run(args):
+    """Runs the lightweight remote management agent (see agent_server.py) -- runs ON this
+    host (local install mode is unaffected/unchanged), exposing a read-only, authenticated
+    query surface for a separate central management server. Refuses to start unless
+    explicitly enabled AND a shared secret is enrolled."""
+    import agent_config as ac
+    import agent_server as ags
+
+    settings = ac.load_agent_settings(CONFIG_DIR)
+    if not settings.enabled:
+        print("BLOCKED: Remote agent is not enabled. Enable it via the menu's "
+              "'Configure Remote Agent' screen first.")
+        return 1
+    try:
+        secrets_obj = ac.load_agent_secrets(ac.default_secrets_path(CONFIG_DIR))
+    except (FileNotFoundError, ac.AgentConfigSecurityError) as e:
+        print(f"BLOCKED: {e}")
+        return 1
+
+    nonce_db_path = os.path.join(STATE_DIR, "agent_nonces.sqlite3")
+    print(f"Starting remote agent on {settings.bind_host}:{settings.bind_port} "
+          f"(Ctrl+C to stop)...")
+    server, _ = ags.run_server_in_thread(CONFIG_DIR, STATE_DIR, secrets_obj.shared_secret,
+                                          nonce_db_path, settings.bind_host, settings.bind_port,
+                                          settings.max_envelope_age_seconds)
+    try:
+        server.socket.settimeout(1.0)
+        import time
+        max_iterations = getattr(args, "max_iterations", None)
+        iterations = 0
+        while max_iterations is None or iterations < max_iterations:
+            time.sleep(1)
+            iterations += 1
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    print("Remote agent stopped.")
+    return 0
+
+
 def cmd_telegram_bot_run(args):
     """Runs the Telegram long-polling loop (see telegram_bot.run_polling_loop). Blocks
     forever by default (the real deployment shape for a systemd service, Type=simple,
@@ -1527,6 +1568,14 @@ def main():
                                      help="Bound the run to N one-second ticks then exit "
                                           "(manual testing)")
     relay_worker_run_p.set_defaults(func=cmd_relay_worker_run)
+
+    agent_run_p = sub.add_parser(
+        "agent-run",
+        help="Run the lightweight remote management agent (blocks; read-only, requires "
+             "enabling via the menu's 'Configure Remote Agent' screen first)")
+    agent_run_p.add_argument("--max-iterations", type=int, default=None,
+                              help="Bound the run to N one-second ticks then exit (manual testing)")
+    agent_run_p.set_defaults(func=cmd_agent_run)
 
     sub.add_parser("hostinfo").set_defaults(func=cmd_hostinfo)
 

@@ -442,10 +442,60 @@ Completes the previously protocol-only relay mode (`sign_relay_request`/
   rewritten test in `tests/test_telegram_bot.py` (relay-mode `build_transport` now
   constructs a real `RelayClientTransport` instead of always raising) + 1 menu-wiring test.
 
+### 13. Remote management architecture — DONE as a read-only MVP (honestly scoped)
+Adds a lightweight, hypervisor-side agent so a SEPARATE central management server can see a
+host's status remotely without ever being handed that host's Virtualizor API credentials.
+Local install mode (this host polling its own Virtualizor node directly) is completely
+unaffected and remains the default everywhere -- this is an additional, optional, disabled-
+by-default surface, not a replacement.
+
+- **`implementation/agent_server.py`**: `AgentApp.handle_request()` is the same pure,
+  socket-free core pattern as `web_server.py`/`relay_worker.py`. Exposes exactly one
+  endpoint, `/query`, accepting a signed envelope naming one of an explicit allowlist of
+  READ-ONLY queries (`snapshot`, `host`, `network`, `inventory`, `renewals`, `health`) --
+  there is no mutating action reachable through this protocol at all (no renewal-apply, no
+  emergency-grant action, no credential rotation). Every query is answered by calling
+  `control_center_api.py`/`menu.py` directly -- never the Virtualizor API itself (verified
+  by `test_agent_never_calls_virtualizor_api`, which monkeypatches `writer.call_vs_api` to
+  raise if ever reached).
+- **Authentication reuses, rather than duplicates, the relay protocol**: `telegram_transport.
+  sign_relay_request`/`verify_relay_request` were already generic HMAC signed-envelope
+  primitives (never actually Telegram-specific despite the module name) -- durable replay
+  protection (SQLite seen-nonces) and timestamp-freshness checking come for free.
+  **Honest limitation:** this provides authenticity/integrity, not transport
+  confidentiality -- it speaks plain HTTP, so binding beyond `127.0.0.1` requires an
+  operator-provided TLS reverse proxy or VPN, the same documented caveat as
+  `web_server.py`/`relay_worker.py`.
+- **Secrets/enrollment**: `agent_config.AgentSecrets` (one shared secret, 0600-enforced,
+  same discipline as everywhere else) plus `rotate_agent_secret()` -- rotation is an atomic
+  overwrite, so a management server holding the old secret is immediately locked out until
+  updated, satisfying "secure credential rotation."
+- **Disabled by default**: `AgentSettings.enabled = False`, binds to `127.0.0.1`.
+  `renewal_cli.py agent-run` refuses to start unless explicitly enabled AND a secret is
+  enrolled; a new "Configure Remote Agent (optional, read-only)" menu screen writes
+  settings/secrets only, never starts the process.
+- **`agent_server.query_agent()`** is the management-server-side client (sign, POST, verify
+  the signed response, raise rather than trust an unverifiable/tampered/error reply) --
+  validated against a real local HTTP server over a genuine socket
+  (`test_real_server_end_to_end_over_a_real_socket`), same "simulate locally, label it
+  honestly" approach used for the relay worker.
+- **NOT done / explicitly out of scope for this pass**: no actual second "management
+  server" program that aggregates multiple agents into one dashboard (today only the
+  client-side `query_agent()` helper and a protocol exist; building a real multi-host
+  aggregating UI would reuse `web_server.py`'s page patterns but is a separate, sizeable
+  piece of work); no mutating actions over this protocol at all (deliberate, matches "least-
+  privilege" and "safe read-only defaults"); no real cross-host validation (same caveat as
+  the relay worker).
+- **Tests:** `tests/test_agent.py` (31: settings/secrets validation+roundtrip+permissions+
+  rotation, every allowed query succeeding, disallowed-query rejection, bad signature,
+  replay, stale timestamp, malformed body, unknown route, never-calls-Virtualizor-API,
+  `query_agent()` success/unknown-query/tamper-rejection/reported-error, the real-socket
+  end-to-end test, 3 CLI wiring tests, 1 menu-wiring test).
+
 ### Combined test count
-- **Total: 1057 passing** (verified by running the full suite), up from 1032 after the
-  backup milestone, 1012 after the Web Control Center milestone, and 923 at the start of
-  this sprint.
+- **Total: 1088 passing** (verified by running the full suite), up from 1057 after the
+  relay worker milestone, 1032 after the backup milestone, 1012 after the Web Control
+  Center milestone, and 923 at the start of this sprint.
 
 ---
 
@@ -453,18 +503,21 @@ Completes the previously protocol-only relay mode (`sign_relay_request`/
 
 These are honestly reported as **not implemented**, not "mostly done" or "mocked":
 
-- **A real cross-host validation of the relay worker.** The relay worker process now exists
-  and is fully tested locally (see section 12 above), but it has only been run against a
-  simulated second host on localhost in this session -- no real second VPS was available.
-  This is the single most important remaining validation step before relay mode can be
-  considered production-ready.
+- **A real cross-host validation of the relay worker AND the remote agent.** Both now exist
+  and are fully tested locally (see sections 12-13 above), but each has only been run
+  against a simulated second host on localhost in this session -- no real second VPS was
+  available. This is the single most important remaining validation step before either
+  feature can be considered production-ready.
+- **A real multi-host "management server" program.** The remote agent's protocol and
+  management-server-side client (`agent_server.query_agent()`) exist and are tested, but
+  there is no actual aggregating dashboard/program that polls multiple enrolled agents --
+  that would most naturally extend `web_server.py`'s page patterns to a multi-host view.
 - **Secure Telegram delivery of backup archives.** `backup-full` and the Web `/backups` page
   create/verify/encrypt/retain archives, but nothing yet sends one through the Telegram bot
   transport. Explicitly listed in the mission's backup section but not started this pass —
   next step would be a size-capped, admin-only, encrypted-only (never plaintext) send path
   reusing `telegram_bot.build_transport` the same way `/reports` already does.
 - **Web dashboard TLS/certificate handling, reverse-proxy guidance.** Not started.
-- **Remote management/agent mode.** Not started.
 - **Unified installer (interactive + noninteractive, module install/upgrade/repair/
   reconfigure/disable/uninstall for Web/Telegram/remote-agent).** Not started — the existing
   `deploy/install.sh`/`deploy/bootstrap.sh` continue to work exactly as before (regression-
@@ -507,8 +560,11 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
 6. ~~The relay worker process...~~ **DONE, locally simulated** (see section 12 above).
    **Still open:** a real end-to-end two-host validation (needs a second host) has not been
    performed. This is now the single highest-priority remaining validation gap.
-7. Remote management/agent mode, then the unified installer (local/remote mode, optional
-   component install/upgrade/repair/reconfigure/uninstall).
+7. ~~Remote management/agent mode...~~ **DONE as a read-only MVP, locally simulated** (see
+   section 13 above). **Still open:** a real cross-host validation, and a real multi-host
+   aggregating management-server program (only the protocol + client helper exist so far).
+8. The unified installer (local/remote mode, optional component install/upgrade/repair/
+   reconfigure/uninstall for Web/Telegram/relay-worker/remote-agent).
 
 ## Known limitations of what WAS built
 
