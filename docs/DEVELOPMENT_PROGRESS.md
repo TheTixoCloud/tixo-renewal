@@ -109,11 +109,46 @@ bumped" below).
   with mocked HTTP/read functions, the same fixture pattern `tests/test_writer.py` already
   uses — never a second, simplified fake of the write path) + 1 in `tests/test_menu.py`.
 
+### 4. Shared backend service layer + security primitives — DONE (this checkpoint)
+- **Files:** `implementation/control_center_api.py`, `implementation/security.py` (both new).
+- **control_center_api.py** is the single module any future Telegram command or Web endpoint
+  must call into for monitoring/status data — `get_host_snapshot`, `get_live_network_reading`,
+  `get_network_overview` (configured interface + persistent totals/rate + full
+  `traffic_analytics` bundle), `get_vps_inventory_overview` (latest synced inventory + fleet
+  analytics), `get_renewal_overview` (thin wrapper reusing `menu.collect_dashboard_data`
+  unchanged — no second implementation of that aggregation), `get_emergency_policy_overview`,
+  and `get_full_snapshot` (bundles all of the above in one call).
+  - **Every function is read-only toward every local cache it touches and NONE call the
+    Virtualizor API directly** — verified by a dedicated test
+    (`test_network_overview_never_calls_virtualizor_api`) that monkeypatches
+    `writer.call_vs_api` to raise if ever invoked from this path.
+  - Unconfigured/empty states (no interface chosen yet, no inventory synced yet, policy
+    disabled) are reported honestly (`configured: False`, empty lists, zero counts) rather
+    than fabricated — matching the same discipline already established in `hostnet.py`/
+    `traffic_analytics.py`.
+  - **Deliberate scope decision:** this does NOT refactor `menu.collect_dashboard_data` or
+    any of menu.py's existing render functions — it wraps/reuses them. Fully unifying the
+    CLI's own dict shapes with this new API was judged too high a regression risk against
+    menu.py's already-large, already-tested surface for this checkpoint; it's listed as
+    follow-up work below.
+- **security.py** provides: `generate_secure_token`/`constant_time_equals` (for future
+  session/CSRF tokens), `hash_password`/`verify_password` (stdlib-only PBKDF2-HMAC-SHA256,
+  310,000 iterations — OWASP's 2023 minimum — no bcrypt/argon2 dependency added),
+  `is_authorized_telegram_id` (numeric-ID-only, by explicit design — there is no `username`
+  parameter at all, and a test asserts this via `inspect.signature`), and a SQLite-backed
+  sliding-window rate limiter (`check_rate_limit`/`prune_rate_limit_events`) shared by future
+  Web login throttling and Telegram command throttling alike.
+- **Tests:** `tests/test_security.py` (23 tests) + `tests/test_control_center_api.py`
+  (12 tests).
+
 ### Combined test count
 - Pre-existing (as of v1.7.3): 675 passing.
-- New this session: 66 (22 traffic_analytics + 7 menu wiring across both features + 37
-  emergency_policy, including the 13 apply-wiring tests above).
-- **Total: 741 passing**, full suite, no skips, no mocked-away failures.
+- New this session: 101, across `tests/test_traffic_analytics.py`,
+  `tests/test_emergency_policy.py`, `tests/test_security.py`,
+  `tests/test_control_center_api.py`, and several new cases added to
+  `tests/test_menu.py` for CLI wiring.
+- **Total: 776 passing** (verified by running the full suite), no skips, no mocked-away
+  failures.
 
 ---
 
@@ -153,19 +188,19 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
 
 ## Exact next steps (in priority order, matching the mission's own ordering)
 
-1. Extend `renewal_cli.py`'s `dry-run`/`apply-due` commands (or add a parallel
+1. Telegram bot: start with Direct mode only, built directly on `control_center_api.py` +
+   `security.is_authorized_telegram_id`/`check_rate_limit` (both already implemented and
+   tested) — `/status` and `/traffic` commands first, before attempting SOCKS5/relay
+   transports. **This is the current next step.**
+2. Extend `renewal_cli.py`'s `dry-run`/`apply-due` commands (or add a parallel
    `check-exhausted`/`apply-emergency-grants` pair) so the exhausted-bandwidth check and
    (approved) auto-apply can run on the existing systemd timer cadence, not just
    interactively from the menu. Not yet done.
-2. Build the shared, secure backend/config service layer (`control_center_api.py` or
-   similar) that wraps `traffic_analytics`, `analytics`, `emergency_policy`, `inventory`,
-   `hostinfo` behind one stable interface, so CLI/Telegram/Web never reimplement business
-   logic independently. **This is the current next step.**
-3. Telegram bot: start with Direct mode only, `/status` and `/traffic` commands, numeric-ID
-   admin authorization, before attempting SOCKS5/relay transports.
-4. Reporting/alerts/backup scheduling.
-5. Web dashboard backend (reusing the service layer from step 2), then frontend.
-6. Local + remote install modes, then the unified installer.
+3. Reporting/alerts/backup scheduling (builds on `control_center_api.get_full_snapshot` for
+   report content).
+4. Web dashboard backend (reusing `control_center_api.py` + `security.py` directly), then
+   frontend.
+5. Local + remote install modes, then the unified installer.
 
 ## Known limitations of what WAS built
 
