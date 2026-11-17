@@ -85,6 +85,8 @@ COLUMN_MIGRATIONS = (
     ("snapshot_records", "ip_primary", "TEXT"),
     ("snapshot_records", "ip_count", "TEXT"),
     ("snapshot_records", "ip_list", "TEXT"),
+    ("snapshot_records", "runtime_status", "TEXT"),
+    ("snapshot_records", "network_suspended_reason", "TEXT"),
 )
 
 
@@ -121,12 +123,13 @@ def latest_snapshot_id(conn: sqlite3.Connection, node_id: str):
 def _load_snapshot_records(conn: sqlite3.Connection, snapshot_id: int) -> dict:
     rows = conn.execute(
         "SELECT vpsid, hostname, status, quota_gb, used_gb, ram_mb, cores, disk_gb, virtualization, "
-        "locked, node_serid, ip_primary, ip_count, ip_list FROM snapshot_records WHERE snapshot_id=?", (snapshot_id,)
+        "locked, node_serid, ip_primary, ip_count, ip_list, runtime_status, network_suspended_reason "
+        "FROM snapshot_records WHERE snapshot_id=?", (snapshot_id,)
     ).fetchall()
     return {r[0]: {"hostname": r[1], "status": r[2], "quota_gb": r[3], "used_gb": r[4],
                    "ram_mb": r[5], "cores": r[6], "disk_gb": r[7], "virtualization": r[8],
                    "locked": r[9], "node_serid": r[10], "ip_primary": r[11], "ip_count": r[12],
-                   "ip_list": r[13]}
+                   "ip_list": r[13], "runtime_status": r[14], "network_suspended_reason": r[15]}
             for r in rows}
 
 
@@ -165,15 +168,19 @@ def ingest_snapshot(conn: sqlite3.Connection, node_id: str, parse_result: dict,
             import json as _json
             ip_list_raw = r.get("ip_list", "unavailable")
             ip_list_json = _json.dumps(ip_list_raw) if isinstance(ip_list_raw, list) else str(ip_list_raw)
+            network_suspended_reason = r.get("network_suspended_reason")
             conn.execute(
                 "INSERT INTO snapshot_records (snapshot_id, vpsid, hostname, status, quota_gb, "
-                "used_gb, ram_mb, cores, disk_gb, virtualization, locked, node_serid, ip_primary, ip_count, ip_list) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "used_gb, ram_mb, cores, disk_gb, virtualization, locked, node_serid, ip_primary, ip_count, ip_list, "
+                "runtime_status, network_suspended_reason) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (snapshot_id, r["vpsid"], str(r["hostname"]), str(r["status"]), str(r["quota_gb"]),
                  str(r["used_gb"]), str(r["ram_mb"]), str(r["cores"]), str(r["disk_gb"]),
                  str(r["virtualization"]), str(r.get("locked", "unavailable")),
                  str(r.get("node_serid", "unavailable")), str(r.get("ip_primary", "unavailable")),
-                 str(r.get("ip_count", "unavailable")), ip_list_json),
+                 str(r.get("ip_count", "unavailable")), ip_list_json,
+                 str(r.get("runtime_status", "unavailable")),
+                 None if network_suspended_reason is None else str(network_suspended_reason)),
             )
             known = conn.execute(
                 "SELECT first_seen_at FROM known_vps WHERE node_id=? AND vpsid=?",

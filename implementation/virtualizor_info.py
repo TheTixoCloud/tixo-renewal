@@ -194,6 +194,16 @@ def parse_listvs_response(parsed: dict) -> dict:
             "vpsid": vpsid,
             "hostname": raw.get("hostname") or raw.get("vps_name", UNAVAILABLE),
             "status": status,
+            # RUNTIME STATUS (v1.7.2): distinct from `status` above, which only ever reports
+            # the ADMINISTRATIVE billing-suspension flag (see the comment above) and never a
+            # real power state. `runtime_status` defaults to "unavailable" here -- it is only
+            # ever populated by merging in fetch_vs_status_bulk()'s result (see
+            # fetch_vs_inventory below), which is the one confirmed authoritative source for
+            # VM running/stopped/suspended state. A record that never gets enriched (e.g. the
+            # vs_status call failed, or this parse path is used standalone/in a test without
+            # enrichment) must keep reporting "unavailable", never silently "running".
+            "runtime_status": UNAVAILABLE,
+            "network_suspended_reason": None,
             "locked": locked if locked is not None else UNAVAILABLE,
             "ip_count": ip_count,
             "ip_primary": ip_primary,
@@ -212,6 +222,92 @@ def parse_listvs_response(parsed: dict) -> dict:
         f"{skipped} record(s) had no usable vpsid" if skipped else "no usable records found"
     )
     return {"complete": complete, "records": records, "skipped_count": skipped, "error": error}
+
+
+# RUNTIME STATUS MAPPING (v1.7.2, confirmed empirically against ir1 AND against Virtualizor's
+# own published admin-API documentation for the dedicated `act=vs&vs_status=<ids>` action --
+# a SEPARATE, documented bulk endpoint from the plain `act=vs` listing, read-only, GET-only, no
+# vpsid-specific mutation parameter). Confirmed real values seen on ir1's live fleet of 60 VPS:
+# 59 VPS reported status=1 (documented "VPS is on"); one VPS (observed used_cpu=0.00, net_in=0)
+# reported status=1 too at the VM-power level but carried a non-false `network_status` entry
+# (`{"id": "2", "reason": "bw", "date": ...}`) -- i.e. the VM process was on, but Virtualizor
+# had network-suspended it for a bandwidth reason. This is a DIFFERENT concept from VM power
+# state (see `network_suspended_reason` below) and must never be conflated with it. Only the
+# three documented codes are ever trusted; any other integer is reported "unavailable" rather
+# than guessed, per the explicit instruction to never fabricate a runtime state.
+RUNTIME_STATUS_CODES = {0: "stopped", 1: "running", 2: "suspended"}
+
+
+def map_runtime_status_code(code) -> str:
+    try:
+        code_int = int(code)
+    except (TypeError, ValueError):
+        return UNAVAILABLE
+    return RUNTIME_STATUS_CODES.get(code_int, UNAVAILABLE)
+
+
+def parse_vs_status_response(parsed: dict) -> dict:
+    """Parses the dedicated, documented `act=vs&vs_status=<comma-separated vpsids>` bulk
+    response. This is a SEPARATE action from the plain `act=vs` listing (which never includes
+    a trustworthy running/stopped/suspended signal -- see parse_listvs_response's docstring)
+    but reuses the SAME `vs` action name with an added query parameter, confirmed empirically
+    on ir1 to return, in a single call regardless of fleet size, a top-level `status` dict
+    keyed by vpsid (string) with per-VPS entries containing (among other fields) `status`
+    (the documented 0/1/2 power-state code) and `network_status` (either `False`, meaning no
+    network-level action is in effect, or a dict like `{"id": ..., "reason": ..., "date": ...}`
+    describing WHY the VPS's networking was suspended, e.g. a bandwidth overage -- distinct
+    from VM power state and never merged into it).
+
+    Returns {"status_by_vpsid": {vpsid: {"runtime_status": ..., "network_suspended_reason":
+    ...}}, "error": str|None}. Never raises; a malformed/missing response yields an empty map
+    with an error string, never a fabricated status for any vpsid."""
+    if not isinstance(parsed, dict):
+        return {"status_by_vpsid": {}, "error": "top-level response was not a JSON object"}
+    status_raw = parsed.get("status")
+    if not isinstance(status_raw, dict):
+        return {"status_by_vpsid": {}, "error": "response had no 'status' object"}
+
+    out = {}
+    for vpsid_key, entry in status_raw.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            vpsid = int(vpsid_key)
+        except (TypeError, ValueError):
+            continue
+        runtime_status = map_runtime_status_code(entry.get("status"))
+        network_status = entry.get("network_status")
+        network_suspended_reason = (
+            network_status.get("reason", UNAVAILABLE)
+            if isinstance(network_status, dict) else None
+        )
+        out[vpsid] = {
+            "runtime_status": runtime_status,
+            "network_suspended_reason": network_suspended_reason,
+        }
+    return {"status_by_vpsid": out, "error": None}
+
+
+def fetch_vs_status_bulk(creds, vpsids, call_vs_api=None, timeout: int = 20) -> dict:
+    """Fetches runtime status for ALL given vpsids in exactly ONE API call (never one request
+    per VPS) via the dedicated `act=vs&vs_status=<ids>` action. Returns parse_vs_status_
+    response's shape. If `vpsids` is empty, returns an empty map without making any request.
+    Any transport/parse failure is reported as a non-fatal error string -- callers must treat
+    a failure here as "runtime status unavailable this cycle", never as "assume running"."""
+    if not vpsids:
+        return {"status_by_vpsid": {}, "error": None}
+    if call_vs_api is None:
+        import writer as writer_mod
+        call_vs_api = writer_mod.call_vs_api
+    ids_param = ",".join(str(v) for v in vpsids)
+    try:
+        result = call_vs_api(creds, timeout=timeout, extra_params={"vs_status": ids_param})
+    except Exception as e:  # noqa: BLE001 -- a failed status enrichment must not break inventory sync
+        return {"status_by_vpsid": {}, "error": str(e)}
+    parsed = result.get("parsed")
+    if parsed is None:
+        return {"status_by_vpsid": {}, "error": "response was not valid JSON"}
+    return parse_vs_status_response(parsed)
 
 
 DEFAULT_PAGE_SIZE = 50
@@ -299,6 +395,22 @@ def fetch_vs_inventory(creds, call_vs_api=None, page_size: int = DEFAULT_PAGE_SI
 
     parse_result = parse_listvs_response({"vs": combined_vs})
     fetched_count = len(parse_result["records"])
+
+    # RUNTIME STATUS ENRICHMENT (v1.7.2): exactly ONE additional bulk call regardless of
+    # fleet size (never one request per VPS -- see fetch_vs_status_bulk's docstring),
+    # performed as part of this SAME inventory-sync workflow so no new timer/cadence is
+    # introduced. A failure here never fails the whole sync -- it just leaves
+    # runtime_status as "unavailable" (already the per-record default), matching the
+    # explicit instruction to show "Unavailable" rather than fabricate a running state.
+    vpsids_for_status = [r["vpsid"] for r in parse_result["records"]]
+    status_result = fetch_vs_status_bulk(creds, vpsids_for_status, call_vs_api=call_vs_api)
+    status_by_vpsid = status_result.get("status_by_vpsid") or {}
+    for record in parse_result["records"]:
+        enrichment = status_by_vpsid.get(record["vpsid"])
+        if enrichment:
+            record["runtime_status"] = enrichment["runtime_status"]
+            record["network_suspended_reason"] = enrichment["network_suspended_reason"]
+    parse_result["runtime_status_error"] = status_result.get("error")
 
     if fetch_error:
         parse_result["complete"] = False

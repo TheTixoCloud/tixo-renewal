@@ -217,7 +217,7 @@ def build_app(renewal_cli_mod, menu_mod):
             table = self.query_one("#inventory-table", DataTable)
             table.clear()
             for r in records:
-                table.add_row(str(r["vpsid"]), str(r.get("hostname")), str(r.get("status")),
+                table.add_row(str(r["vpsid"]), str(r.get("hostname")), str(r.get("runtime_status", "unavailable")),
                               str(r.get("quota_gb")), str(r.get("used_gb")), key=str(r["vpsid"]))
 
             summary = menu_mod.render_analytics_summary(

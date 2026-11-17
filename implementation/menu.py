@@ -17,6 +17,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -531,6 +532,20 @@ def _format_bits_per_sec_human(bytes_per_sec) -> str:
     return f"{bps:.0f} bps"
 
 
+def _format_bytes_per_sec_human(bytes_per_sec) -> str:
+    """B/s -> KB/s -> MB/s -> GB/s, auto-scaled (decimal/SI, matching _format_bytes_human) --
+    used for the live hostnet screen, which the task spec explicitly asks for in bytes/sec
+    (not the bits/sec convention _format_bits_per_sec_human uses elsewhere)."""
+    try:
+        n = float(bytes_per_sec)
+    except (TypeError, ValueError):
+        return "unavailable"
+    for unit, divisor in (("GB/s", 1e9), ("MB/s", 1e6), ("KB/s", 1e3)):
+        if n >= divisor:
+            return f"{n / divisor:.2f} {unit}"
+    return f"{n:.0f} B/s"
+
+
 def _format_uptime_human(seconds) -> str:
     try:
         seconds = float(seconds)
@@ -630,8 +645,8 @@ def render_host_info(info: dict, style: Style, show_virtual_interfaces: bool = F
     for iface in shown:
         tag = f" {style.GRAY}[virtual]{style.RESET}" if iface.get("is_virtual") else ""
         rx, tx = iface.get("rx_bytes"), iface.get("tx_bytes")
-        rx_str = f"RX {_format_bytes_human(rx)}" if isinstance(rx, int) else "RX unavailable"
-        tx_str = f"TX {_format_bytes_human(tx)}" if isinstance(tx, int) else "TX unavailable"
+        rx_str = f"Download (RX) {_format_bytes_human(rx)}" if isinstance(rx, int) else "Download (RX) unavailable"
+        tx_str = f"Upload (TX) {_format_bytes_human(tx)}" if isinstance(tx, int) else "Upload (TX) unavailable"
         lines.append(f"  {iface['name']}: {iface['state']}, {iface['ipv4']} ({rx_str}, {tx_str}){tag}")
     if not show_virtual_interfaces and hidden_count:
         lines.append(f"  {style.GRAY}... {hidden_count} interface(s) hidden (virtual or "
@@ -701,7 +716,7 @@ def filter_and_sort_vps(records: list[dict], search: str = None, status_filter: 
                or s in str(r.get("hostname", "")).lower()
                or s in str(r.get("ip_primary", "")).lower()]
     if status_filter:
-        out = [r for r in out if str(r.get("status", "")).lower() == status_filter.lower()]
+        out = [r for r in out if str(r.get("runtime_status", "")).lower() == status_filter.lower()]
 
     numeric_fields = ("vpsid", "quota_gb", "used_gb")
     def sort_key(r):
@@ -727,7 +742,7 @@ def _status_color(status, style: Style) -> str:
         return style.GREEN
     if s == "stopped":
         return style.YELLOW
-    return style.GRAY  # "unknown" and anything unrecognized
+    return style.GRAY  # "unavailable"/"unknown" and anything unrecognized
 
 
 def render_vps_table(records: list[dict], style: Style) -> str:
@@ -759,20 +774,36 @@ def render_vps_table(records: list[dict], style: Style) -> str:
             pct = None
         usage_display = "UNLIMITED" if is_unlimited else render_progress_bar(
             float(pct) if pct is not None else None, width=10, style=style)
-        color = _status_color(r.get("status"), style)
+        runtime_status = r.get("runtime_status", "unavailable")
+        color = _status_color(runtime_status, style)
         ip = str(r.get("ip_primary", "unavailable"))
         lines.append(f"  {r['vpsid']:>7}  {str(r.get('hostname'))[:host_w]:<{host_w}}  "
                      f"{ip[:ip_w]:<{ip_w}}  "
-                     f"{color}{str(r.get('status'))[:10]:<10}{style.RESET}  "
+                     f"{color}{str(runtime_status)[:10]:<10}{style.RESET}  "
                      f"{str(quota):>9}  {str(used):>9}  {usage_display}")
     return "\n".join(lines)
 
 
 def render_vps_detail(record: dict, style: Style) -> str:
+    """STATUS FIELDS ARE DELIBERATELY SPLIT (v1.7.2) into three distinct concepts, per the
+    real-world confusion this is designed to avoid: Runtime Status (is the VM actually
+    powered on right now -- from virtualizor_info.fetch_vs_status_bulk's authoritative bulk
+    call), Billing Suspended (an administrative flag, unrelated to power state -- a VM can
+    be running while billing-suspended, or vice versa), and Network Suspended (Virtualizor
+    may cut network access for a specific reason, e.g. a bandwidth overage, while the VM
+    process itself keeps running)."""
     lines = [f"{style.BOLD}{style.ACCENT}VPS {record['vpsid']} detail{style.RESET}"]
-    color = _status_color(record.get("status"), style)
+    runtime_status = record.get("runtime_status", "unavailable")
+    color = _status_color(runtime_status, style)
     lines.append(f"  Hostname:       {record.get('hostname')}")
-    lines.append(f"  Status:         {color}{record.get('status')}{style.RESET}")
+    lines.append(f"  Runtime Status: {color}{runtime_status}{style.RESET}")
+    billing_suspended = "yes" if str(record.get("status")).lower() == "suspended" else "no"
+    lines.append(f"  Billing Suspended: {billing_suspended}")
+    network_reason = record.get("network_suspended_reason")
+    if network_reason:
+        lines.append(f"  {style.YELLOW}Network Suspended: yes (reason: {network_reason}){style.RESET}")
+    else:
+        lines.append(f"  Network Suspended: no")
     lines.append(f"  Quota:          {record.get('quota_gb')} GB")
     lines.append(f"  Used:           {record.get('used_gb')} GB")
     lines.append(f"  RAM:            {record.get('ram_mb')} MB")
@@ -802,19 +833,20 @@ def render_hostnet_panel(interface: str, cumulative: dict, live_rate: dict,
 
     rx_total = cumulative["cumulative_rx_bytes"]
     tx_total = cumulative["cumulative_tx_bytes"]
-    lines.append(f"  RX Total:       {_format_bytes_human(rx_total)}")
-    lines.append(f"  TX Total:       {_format_bytes_human(tx_total)}")
-    lines.append(f"  Combined Total: {_format_bytes_human(rx_total + tx_total)}")
+    lines.append(f"  Host Download (RX) Total: {_format_bytes_human(rx_total)}")
+    lines.append(f"  Host Upload (TX) Total:   {_format_bytes_human(tx_total)}")
+    lines.append(f"  Host Total Traffic:       {_format_bytes_human(rx_total + tx_total)}")
     lines.append("")
     if live_rate is None:
-        lines.append(f"  RX Speed:       {style.GRAY}unavailable{style.RESET}")
-        lines.append(f"  TX Speed:       {style.GRAY}unavailable{style.RESET}")
-        lines.append(f"  Combined Speed: {style.GRAY}unavailable{style.RESET}")
+        lines.append(f"  Persistent Download (RX) Speed: {style.GRAY}unavailable{style.RESET}")
+        lines.append(f"  Persistent Upload (TX) Speed:   {style.GRAY}unavailable{style.RESET}")
+        lines.append(f"  Persistent Combined Speed:      {style.GRAY}unavailable{style.RESET}")
     else:
         rx_bps, tx_bps = live_rate["rx_bytes_per_sec"], live_rate["tx_bytes_per_sec"]
-        lines.append(f"  RX Speed:       {_format_bits_per_sec_human(rx_bps)}")
-        lines.append(f"  TX Speed:       {_format_bits_per_sec_human(tx_bps)}")
-        lines.append(f"  Combined Speed: {_format_bits_per_sec_human(rx_bps + tx_bps)}")
+        lines.append(f"  Persistent Download (RX) Speed: {_format_bytes_per_sec_human(rx_bps)} "
+                      f"{style.GRAY}(computed from the 5-minute persistent sampler, not live){style.RESET}")
+        lines.append(f"  Persistent Upload (TX) Speed:   {_format_bytes_per_sec_human(tx_bps)}")
+        lines.append(f"  Persistent Combined Speed:      {_format_bytes_per_sec_human(rx_bps + tx_bps)}")
     lines.append("")
     if recent_sample:
         lines.append(f"  Last Sample:        {format_local_time(recent_sample['sampled_at'], display_tz)}")
@@ -828,9 +860,150 @@ def render_hostnet_panel(interface: str, cumulative: dict, live_rate: dict,
                      f"at last sample -- some traffic in this gap is not observable, never invented.{style.RESET}")
     elif gap and gap > 0:
         lines.append(f"  Data Quality: OK (last gap {gap:.0f}s)")
-    lines.append(f"\n  {style.GRAY}RX/TX are measured from THIS HOST's interface -- not automatically "
-                 f"'customer download/upload'. GB/TB here are decimal (10^9/10^12 bytes).{style.RESET}")
+    lines.append(f"\n  {style.GRAY}Download (RX) = bytes received by this HOST's monitored interface. "
+                 f"Upload (TX) = bytes transmitted. Total Traffic = Download + Upload. These are "
+                 f"from the physical host's perspective, not necessarily any one VPS customer's "
+                 f"perspective. GB/TB here are decimal (10^9/10^12 bytes).{style.RESET}")
     return "\n".join(lines)
+
+
+def render_live_hostnet_panel(interface: str, live_speed: dict, live_counters_ok: bool,
+                               cumulative: dict, recent_sample: dict, style: Style,
+                               display_tz: str = "UTC") -> str:
+    """The TRUE live screen (v1.7.2, Part 1 of the live-traffic fix): `live_speed` is derived
+    from TWO SEQUENTIAL RAW READS of /sys/class/net/<interface>/statistics/{rx,tx}_bytes taken
+    roughly a second apart by the caller's refresh loop -- NEVER from the persistent 5-minute
+    hostnet sampler, and NEVER written back into hostnet's database (this function and its
+    caller are read-only with respect to that persistent accounting; see action_view_hostnet).
+
+    `live_counters_ok` is False when the monitored interface's kernel counters could not be
+    read this tick (e.g. the interface was removed) -- in that case an explicit stale/
+    unavailable warning is shown and no live speed is fabricated, even if a previous tick had
+    a valid reading."""
+    lines = [f"{style.BOLD}{style.ACCENT}LIVE HOST TRAFFIC -- {interface}{style.RESET}"]
+    if not live_counters_ok:
+        lines.append(f"  {style.RED}WARNING: live kernel counters for '{interface}' are "
+                      f"currently unavailable -- showing no live speed rather than a stale "
+                      f"or fabricated value.{style.RESET}")
+    elif live_speed is None:
+        lines.append(f"  {style.GRAY}Live Download (RX): measuring... (first sample this view){style.RESET}")
+        lines.append(f"  {style.GRAY}Live Upload (TX):   measuring...{style.RESET}")
+        lines.append(f"  {style.GRAY}Live Combined:      measuring...{style.RESET}")
+    else:
+        rx_bps, tx_bps = live_speed["rx_bytes_per_sec"], live_speed["tx_bytes_per_sec"]
+        lines.append(f"  Live Download (RX): {style.GREEN}{_format_bytes_per_sec_human(rx_bps)}{style.RESET}")
+        lines.append(f"  Live Upload (TX):   {style.GREEN}{_format_bytes_per_sec_human(tx_bps)}{style.RESET}")
+        lines.append(f"  Live Combined:      {style.GREEN}{_format_bytes_per_sec_human(rx_bps + tx_bps)}{style.RESET}")
+    lines.append(f"  {style.GRAY}(live speed refreshes ~1x/sec from this host's live kernel "
+                 f"counters -- separate from, and never affecting, the 5-minute persistent "
+                 f"sampler below){style.RESET}")
+    lines.append("")
+
+    if cumulative is None:
+        lines.append(f"  {style.GRAY}No persistent samples recorded yet for this interface.{style.RESET}")
+    else:
+        rx_total = cumulative["cumulative_rx_bytes"]
+        tx_total = cumulative["cumulative_tx_bytes"]
+        lines.append(f"  Persistent Download (RX) Total: {_format_bytes_human(rx_total)}")
+        lines.append(f"  Persistent Upload (TX) Total:   {_format_bytes_human(tx_total)}")
+        lines.append(f"  Persistent Total Traffic:       {_format_bytes_human(rx_total + tx_total)}")
+        if recent_sample:
+            lines.append(f"  Latest Persistent Sample:       "
+                          f"{format_local_time(recent_sample['sampled_at'], display_tz)}")
+        if recent_sample and recent_sample.get("discontinuity_type"):
+            lines.append(f"  {style.YELLOW}Monitoring Health: discontinuity "
+                          f"({recent_sample['discontinuity_type']}) at last persistent sample{style.RESET}")
+        else:
+            lines.append(f"  Monitoring Health: OK")
+
+    lines.append(f"\n  {style.GRAY}Download (RX) = bytes received by this HOST's monitored "
+                 f"interface. Upload (TX) = bytes transmitted. From the physical host's "
+                 f"perspective, not necessarily any one VPS customer's perspective.{style.RESET}")
+    return "\n".join(lines)
+
+
+class _RawTerminalGuard:
+    """Context manager for responsive single-key input (Part 2): puts stdin into cbreak mode
+    (keys read immediately, no Enter required, no local echo of control keys) and GUARANTEES
+    the original terminal attributes are restored in a `finally`-equivalent `__exit__` on
+    EVERY exit path -- normal return, `break`, or any exception including KeyboardInterrupt.
+    Never used if `sys.stdin` isn't a real tty (see supports_raw_input())."""
+
+    def __init__(self):
+        self._fd = None
+        self._old_settings = None
+
+    def __enter__(self):
+        import termios
+        import tty
+        self._fd = sys.stdin.fileno()
+        self._old_settings = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._old_settings is not None:
+            import termios
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old_settings)
+        return False  # never swallow exceptions -- callers handle KeyboardInterrupt themselves
+
+
+def supports_raw_input() -> bool:
+    """False in any environment where cbreak-mode single-key input can't work (piped stdin,
+    not a tty, termios unavailable) -- the live screen must fall back gracefully rather than
+    raise, per the explicit 'graceful fallback' requirement."""
+    try:
+        import termios  # noqa: F401
+    except ImportError:
+        return False
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def poll_single_key(timeout_seconds: float):
+    """Non-blocking (bounded-wait) single-character read -- returns None if no key arrived
+    within `timeout_seconds`, otherwise the one character read. Uses select() so the live
+    refresh loop never blocks waiting for input the way a bare input() call would (that bare
+    call is the confirmed root cause of the old hostnet screen never updating without
+    Enter -- see action_view_hostnet)."""
+    import select
+    ready, _, _ = select.select([sys.stdin], [], [], timeout_seconds)
+    if not ready:
+        return None
+    return sys.stdin.read(1)
+
+
+def compute_live_speed(prev_counters, rx, tx, now_mono):
+    """Pure delta/sec calculation from two sequential raw counter reads: `prev_counters` is
+    either None (no prior reading this view -- e.g. the very first tick) or (prev_rx, prev_tx,
+    prev_mono). Returns None (never a fabricated rate) if there's no prior reading, no elapsed
+    time, or either counter went backwards (a counter reset/interface replacement -- see
+    hostnet.py's own discontinuity handling for the persistent-sample equivalent of this same
+    rule: a decrease is never reported as negative throughput, and never silently absorbed into
+    a positive one either)."""
+    if prev_counters is None:
+        return None
+    prev_rx, prev_tx, prev_mono = prev_counters
+    dt = now_mono - prev_mono
+    if dt <= 0 or rx < prev_rx or tx < prev_tx:
+        return None
+    return {"rx_bytes_per_sec": (rx - prev_rx) / dt, "tx_bytes_per_sec": (tx - prev_tx) / dt}
+
+
+def read_live_interface_counters(interface: str):
+    """ONE raw read of /sys/class/net/<interface>/statistics/{rx,tx}_bytes -- the same
+    primitive hostinfo.py already uses elsewhere, reused here (not reimplemented) so there is
+    exactly one code path that touches these sysfs files. Returns (rx_bytes, tx_bytes) as ints,
+    or (None, None) if either counter couldn't be read (interface removed, permissions, etc).
+    Never writes anywhere; never touches hostnet's persistent database."""
+    iface_dir = Path("/sys/class/net") / interface
+    rx = hostinfo._read_interface_counter(iface_dir, "rx_bytes")
+    tx = hostinfo._read_interface_counter(iface_dir, "tx_bytes")
+    if isinstance(rx, int) and isinstance(tx, int):
+        return rx, tx
+    return None, None
 
 
 # ---------- menu actions ---------------------------------------------------------------------
@@ -1138,7 +1311,8 @@ def action_inventory_view(style: Style, node_id: str = "self"):
             search = input("Search (VPS ID, hostname): ").strip() or None
             page = 1
         elif choice == "f":
-            status_filter = input("Status filter (suspended/unknown, blank clears): ").strip() or None
+            status_filter = input("Runtime status filter (running/stopped/suspended/unavailable, "
+                                   "blank clears): ").strip() or None
             page = 1
         elif choice == "c":
             search, status_filter, page = None, None, 1
@@ -1248,7 +1422,22 @@ def action_configure_hostnet_interface():
           f"sample manually with the hostnet-sync CLI command.")
 
 
+LIVE_REFRESH_INTERVAL_SECONDS = 1.0
+
+
 def action_view_hostnet(style: Style):
+    """TRUE LIVE SCREEN (v1.7.2, Parts 1+2 of the live-traffic fix). ROOT CAUSE of the old
+    behavior: this function used to render the panel ONCE and then call a blocking `input()`
+    (see git history) -- nothing re-rendered until Enter was pressed. Fixed here with an
+    actual refresh loop that reads live kernel counters directly (read_live_interface_
+    counters, never hostnet.record_sample -- the persistent 5-minute sampler is untouched)
+    and polls for a single key each tick (poll_single_key) instead of blocking on input().
+
+    Navigation: '0' or 'q' exits immediately; Ctrl+C exits gracefully (caught, no traceback).
+    Terminal state is restored on every exit path via _RawTerminalGuard's __exit__, which
+    runs even when the loop exits via an exception. If stdin isn't a real tty (piped,
+    non-interactive, or termios unavailable), falls back to the old static single-render
+    view with an explicit note, rather than hanging or crashing."""
     settings = hostnet_sync.load_settings(renewal_cli.CONFIG_DIR)
     interface = settings.get("interface")
     tz = load_display_tz(renewal_cli.CONFIG_DIR)
@@ -1257,15 +1446,42 @@ def action_view_hostnet(style: Style):
               f"monitoring interface' first.{style.RESET}")
         return
     conn = hostnet.open_db(os.path.join(renewal_cli.STATE_DIR, "hostnet.sqlite3"))
-    cumulative = hostnet.get_cumulative(conn, interface)
-    live_rate = hostnet.compute_live_throughput(conn, interface)
-    recent = hostnet.get_recent_samples(conn, interface, limit=1)
-    recent_sample = recent[-1] if recent else None
-    print(render_hostnet_panel(interface, cumulative, live_rate, recent_sample, style, display_tz=tz))
-    print(f"\n  {style.GRAY}[r] force one manual sample now, or press Enter to continue.{style.RESET}")
-    if input("> ").strip().lower() == "r":
-        result = hostnet_sync.run_hostnet_sample(renewal_cli.STATE_DIR, renewal_cli.CONFIG_DIR)
-        print(f"Sample result: {result['status']}")
+
+    if not supports_raw_input():
+        cumulative = hostnet.get_cumulative(conn, interface)
+        live_rate = hostnet.compute_live_throughput(conn, interface)
+        recent = hostnet.get_recent_samples(conn, interface, limit=1)
+        recent_sample = recent[-1] if recent else None
+        print(render_hostnet_panel(interface, cumulative, live_rate, recent_sample, style, display_tz=tz))
+        print(f"\n  {style.GRAY}(live auto-refresh unavailable in this terminal -- showing a "
+              f"single static snapshot instead){style.RESET}")
+        input(f"{style.GRAY}[0] Press Enter to return{style.RESET}")
+        return
+
+    prev_counters = None  # (rx, tx, monotonic_time) from the previous tick, for delta/sec
+    try:
+        with _RawTerminalGuard():
+            while True:
+                rx, tx = read_live_interface_counters(interface)
+                now_mono = time.monotonic()
+                counters_ok = rx is not None and tx is not None
+                live_speed = compute_live_speed(prev_counters, rx, tx, now_mono) if counters_ok else None
+                prev_counters = (rx, tx, now_mono) if counters_ok else None  # a gap/unavailable tick must not be bridged into a fake rate
+
+                cumulative = hostnet.get_cumulative(conn, interface)
+                recent = hostnet.get_recent_samples(conn, interface, limit=1)
+                recent_sample = recent[-1] if recent else None
+
+                clear_screen()
+                print(render_live_hostnet_panel(interface, live_speed, counters_ok, cumulative,
+                                                 recent_sample, style, display_tz=tz))
+                print(f"\n  {style.GRAY}[0] Back   [q] Exit Live View   [Ctrl+C] Back{style.RESET}")
+
+                key = poll_single_key(LIVE_REFRESH_INTERVAL_SECONDS)
+                if key in ("0", "q"):
+                    break
+    except KeyboardInterrupt:
+        pass
 
 
 MENU_ITEMS = [

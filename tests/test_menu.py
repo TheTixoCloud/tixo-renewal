@@ -363,7 +363,7 @@ def test_filter_and_sort_vps_by_search():
 
 
 def test_filter_and_sort_vps_by_status():
-    records = [{"vpsid": 1, "status": "running"}, {"vpsid": 2, "status": "stopped"}]
+    records = [{"vpsid": 1, "runtime_status": "running"}, {"vpsid": 2, "runtime_status": "stopped"}]
     out = menu.filter_and_sort_vps(records, status_filter="stopped")
     assert len(out) == 1
     assert out[0]["vpsid"] == 2
@@ -514,13 +514,15 @@ def test_render_host_info_shows_virtual_interfaces_when_requested():
 
 
 def test_render_vps_detail_shows_all_fields():
-    record = {"vpsid": 42, "hostname": "web1", "status": "suspended", "quota_gb": "100",
-              "used_gb": "50", "ram_mb": "2048", "cores": "2", "disk_gb": "40",
+    record = {"vpsid": 42, "hostname": "web1", "status": "suspended", "runtime_status": "running",
+              "quota_gb": "100", "used_gb": "50", "ram_mb": "2048", "cores": "2", "disk_gb": "40",
               "virtualization": "kvm", "locked": False, "node_serid": 1}
     out = menu.render_vps_detail(record, menu.Style(enabled=False))
     assert "42" in out
     assert "web1" in out
-    assert "suspended" in out
+    assert "Runtime Status:" in out
+    assert "running" in out
+    assert "Billing Suspended: yes" in out
 
 
 def test_render_vps_table_marks_unlimited_quota():
@@ -665,14 +667,14 @@ def test_render_hostnet_panel_shows_totals_and_speed():
     out = menu.render_hostnet_panel("ens1f1", cumulative, live_rate, recent, menu.Style(enabled=False))
     assert "HOST NETWORK -- ens1f1" in out
     assert "5.00 GB" in out
-    assert "Mbps" in out
-    assert "not automatically 'customer download/upload'" in out
+    assert "MB/s" in out
+    assert "Download (RX) = bytes received" in out
 
 
 def test_render_hostnet_panel_handles_missing_live_rate_honestly():
     cumulative = {"cumulative_rx_bytes": 100, "cumulative_tx_bytes": 100, "first_sample_at": None}
     out = menu.render_hostnet_panel("eth0", cumulative, None, None, menu.Style(enabled=False))
-    assert "RX Speed:       " in out
+    assert "Persistent Download (RX) Speed:" in out
     assert "unavailable" in out
 
 

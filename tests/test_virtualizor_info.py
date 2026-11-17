@@ -189,6 +189,11 @@ def test_fetch_vs_inventory_reproduces_and_fixes_the_real_50_vs_60_discrepancy()
     all_ids = list(range(1, 61))  # 60 real VPSs, matching the confirmed ir1 authoritative count
     calls = []
     def fake_call_vs_api(creds, extra_params=None, timeout=20):
+        if extra_params and "vs_status" in extra_params:
+            # runtime-status enrichment call (v1.7.2): exactly ONE extra bulk call, never
+            # one request per VPS -- see fetch_vs_status_bulk's docstring.
+            ids = extra_params["vs_status"].split(",")
+            return {"parsed": {"status": {i: {"status": 1, "network_status": False} for i in ids}}}
         page = extra_params.get("page", 1)
         page_size = extra_params.get("reslen", 50)
         calls.append(page)
@@ -200,6 +205,7 @@ def test_fetch_vs_inventory_reproduces_and_fixes_the_real_50_vs_60_discrepancy()
     assert result["complete"] is True
     assert {r["vpsid"] for r in result["records"]} == set(all_ids)
     assert calls == [1, 2]  # page 1 (50) + page 2 (10, < page_size, stops)
+    assert all(r["runtime_status"] == "running" for r in result["records"])
 
 
 def test_fetch_vs_inventory_single_page_naive_call_would_have_undercounted():

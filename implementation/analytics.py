@@ -43,16 +43,20 @@ def compute_bandwidth_analytics(records: list[dict], usage_threshold_percent: De
         else:
             limited.append(r)
 
-    # STATUS VOCABULARY (v1.5.0 correction): only "suspended" is a confirmed, reliable value
-    # from the real API (see virtualizor_info.parse_listvs_response's docstring on why
-    # machine_status is never used for VPS run-state). "running"/"stopped" are counted
-    # separately for forward compatibility if a reliable live-state source is added later,
-    # but on the current data source every non-suspended VPS reports "unknown" -- counted as
-    # unknown_status_count, never silently folded into running or stopped.
-    running = sum(1 for r in records if str(r.get("status")).lower() == "running")
-    stopped = sum(1 for r in records if str(r.get("status")).lower() == "stopped")
-    suspended = sum(1 for r in records if str(r.get("status")).lower() == "suspended")
-    unknown_status = sum(1 for r in records if str(r.get("status")).lower() == "unknown")
+    # STATUS VOCABULARY (v1.7.2 correction): `runtime_status` is the confirmed-authoritative
+    # VM power-state field, populated by virtualizor_info.fetch_vs_inventory's single bulk
+    # `act=vs&vs_status=<ids>` enrichment call (see that module's docstring for the real-API
+    # confirmation). Any record never enriched (vs_status call failed, or an older cached
+    # snapshot predating this field) reports "unavailable" -- counted as unknown_status_count,
+    # never silently folded into running/stopped/suspended. The older, admin-level `status`
+    # field (billing suspension only, see parse_listvs_response) is intentionally NOT used
+    # here anymore -- it answers a different question (administrative suspension) than "is
+    # the VM currently running".
+    running = sum(1 for r in records if str(r.get("runtime_status")).lower() == "running")
+    stopped = sum(1 for r in records if str(r.get("runtime_status")).lower() == "stopped")
+    suspended = sum(1 for r in records if str(r.get("runtime_status")).lower() == "suspended")
+    unknown_status = sum(1 for r in records if str(r.get("runtime_status")).lower() not in
+                          ("running", "stopped", "suspended"))
 
     limited_quota_sum = sum((Decimal(str(r["quota_gb"])) for r in limited), Decimal(0))
     limited_used = [r for r in limited if _is_known_decimal(r.get("used_gb"))]

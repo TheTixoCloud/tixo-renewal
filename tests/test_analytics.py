@@ -10,7 +10,7 @@ import writer as w
 
 
 def rec(vpsid, quota, used, status="running"):
-    return {"vpsid": vpsid, "quota_gb": quota, "used_gb": used, "status": status}
+    return {"vpsid": vpsid, "quota_gb": quota, "used_gb": used, "runtime_status": status}
 
 
 def test_unlimited_vps_excluded_from_limited_sums():
@@ -46,7 +46,7 @@ def test_unknown_quota_vps_counted_separately_not_as_limited_or_unlimited():
 
 def test_running_and_stopped_counts():
     records = [rec(1, "100", "10", status="running"), rec(2, "100", "10", status="stopped"),
-               rec(3, "100", "10", status="suspended"), rec(4, "100", "10", status="unknown")]
+               rec(3, "100", "10", status="suspended"), rec(4, "100", "10", status="unavailable")]
     result = analytics.compute_bandwidth_analytics(records)
     assert result["running_count"] == 1
     assert result["stopped_count"] == 1
