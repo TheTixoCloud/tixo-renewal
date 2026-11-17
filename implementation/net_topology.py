@@ -28,11 +28,20 @@ ROLE_UNKNOWN = "unknown"
 def get_interface_master(name: str) -> str:
     """The bond/bridge this interface is a MEMBER of, via the kernel-maintained
     /sys/class/net/<name>/master symlink -- the same mechanism for both bond and bridge
-    membership. Returns None if the interface has no master (not a member of anything)."""
+    membership. Returns None if the interface has no master (not a member of anything).
+
+    BUG FIX: Path.resolve() is non-strict by default -- on a symlink path that doesn't
+    exist at all, it does NOT raise; it just normalizes the (nonexistent) path and returns
+    it, whose .name is literally the string "master" (the path component itself). This
+    previously caused every non-member interface to be misreported as master="master"
+    (a truthy value), found via real-world verification against ir1's actual interfaces
+    (eno1-4/ens1f0, which have no master symlink at all). Checking is_symlink() first
+    avoids this entirely."""
     link = SYS_NET / name / "master"
+    if not link.is_symlink():
+        return None
     try:
-        target = link.resolve()
-        return target.name
+        return link.resolve().name
     except (OSError, RuntimeError):
         return None
 
@@ -43,6 +52,28 @@ def is_bridge(name: str) -> bool:
 
 def is_bond_master(name: str) -> bool:
     return (SYS_NET / name / "bonding").is_dir()
+
+
+def has_hardware_device(name: str) -> bool:
+    """A real hardware NIC backing this interface (vs a purely software construct like a
+    bridge, bond, or VLAN sub-interface) -- the same positive physical-ness signal
+    classify_interface()'s fallback branch already uses, exposed here so bridge-membership
+    evaluation can apply it to MEMBER interfaces too (classify_interface's own fallback is
+    only reached for interfaces with no master at all)."""
+    return (SYS_NET / name / "device").exists()
+
+
+def read_bridge_members(bridge_name: str) -> list[str]:
+    """Lists a bridge's member interfaces via /sys/class/net/<bridge>/brif/ -- the standard,
+    authoritative kernel-maintained bridge membership directory (one symlink per member).
+    Returns [] if `bridge_name` isn't a bridge or has no members."""
+    brif_dir = SYS_NET / bridge_name / "brif"
+    if not brif_dir.is_dir():
+        return []
+    try:
+        return sorted(p.name for p in brif_dir.iterdir())
+    except OSError:
+        return []
 
 
 def read_vlan_parents() -> dict:
@@ -156,24 +187,53 @@ def select_accounting_candidates(interfaces: list[dict]) -> dict:
 
     Returns {"auto_selected": str|None, "candidates": [...], "excluded": [...]}.
 
-    Exclusion rule (unambiguous, always applied): a bond or bridge MEMBER interface is
-    excluded entirely -- its master/aggregate already represents its traffic, so including
-    both would double-count. This is the one topology relationship resolved automatically,
-    because for a member/master pair there is no genuine deployment-dependent ambiguity:
-    the aggregate is always the correct superset.
+    BOND members are excluded unconditionally: the Linux bonding driver maintains the
+    master's own counters as the true sum of all slave traffic, so a bond master is always
+    the correct, non-overlapping aggregate -- there is no genuine ambiguity here.
+
+    BRIDGE members are handled differently, based on a real-world finding (verified against
+    ir1's actual topology, read-only, by comparing counter values): a Linux bridge DEVICE's
+    own rx/tx counters only count frames locally delivered to the bridge's own address --
+    NOT the full set of frames switched between its ports. A bridge's physical (hardware-
+    backed, non-virtual) member interface, by contrast, sees every frame on the physical
+    wire, which IS the correct "total external traffic" figure. So: when a bridge has
+    EXACTLY ONE physical, non-virtual member, that member is kept as a candidate and the
+    BRIDGE DEVICE ITSELF is excluded (the reverse of the bond case) -- selecting the bridge
+    device there would silently and drastically UNDERSTATE real traffic, not merely
+    duplicate it. When a bridge has zero or multiple physical members, this resolution does
+    not apply and both the bridge and its physical member(s) remain candidates, correctly
+    surfaced as ambiguous.
+
+    A DOWN interface (administratively or physically down -- carries no live traffic by
+    definition) is always excluded from candidacy, regardless of name. This is a portable,
+    name-agnostic signal that lets automatic selection resolve correctly even on a host
+    with several unused/disabled physical NICs alongside the one real uplink.
 
     VLAN-vs-parent is a GENUINE ambiguity (which one represents "VPS traffic" depends on
-    the deployment -- a VLAN might carry only VPS traffic while the physical parent also
-    carries management traffic, or vice versa) and is therefore never auto-collapsed: both
-    remain candidates, with the relationship surfaced for the operator to decide.
+    the deployment) and is therefore never auto-collapsed: both remain candidates, with the
+    relationship surfaced for the operator to decide. The same applies to multiple
+    candidates with independent default routes, or multiple NICs with no default route at
+    all (e.g. separate management/VPS networks).
 
-    Auto-selection (`auto_selected` non-None) only happens when exactly one non-virtual,
-    non-uninformative, non-excluded candidate remains. Default-route membership is attached
-    as evidence/reasoning on each candidate, never used by itself to break a tie between
-    multiple remaining candidates."""
+    Auto-selection (`auto_selected` non-None) only happens when exactly one real candidate
+    remains after all of the above. Default-route membership is attached as evidence/
+    reasoning on each candidate, never used by itself to break a tie between multiple real
+    candidates, and never fabricated as "confidence" when the evidence doesn't support it."""
     names = [i["name"] for i in interfaces]
     topology = build_topology(names)
     routes = get_default_route_interfaces()
+    iface_by_name = {i["name"]: i for i in interfaces}
+
+    # Pre-resolve, for every bridge present, how many of its members are "physical" (hardware-
+    # backed AND not matching the virtual-interface naming heuristic) -- this is what decides
+    # whether the bridge device itself should be excluded in favor of that one member.
+    bridge_physical_members = {}
+    for name, topo in topology.items():
+        if topo["role"] == ROLE_BRIDGE:
+            members = read_bridge_members(name)
+            physical = [m for m in members if has_hardware_device(m)
+                        and not iface_by_name.get(m, {}).get("is_virtual", False)]
+            bridge_physical_members[name] = physical
 
     candidates = []
     excluded = []
@@ -186,11 +246,32 @@ def select_accounting_candidates(interfaces: list[dict]) -> dict:
         if iface.get("is_uninformative"):
             excluded.append({**iface, **topo, "exclusion_reason": "no usable state/IP/counter data"})
             continue
-        if topo["role"] in (ROLE_BOND_MEMBER, ROLE_BRIDGE_MEMBER):
-            excluded.append({**iface, **topo,
-                             "exclusion_reason": f"member of {topo['master']} -- would double-count "
-                                                  f"against the aggregate"})
+        if iface.get("state") == "down":
+            excluded.append({**iface, **topo, "exclusion_reason": "interface is down -- cannot "
+                                                                    "be the active accounting source"})
             continue
+        if topo["role"] == ROLE_BOND_MEMBER:
+            excluded.append({**iface, **topo,
+                             "exclusion_reason": f"member of bond {topo['master']} -- the bond "
+                                                  f"master's own counters already reflect the true "
+                                                  f"sum of all slave traffic"})
+            continue
+        if topo["role"] == ROLE_BRIDGE:
+            physical_members = bridge_physical_members.get(name, [])
+            if len(physical_members) == 1:
+                excluded.append({**iface, **topo,
+                                 "exclusion_reason": f"bridge device -- only counts traffic locally "
+                                                      f"delivered to this bridge's own address, NOT "
+                                                      f"the full wire traffic; its one physical member "
+                                                      f"({physical_members[0]}) represents the correct "
+                                                      f"total (verified empirically: {name}'s own "
+                                                      f"counters are orders of magnitude smaller)"})
+                continue
+            # Zero or multiple physical members: this resolution doesn't apply -- fall through
+            # and let the bridge remain a candidate alongside its member(s), genuinely ambiguous.
+        # ROLE_BRIDGE_MEMBER interfaces are deliberately NOT excluded here -- see the bridge
+        # branch above, which is where that relationship is actually resolved (from the
+        # bridge's side, since it needs to count ALL of the bridge's members to decide).
         is_default_v4 = name in routes["ipv4"]
         is_default_v6 = name in routes["ipv6"]
         candidates.append({**iface, **topo, "is_default_route_v4": is_default_v4,

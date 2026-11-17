@@ -8,11 +8,11 @@
 # BEFORE extracting or executing anything from it, then runs install.sh.
 #
 # Usage (replace the tag in the URL if you want a different pinned version):
-#   curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.7.0/deploy/bootstrap.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.7.1/deploy/bootstrap.sh | sudo bash
 set -euo pipefail
 
 REPO="TheTixoCloud/tixo-renewal"
-TAG="${TIXO_RENEWAL_VERSION:-v1.7.0}"
+TAG="${TIXO_RENEWAL_VERSION:-v1.7.1}"
 ASSET="tixo-renewal-package.tar.gz"
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"
 
