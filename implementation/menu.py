@@ -521,29 +521,56 @@ def _format_bytes_human(num_bytes) -> str:
     return f"{n:.0f} B"
 
 
+_BIT_RATE_UNITS = (("Tbps", 1e12), ("Gbps", 1e9), ("Mbps", 1e6), ("Kbps", 1e3))
+_BYTE_RATE_UNITS = (("TB/s", 1e12), ("GB/s", 1e9), ("MB/s", 1e6), ("KB/s", 1e3))
+
+
+def _scale_rate_human(value: float, units: tuple, base_unit: str) -> str:
+    """Shared decimal (1000-based) SI auto-scaling for a non-negative rate, used by both the
+    bit-based and byte-based formatters below so they can never disagree on scaling logic.
+    `units` must be ordered LARGEST divisor first.
+
+    NO MISLEADING ROUNDING (v1.7.3): rounding `value/divisor` to 2 decimals can push it to
+    exactly the next tier's threshold (e.g. 999999 B/s -> 999.999 KB/s -> rounds to "1000.00
+    KB/s", which is wrong -- it should display as "1.00 MB/s"). Detected by checking whether
+    the ROUNDED value would read >= 1000 and, if so, re-rendering against the next larger
+    unit instead."""
+    for idx, (unit, divisor) in enumerate(units):
+        if value < divisor:
+            continue
+        scaled = value / divisor
+        if round(scaled, 2) >= 1000 and idx > 0:
+            bigger_unit, bigger_divisor = units[idx - 1]
+            return f"{value / bigger_divisor:.2f} {bigger_unit}"
+        return f"{scaled:.2f} {unit}"
+    return f"{value:.0f} {base_unit}"
+
+
 def _format_bits_per_sec_human(bytes_per_sec) -> str:
     try:
         bps = float(bytes_per_sec) * 8
     except (TypeError, ValueError):
         return "unavailable"
-    for unit, divisor in (("Gbps", 1e9), ("Mbps", 1e6), ("Kbps", 1e3)):
-        if bps >= divisor:
-            return f"{bps / divisor:.2f} {unit}"
-    return f"{bps:.0f} bps"
+    return _scale_rate_human(bps, _BIT_RATE_UNITS, "bps")
 
 
 def _format_bytes_per_sec_human(bytes_per_sec) -> str:
-    """B/s -> KB/s -> MB/s -> GB/s, auto-scaled (decimal/SI, matching _format_bytes_human) --
-    used for the live hostnet screen, which the task spec explicitly asks for in bytes/sec
-    (not the bits/sec convention _format_bits_per_sec_human uses elsewhere)."""
+    """B/s -> KB/s -> MB/s -> GB/s -> TB/s, auto-scaled (decimal/SI, matching
+    _format_bytes_human) -- used for the live hostnet screen's byte-based reading."""
     try:
         n = float(bytes_per_sec)
     except (TypeError, ValueError):
         return "unavailable"
-    for unit, divisor in (("GB/s", 1e9), ("MB/s", 1e6), ("KB/s", 1e3)):
-        if n >= divisor:
-            return f"{n / divisor:.2f} {unit}"
-    return f"{n:.0f} B/s"
+    return _scale_rate_human(n, _BYTE_RATE_UNITS, "B/s")
+
+
+def _format_dual_speed_human(bytes_per_sec) -> tuple:
+    """Returns (bit_based_str, byte_based_str) for the SAME underlying bytes_per_sec reading
+    (v1.7.3): bit-based is the networking-industry convention (ISP/NIC line rates), byte-
+    based is the transfer/accounting convention (file sizes, quota consumption). Always
+    derived from one measurement via the fixed 1 byte = 8 bits relationship -- the two
+    strings can never describe different events or disagree about what happened."""
+    return _format_bits_per_sec_human(bytes_per_sec), _format_bytes_per_sec_human(bytes_per_sec)
 
 
 def _format_uptime_human(seconds) -> str:
@@ -843,10 +870,15 @@ def render_hostnet_panel(interface: str, cumulative: dict, live_rate: dict,
         lines.append(f"  Persistent Combined Speed:      {style.GRAY}unavailable{style.RESET}")
     else:
         rx_bps, tx_bps = live_rate["rx_bytes_per_sec"], live_rate["tx_bytes_per_sec"]
-        lines.append(f"  Persistent Download (RX) Speed: {_format_bytes_per_sec_human(rx_bps)} "
-                      f"{style.GRAY}(computed from the 5-minute persistent sampler, not live){style.RESET}")
-        lines.append(f"  Persistent Upload (TX) Speed:   {_format_bytes_per_sec_human(tx_bps)}")
-        lines.append(f"  Persistent Combined Speed:      {_format_bytes_per_sec_human(rx_bps + tx_bps)}")
+        combined_bps = rx_bps + tx_bps
+        for label, value in (("Persistent Download (RX) Speed", rx_bps),
+                              ("Persistent Upload (TX) Speed", tx_bps),
+                              ("Persistent Combined Speed", combined_bps)):
+            bit_str, byte_str = _format_dual_speed_human(value)
+            lines.append(f"  {label}:")
+            lines.append(f"      {style.BOLD}{bit_str}{style.RESET}")
+            lines.append(f"      {byte_str}")
+        lines.append(f"  {style.GRAY}(computed from the 5-minute persistent sampler, not live){style.RESET}")
     lines.append("")
     if recent_sample:
         lines.append(f"  Last Sample:        {format_local_time(recent_sample['sampled_at'], display_tz)}")
@@ -891,9 +923,13 @@ def render_live_hostnet_panel(interface: str, live_speed: dict, live_counters_ok
         lines.append(f"  {style.GRAY}Live Combined:      measuring...{style.RESET}")
     else:
         rx_bps, tx_bps = live_speed["rx_bytes_per_sec"], live_speed["tx_bytes_per_sec"]
-        lines.append(f"  Live Download (RX): {style.GREEN}{_format_bytes_per_sec_human(rx_bps)}{style.RESET}")
-        lines.append(f"  Live Upload (TX):   {style.GREEN}{_format_bytes_per_sec_human(tx_bps)}{style.RESET}")
-        lines.append(f"  Live Combined:      {style.GREEN}{_format_bytes_per_sec_human(rx_bps + tx_bps)}{style.RESET}")
+        combined_bps = rx_bps + tx_bps
+        for label, value in (("Live Download (RX)", rx_bps), ("Live Upload (TX)", tx_bps),
+                              ("Live Combined", combined_bps)):
+            bit_str, byte_str = _format_dual_speed_human(value)
+            lines.append(f"  {label}:")
+            lines.append(f"      {style.BOLD}{style.GREEN}{bit_str}{style.RESET}")
+            lines.append(f"      {style.GREEN}{byte_str}{style.RESET}")
     lines.append(f"  {style.GRAY}(live speed refreshes ~1x/sec from this host's live kernel "
                  f"counters -- separate from, and never affecting, the 5-minute persistent "
                  f"sampler below){style.RESET}")
