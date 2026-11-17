@@ -1855,7 +1855,8 @@ def action_configure_telegram_bot(style: Style):
     kwargs = dict(connectivity_mode=raw_mode, admin_ids=admin_ids, viewer_ids=viewer_ids,
                   enabled=settings.enabled, socks5_host=settings.socks5_host,
                   socks5_port=settings.socks5_port, socks5_username=settings.socks5_username,
-                  relay_host=settings.relay_host, report_hour=settings.report_hour,
+                  relay_host=settings.relay_host, relay_port=settings.relay_port,
+                  relay_use_tls=settings.relay_use_tls, report_hour=settings.report_hour,
                   report_minute=settings.report_minute, report_timezone=settings.report_timezone)
     if raw_mode == tgc.MODE_SOCKS5:
         kwargs["socks5_host"] = input(f"SOCKS5 proxy host [{settings.socks5_host or ''}]: ").strip() \
@@ -1866,11 +1867,15 @@ def action_configure_telegram_bot(style: Style):
                                            f"[{settings.socks5_username or ''}]: ").strip() \
             or settings.socks5_username
     elif raw_mode == tgc.MODE_RELAY:
-        kwargs["relay_host"] = input(f"Relay worker host/URL [{settings.relay_host or ''}]: ").strip() \
+        kwargs["relay_host"] = input(f"Relay worker host [{settings.relay_host or ''}]: ").strip() \
             or settings.relay_host
-        print(f"{style.YELLOW}NOTE: the relay WORKER itself is not yet implemented -- this only "
-              f"records the configured relay host for when it is (see "
-              f"docs/DEVELOPMENT_PROGRESS.md).{style.RESET}")
+        rport_raw = input(f"Relay worker port [{settings.relay_port or ''}]: ").strip()
+        kwargs["relay_port"] = int(rport_raw) if rport_raw else settings.relay_port
+        tls_raw = input(f"Use TLS (https) to reach the relay worker? [Y/n] "
+                         f"(currently {settings.relay_use_tls}): ").strip().lower()
+        kwargs["relay_use_tls"] = (tls_raw != "n") if tls_raw else settings.relay_use_tls
+        print(f"{style.GRAY}The relay worker must be separately enrolled/enabled on its own "
+              f"host via 'Configure Relay Worker' there -- this host never runs it.{style.RESET}")
 
     try:
         new_settings = tgc.TelegramSettings(**kwargs)
@@ -1905,6 +1910,7 @@ def action_configure_telegram_bot(style: Style):
             admin_ids=new_settings.admin_ids, viewer_ids=new_settings.viewer_ids,
             socks5_host=new_settings.socks5_host, socks5_port=new_settings.socks5_port,
             socks5_username=new_settings.socks5_username, relay_host=new_settings.relay_host,
+            relay_port=new_settings.relay_port, relay_use_tls=new_settings.relay_use_tls,
             report_hour=report_hour, report_minute=report_minute,
             report_timezone=report_timezone, reports_enabled=reports_enabled)
     except ValueError as e:
@@ -1919,7 +1925,12 @@ def action_configure_telegram_bot(style: Style):
         socks5_password = None
         if new_settings.connectivity_mode == tgc.MODE_SOCKS5 and new_settings.socks5_username:
             socks5_password = getpass.getpass("SOCKS5 proxy password: ")
-        tgc.store_telegram_secrets(secrets_path, bot_token=token, socks5_password=socks5_password)
+        relay_shared_secret = None
+        if new_settings.connectivity_mode == tgc.MODE_RELAY:
+            relay_shared_secret = getpass.getpass(
+                "Relay shared secret (must match what was enrolled on the relay worker host): ")
+        tgc.store_telegram_secrets(secrets_path, bot_token=token, socks5_password=socks5_password,
+                                    relay_shared_secret=relay_shared_secret)
         print(f"Secrets stored at {secrets_path} (0600 permissions).")
 
     if not _confirm("Save these Telegram bot settings?"):
@@ -1997,6 +2008,50 @@ def action_configure_web(style: Style):
     print(f"Saved. Start it with: renewal_cli.py web-run (only works while enabled).")
 
 
+def action_configure_relay_worker(style: Style):
+    """Configures THIS host as a relay worker -- i.e. this screen is run on the separate VPS
+    that CAN reach Telegram, never on the Iran-side host (which instead configures RELAY
+    mode + relay_host/relay_port on its own 'Configure Telegram bot' screen). DISABLED by
+    default. Never starts the worker process itself (see renewal_cli.py's
+    `relay-worker-run`); only writes settings/secrets."""
+    settings = tgc.load_relay_worker_settings(renewal_cli.CONFIG_DIR)
+    print(f"Enabled: {settings.enabled}")
+    print(f"Bind: {settings.bind_host}:{settings.bind_port}")
+
+    host_raw = input(f"Bind host [{settings.bind_host}] (0.0.0.0 to accept the Iran-side "
+                      f"host's connections -- put a firewall/TLS terminator in front): ").strip() \
+        or settings.bind_host
+    port_raw = input(f"Bind port [{settings.bind_port}]: ").strip()
+    try:
+        new_settings = tgc.RelayWorkerSettings(
+            enabled=settings.enabled, bind_host=host_raw,
+            bind_port=int(port_raw) if port_raw else settings.bind_port,
+            max_envelope_age_seconds=settings.max_envelope_age_seconds)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+
+    enable_raw = input(f"Enable the relay worker now? [y/N] "
+                        f"(enabled={settings.enabled}): ").strip().lower()
+    new_settings.enabled = enable_raw == "y"
+
+    import getpass
+    secrets_path = tgc.default_relay_worker_secrets_path(renewal_cli.CONFIG_DIR)
+    set_secrets = input("Set/update the bot token + shared secret now? [y/N]: ").strip().lower() == "y"
+    if set_secrets:
+        token = getpass.getpass("Bot token (same token the Iran-side bot uses, never echoed): ")
+        shared_secret = getpass.getpass(
+            "Shared secret (must match what is stored on the Iran-side host, never echoed): ")
+        tgc.store_relay_worker_secrets(secrets_path, bot_token=token, shared_secret=shared_secret)
+        print(f"Secrets stored at {secrets_path} (0600 permissions).")
+
+    if not _confirm("Save these relay worker settings?"):
+        print("Cancelled.")
+        return
+    tgc.save_relay_worker_settings(renewal_cli.CONFIG_DIR, new_settings)
+    print("Saved. Start it with: renewal_cli.py relay-worker-run (only works while enabled).")
+
+
 MENU_ITEMS = [
     ("Install / Initial Setup", action_install),
     ("Dashboard", None),  # needs style, wired specially below
@@ -2023,6 +2078,7 @@ MENU_ITEMS = [
     ("Emergency grants (proposed)", None),  # needs style, wired specially below
     ("Configure Telegram bot (optional)", None),  # needs style, wired specially below
     ("Configure Web Control Center (optional)", None),  # needs style, wired specially below
+    ("Configure Relay Worker (optional, run on a SEPARATE host)", None),  # wired specially below
     ("Enable automatic renewal", lambda: action_toggle_auto_renewal(True)),
     ("Disable automatic renewal", lambda: action_toggle_auto_renewal(False)),
     ("View logs and renewal history", action_view_logs),
@@ -2105,6 +2161,8 @@ def run_menu():
                     action_configure_telegram_bot(style)
                 elif label == "Configure Web Control Center (optional)":
                     action_configure_web(style)
+                elif label == "Configure Relay Worker (optional, run on a SEPARATE host)":
+                    action_configure_relay_worker(style)
                 else:
                     fn()
             except Exception as e:

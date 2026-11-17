@@ -250,14 +250,27 @@ def test_build_transport_socks5_mode_builds_real_transport_when_configured():
     assert transport.proxy.host == "proxy"
 
 
-def test_build_transport_relay_mode_refuses_direct_construction():
-    """Relay mode has no local transport object at all -- the Iran host must never
-    accidentally talk directly to Telegram when relay mode is selected."""
+def test_build_transport_relay_mode_requires_host_port_and_secret():
+    """Relay mode never silently falls back to a direct Telegram connection -- it requires
+    relay_host/relay_port AND a stored shared secret, or raises rather than guessing."""
     import pytest
+    import telegram_transport as tt
+
     settings = tc.TelegramSettings(connectivity_mode=tc.MODE_RELAY)
     secrets = tc.TelegramSecrets(bot_token="t")
-    with pytest.raises(ValueError, match="relay worker"):
+    with pytest.raises(ValueError, match="relay_host/relay_port"):
         bot.build_transport(settings, secrets)
+
+    settings = tc.TelegramSettings(connectivity_mode=tc.MODE_RELAY, relay_host="1.2.3.4",
+                                    relay_port=8765)
+    with pytest.raises(ValueError, match="relay_shared_secret"):
+        bot.build_transport(settings, secrets)
+
+    secrets = tc.TelegramSecrets(bot_token="t", relay_shared_secret="shh")
+    transport = bot.build_transport(settings, secrets)
+    assert isinstance(transport, tt.RelayClientTransport)
+    assert transport.relay_host == "1.2.3.4"
+    assert transport.relay_port == 8765
 
 
 # ---------- test_transport_connectivity ----------------------------------------------------

@@ -396,9 +396,56 @@ Extends the pre-existing `implementation/backup.py` (per-node `backup_db`/`list_
   Telegram bot and (not yet) the Web server; no Telegram delivery of backup archives yet
   (explicitly listed in the mission but not started this pass — see below).
 
+### 12. Relay worker process — DONE (locally simulated; real cross-host run still pending)
+Completes the previously protocol-only relay mode (`sign_relay_request`/
+`verify_relay_request` were already done and tested). New: `implementation/relay_worker.py`
+-- the actual SEPARATE program meant to run on a VPS that can reach Telegram.
+
+- **Protocol:** the Iran-side host makes an OUTBOUND-only HTTPS POST (never an inbound
+  connection) to the relay worker's `/submit` endpoint carrying a signed envelope. The
+  worker verifies signature + replay (durable SQLite seen-nonces table, survives restarts) +
+  timestamp freshness, executes the requested Telegram Bot API call, signs the result with
+  the same shared secret, and returns it synchronously -- no separate poll-for-result
+  round trip, and the relay worker never initiates a connection back to the Iran host.
+- **`RelayWorkerApp.handle_request()`** is the same pure, socket-free core pattern as
+  `web_server.py`'s `WebApp` -- fully testable without a real socket; a thin
+  `http.server`-based wrapper (`build_server`/`run_server_in_thread`) is the only part that
+  touches one.
+- **`telegram_transport.RelayClientTransport`** (Iran-side) is drop-in compatible with
+  `DirectTransport`/`Socks5Transport`'s `.call()` signature -- `telegram_bot.build_transport()`
+  now actually constructs it for RELAY mode (previously raised unconditionally), verifies
+  the worker's signed response before trusting it, and raises rather than silently trusting
+  an unverifiable or tampered reply.
+- **Secrets:** the relay worker has its own `telegram_config.RelayWorkerSecrets`
+  (bot_token + shared_secret) in its OWN config_dir on its OWN host -- it shares no
+  filesystem or secret store with the Iran-side host. Both sides store the shared secret
+  with the same 0600-enforced discipline as everything else.
+- **Disabled by default:** `RelayWorkerSettings.enabled = False`, binds to `127.0.0.1` by
+  default; `renewal_cli.py relay-worker-run` refuses to start unless explicitly enabled AND
+  secrets are stored, mirroring the Telegram bot/Web Control Center pattern exactly.
+- **Menu:** new "Configure Relay Worker (optional, run on a SEPARATE host)" screen (writes
+  settings/secrets only, never starts the process); the existing "Configure Telegram bot"
+  screen's RELAY branch now collects `relay_port`/`relay_use_tls` and the matching shared
+  secret, and no longer prints the old "not yet implemented" note.
+- **Local simulation, honestly labeled:** `test_real_server_end_to_end_simulated_second_host`
+  spins up a genuine `relay_worker` HTTP server on a real localhost port and drives it
+  through `RelayClientTransport` over an actual socket -- exactly the "simulate locally
+  since no second host is available" allowance in the mission. **A real two-host
+  cross-network validation has NOT been performed** and is explicitly still required before
+  this feature can be considered production-validated.
+- **Tests:** `tests/test_relay_worker.py` (15: envelope execution, bad signature, replay,
+  stale timestamp, malformed body, unknown route, Telegram-call failure surfaced as a
+  signed failure rather than an exception, `RelayClientTransport` success/tamper-rejection/
+  reported-failure, the real-socket simulated end-to-end test, and 3 CLI wiring tests) + 11
+  new tests in `tests/test_telegram_config.py` (relay field roundtrip,
+  `RelayWorkerSettings`/`RelayWorkerSecrets` defaults/validation/roundtrip/permissions) + 1
+  rewritten test in `tests/test_telegram_bot.py` (relay-mode `build_transport` now
+  constructs a real `RelayClientTransport` instead of always raising) + 1 menu-wiring test.
+
 ### Combined test count
-- **Total: 1032 passing** (verified by running the full suite), up from 1012 after the Web
-  Control Center milestone and 923 at the start of this sprint.
+- **Total: 1057 passing** (verified by running the full suite), up from 1032 after the
+  backup milestone, 1012 after the Web Control Center milestone, and 923 at the start of
+  this sprint.
 
 ---
 
@@ -406,11 +453,11 @@ Extends the pre-existing `implementation/backup.py` (per-node `backup_db`/`list_
 
 These are honestly reported as **not implemented**, not "mostly done" or "mocked":
 
-- **The relay worker process.** The signing/verification *protocol* (`sign_relay_request`/
-  `verify_relay_request`) is done and tested; the actual second program meant to run on an
-  external VPS (receiving signed envelopes, calling Telegram, signing results back) does not
-  exist, and there is no second host available this session to validate an end-to-end
-  two-host integration even if it did.
+- **A real cross-host validation of the relay worker.** The relay worker process now exists
+  and is fully tested locally (see section 12 above), but it has only been run against a
+  simulated second host on localhost in this session -- no real second VPS was available.
+  This is the single most important remaining validation step before relay mode can be
+  considered production-ready.
 - **Secure Telegram delivery of backup archives.** `backup-full` and the Web `/backups` page
   create/verify/encrypt/retain archives, but nothing yet sends one through the Telegram bot
   transport. Explicitly listed in the mission's backup section but not started this pass —
@@ -457,7 +504,9 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
    **DONE** (see section 11 above). **Still open:** no scheduling/timer for `backup-full`
    yet (manual/CLI-only trigger), and secure Telegram delivery of backup archives is not
    wired up — this is the current next step for this feature area.
-6. The relay worker process + an end-to-end two-host validation (needs a second host).
+6. ~~The relay worker process...~~ **DONE, locally simulated** (see section 12 above).
+   **Still open:** a real end-to-end two-host validation (needs a second host) has not been
+   performed. This is now the single highest-priority remaining validation gap.
 7. Remote management/agent mode, then the unified installer (local/remote mode, optional
    component install/upgrade/repair/reconfigure/uninstall).
 

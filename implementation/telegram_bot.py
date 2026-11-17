@@ -70,9 +70,15 @@ def build_transport(settings, secrets):
                                       password=secrets.socks5_password)
         return tt.Socks5Transport(bot_token=secrets.bot_token, proxy=proxy)
     if settings.connectivity_mode == tc.MODE_RELAY:
-        raise ValueError("RELAY mode requires a separately deployed relay worker -- see "
-                          "docs/DEVELOPMENT_PROGRESS.md; this installation's direct transport "
-                          "object is intentionally not constructed for this mode")
+        if not settings.relay_host or not settings.relay_port:
+            raise ValueError("RELAY mode selected but relay_host/relay_port are not configured")
+        if not secrets.relay_shared_secret:
+            raise ValueError("RELAY mode selected but no relay_shared_secret is stored")
+        return tt.RelayClientTransport(bot_token=secrets.bot_token,
+                                        shared_secret=secrets.relay_shared_secret,
+                                        relay_host=settings.relay_host,
+                                        relay_port=settings.relay_port,
+                                        use_tls=settings.relay_use_tls)
     raise ValueError(f"unknown connectivity mode: {settings.connectivity_mode!r}")
 
 

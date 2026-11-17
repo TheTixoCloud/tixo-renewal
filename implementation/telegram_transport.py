@@ -318,3 +318,59 @@ def verify_relay_request(shared_secret: str, envelope: dict, seen_nonces: set,
                 "payload": None}
 
     return {"valid": True, "reason": None, "payload": envelope["payload"]}
+
+
+@dataclass(frozen=True)
+class RelayClientTransport:
+    """The Iran-side half of RELAY mode: makes an OUTBOUND-only HTTPS (or HTTP, for an
+    isolated local test/simulation -- see `use_tls`) POST to a separately-deployed
+    `relay_worker.py` process's `/submit` endpoint, carrying a signed envelope. Never opens
+    an inbound port; the relay worker never connects back to this host. Drop-in compatible
+    with DirectTransport/Socks5Transport's `.call()` signature so `telegram_bot.py` never
+    needs mode-specific dispatch logic beyond `build_transport()`."""
+    bot_token: str  # kept only for redaction symmetry with the other transports; never sent
+    shared_secret: str
+    relay_host: str
+    relay_port: int
+    use_tls: bool = True
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+
+    def call(self, method: str, params: dict = None, http_post=None) -> dict:
+        envelope = sign_relay_request(self.shared_secret, {"method": method, "params": params or {}})
+        body = json.dumps(envelope).encode("utf-8")
+        scheme = "https" if self.use_tls else "http"
+        url = f"{scheme}://{self.relay_host}:{self.relay_port}/submit"
+
+        if http_post is None:
+            def http_post(url, data, timeout):
+                req = urllib.request.Request(url, data=data, method="POST",
+                                               headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read().decode()
+        try:
+            raw = http_post(url, body, self.timeout_seconds)
+        except Exception as e:
+            raise TelegramTransportError(_redact_token(str(e), self.bot_token)) from None
+
+        try:
+            signed_result = json.loads(raw)
+        except (ValueError, TypeError):
+            raise TelegramTransportError("relay worker response was not valid JSON") from None
+
+        verification = verify_relay_request(self.shared_secret, signed_result, set())
+        if not verification["valid"]:
+            raise TelegramTransportError(
+                f"relay worker response failed verification: {verification['reason']}")
+
+        result_payload = verification["payload"]
+        if not result_payload.get("ok"):
+            raise TelegramTransportError(
+                f"relay worker reported a Telegram API failure: {result_payload.get('error')}")
+        return result_payload["result"]
+
+    def test_connectivity(self) -> dict:
+        try:
+            result = self.call("getMe")
+            return {"ok": bool(result.get("ok")), "detail": result}
+        except TelegramTransportError as e:
+            return {"ok": False, "detail": str(e)}

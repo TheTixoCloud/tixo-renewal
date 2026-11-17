@@ -1334,6 +1334,47 @@ def cmd_web_run(args):
     return 0
 
 
+def cmd_relay_worker_run(args):
+    """Runs the relay worker (see relay_worker.py) -- the SEPARATE process meant to run on a
+    VPS that can reach Telegram, for an Iran-side host that cannot reach it directly. Uses
+    its OWN config_dir/secrets (telegram_config.RelayWorkerSettings/RelayWorkerSecrets),
+    never the Iran-side bot's settings. Refuses to start unless explicitly enabled."""
+    import telegram_config as tc
+    import relay_worker as rw
+
+    settings = tc.load_relay_worker_settings(CONFIG_DIR)
+    if not settings.enabled:
+        print("BLOCKED: Relay worker is not enabled. Enable it via the menu's "
+              "'Configure Relay Worker' screen first.")
+        return 1
+    try:
+        secrets_obj = tc.load_relay_worker_secrets(tc.default_relay_worker_secrets_path(CONFIG_DIR))
+    except (FileNotFoundError, tc.TelegramConfigSecurityError) as e:
+        print(f"BLOCKED: {e}")
+        return 1
+
+    nonce_db_path = os.path.join(STATE_DIR, "relay_worker_nonces.sqlite3")
+    print(f"Starting relay worker on {settings.bind_host}:{settings.bind_port} "
+          f"(Ctrl+C to stop)...")
+    server, _ = rw.run_server_in_thread(secrets_obj.bot_token, secrets_obj.shared_secret,
+                                          nonce_db_path, settings.bind_host, settings.bind_port,
+                                          settings.max_envelope_age_seconds)
+    try:
+        server.socket.settimeout(1.0)
+        import time
+        max_iterations = getattr(args, "max_iterations", None)
+        iterations = 0
+        while max_iterations is None or iterations < max_iterations:
+            time.sleep(1)
+            iterations += 1
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    print("Relay worker stopped.")
+    return 0
+
+
 def cmd_telegram_bot_run(args):
     """Runs the Telegram long-polling loop (see telegram_bot.run_polling_loop). Blocks
     forever by default (the real deployment shape for a systemd service, Type=simple,
@@ -1476,6 +1517,16 @@ def main():
     web_run_p.add_argument("--max-iterations", type=int, default=None,
                             help="Bound the run to N one-second ticks then exit (manual testing)")
     web_run_p.set_defaults(func=cmd_web_run)
+
+    relay_worker_run_p = sub.add_parser(
+        "relay-worker-run",
+        help="Run the relay worker (blocks; runs on a SEPARATE host that can reach "
+             "Telegram; requires enabling via the menu's 'Configure Relay Worker' screen "
+             "first, on THAT host)")
+    relay_worker_run_p.add_argument("--max-iterations", type=int, default=None,
+                                     help="Bound the run to N one-second ticks then exit "
+                                          "(manual testing)")
+    relay_worker_run_p.set_defaults(func=cmd_relay_worker_run)
 
     sub.add_parser("hostinfo").set_defaults(func=cmd_hostinfo)
 

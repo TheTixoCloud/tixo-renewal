@@ -774,3 +774,8 @@ def test_action_view_emergency_grants_blocks_apply_without_approval_marker(tmp_p
 def test_menu_items_includes_telegram_bot_config():
     labels = [label for label, _ in menu.MENU_ITEMS]
     assert "Configure Telegram bot (optional)" in labels
+
+
+def test_menu_items_includes_relay_worker_config():
+    labels = [label for label, _ in menu.MENU_ITEMS]
+    assert "Configure Relay Worker (optional, run on a SEPARATE host)" in labels
