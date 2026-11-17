@@ -508,3 +508,47 @@ def test_is_emergency_grants_approved_false_when_file_absent(tmp_path):
 def test_is_emergency_grants_approved_true_when_file_present(tmp_path):
     _emergency_grants_approved_marker(tmp_path)
     assert ep.is_emergency_grants_approved(str(tmp_path)) is True
+
+
+# ---------- check_fleet_exhaustion: shared fleet-check logic (CLI + menu reuse this) --------
+
+def _vps_record(vpsid, quota, used, hostname="h"):
+    return {"vpsid": vpsid, "hostname": hostname, "quota_gb": quota, "used_gb": used}
+
+
+def test_check_fleet_exhaustion_counts_and_lists_actionable(tmp_path):
+    conn = _db(tmp_path)
+    policy = ep.ExhaustedBandwidthPolicy(mode=ep.MODE_EMERGENCY_GRANT, cooldown_hours=0)
+    records = [
+        _vps_record(1, "100", "50"),   # not exhausted
+        _vps_record(2, "100", "150"),  # exhausted -> grant proposed
+        _vps_record(3, "0", "99999"),  # unlimited
+    ]
+    result = ep.check_fleet_exhaustion(conn, records, policy)
+    assert result["total_checked"] == 3
+    assert result["mode"] == ep.MODE_EMERGENCY_GRANT
+    assert result["counts"][ep.RESULT_GRANT_PROPOSED] == 1
+    assert result["counts"][ep.RESULT_NOT_EXHAUSTED] == 1
+    assert result["counts"][ep.RESULT_NOT_APPLICABLE_UNLIMITED] == 1
+    assert len(result["actionable"]) == 1
+    assert result["actionable"][0]["vpsid"] == 2
+
+
+def test_check_fleet_exhaustion_empty_records(tmp_path):
+    conn = _db(tmp_path)
+    policy = ep.ExhaustedBandwidthPolicy(mode=ep.MODE_MANUAL_REVIEW)
+    result = ep.check_fleet_exhaustion(conn, [], policy)
+    assert result["total_checked"] == 0
+    assert result["counts"] == {}
+    assert result["actionable"] == []
+
+
+def test_check_fleet_exhaustion_is_idempotent_across_repeated_runs(tmp_path):
+    conn = _db(tmp_path)
+    policy = ep.ExhaustedBandwidthPolicy(mode=ep.MODE_MANUAL_REVIEW)
+    records = [_vps_record(1, "100", "150")]
+    r1 = ep.check_fleet_exhaustion(conn, records, policy)
+    r2 = ep.check_fleet_exhaustion(conn, records, policy)
+    assert r1["counts"][ep.RESULT_QUEUED_FOR_REVIEW] == 1
+    assert r2["counts"][ep.RESULT_ALREADY_QUEUED] == 1
+    assert conn.execute("SELECT COUNT(*) FROM manual_review_queue").fetchone()[0] == 1

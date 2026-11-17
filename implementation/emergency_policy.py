@@ -328,6 +328,36 @@ def list_proposed_grants(conn: sqlite3.Connection, limit: int = 100) -> list[dic
              "status": r[4], "note": r[5]} for r in rows]
 
 
+def check_fleet_exhaustion(conn_ep: sqlite3.Connection, records: list, policy,
+                            now: datetime = None) -> dict:
+    """Evaluates every record in an already-synced inventory snapshot (the shape
+    inventory.latest_records() returns -- each dict needs at least `vpsid`/`quota_gb`/
+    `used_gb`) against `policy` via evaluate_exhaustion(), one call per VPS. Makes NO
+    Virtualizor API call itself (the caller is responsible for having already synced
+    `records` through the existing, independent inventory-sync timer/cache).
+
+    This is the SINGLE shared implementation menu.py's interactive 'Check exhausted VPS
+    bandwidth' screen and renewal_cli.py's noninteractive `check-exhausted` subcommand both
+    call -- neither re-derives this loop independently, per the project's "avoid duplicated
+    business logic" rule.
+
+    Returns {"mode": ..., "total_checked": int, "counts": {result_label: count},
+    "actionable": [...]} where `actionable` lists only the VPS that got a real grant
+    proposed or were queued for review (the subset worth printing/alerting on; the full
+    per-VPS detail for NOT_EXHAUSTED/DISABLED/etc. is summarized only as a count)."""
+    counts = {}
+    actionable = []
+    for r in records:
+        result = evaluate_exhaustion(conn_ep, r["vpsid"], r.get("quota_gb"), r.get("used_gb"),
+                                      policy, now=now)
+        counts[result["result"]] = counts.get(result["result"], 0) + 1
+        if result["result"] in (RESULT_GRANT_PROPOSED, RESULT_QUEUED_FOR_REVIEW):
+            actionable.append({"vpsid": r["vpsid"], "hostname": r.get("hostname"),
+                                "result": result["result"]})
+    return {"mode": policy.mode, "total_checked": len(records), "counts": counts,
+            "actionable": actionable}
+
+
 # ---------- settings persistence (mirrors hostnet_sync.py's load_settings/save_* pattern) ----
 
 def _settings_path(config_dir: str) -> str:

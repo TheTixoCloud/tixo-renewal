@@ -1154,6 +1154,34 @@ def cmd_install_ui(args):
     return 0
 
 
+def cmd_check_exhausted(args):
+    """Noninteractive counterpart to the menu's 'Check exhausted VPS bandwidth' screen --
+    same shared implementation (emergency_policy.check_fleet_exhaustion), suitable for a
+    future systemd timer (NOT yet installed/enabled anywhere -- this only adds the command
+    itself, per the explicit instruction not to alter production timers this session).
+    Makes NO Virtualizor API call: reads only the already-synced local inventory cache."""
+    import emergency_policy as emp_mod
+    import inventory as inv_mod
+
+    policy = emp_mod.load_policy_settings(CONFIG_DIR)
+    if policy.mode == emp_mod.MODE_DISABLED:
+        print("Exhausted-bandwidth policy is disabled -- nothing to check.")
+        return 0
+    conn_inv = inv_mod.open_db(os.path.join(STATE_DIR, "inventory.sqlite3"))
+    records = inv_mod.latest_records(conn_inv, getattr(args, "node", None) or "self")
+    if not records:
+        print("No inventory records available yet -- run inventory-sync first.")
+        return 1
+    conn_ep = emp_mod.open_db(os.path.join(STATE_DIR, "emergency_policy.sqlite3"))
+    result = emp_mod.check_fleet_exhaustion(conn_ep, records, policy)
+    for item in result["actionable"]:
+        print(f"VPS {item['vpsid']} ({item['hostname']}): {item['result']}")
+    print(f"Checked {result['total_checked']} VPS record(s) against mode={policy.mode}.")
+    for label, count in sorted(result["counts"].items()):
+        print(f"  {label}: {count}")
+    return 0
+
+
 def cmd_telegram_bot_run(args):
     """Runs the Telegram long-polling loop (see telegram_bot.run_polling_loop). Blocks
     forever by default (the real deployment shape for a systemd service, Type=simple,
@@ -1256,6 +1284,14 @@ def main():
     install_ui_p = sub.add_parser("install-ui")
     install_ui_p.add_argument("--yes", action="store_true")
     install_ui_p.set_defaults(func=cmd_install_ui)
+
+    check_exhausted_p = sub.add_parser(
+        "check-exhausted",
+        help="Evaluate the already-synced VPS inventory against the configured "
+             "exhausted-bandwidth policy (no Virtualizor API call; no-op if the policy is "
+             "disabled)")
+    check_exhausted_p.add_argument("--node")
+    check_exhausted_p.set_defaults(func=cmd_check_exhausted)
 
     telegram_bot_run_p = sub.add_parser(
         "telegram-bot-run",

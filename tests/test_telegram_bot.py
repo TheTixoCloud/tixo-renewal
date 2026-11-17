@@ -493,3 +493,73 @@ def test_cmd_telegram_bot_run_starts_and_stops_with_max_iterations(tmp_path, cap
     assert captured_transport.get("called") is True
     assert "Starting Telegram bot polling loop" in out
     assert "Stopped:" in out
+
+
+# ---------- renewal_cli.py: check-exhausted subcommand (shared with menu's screen) -----------
+
+def test_cmd_check_exhausted_noop_when_disabled(tmp_path, capsys):
+    import renewal_cli
+    renewal_cli.CONFIG_DIR = str(tmp_path / "config")
+    renewal_cli.STATE_DIR = str(tmp_path / "state")
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    os.makedirs(renewal_cli.STATE_DIR, exist_ok=True)
+
+    class _Args:
+        node = None
+    rc = renewal_cli.cmd_check_exhausted(_Args())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "disabled" in out.lower()
+
+
+def test_cmd_check_exhausted_reports_no_inventory(tmp_path, capsys):
+    import renewal_cli
+    import emergency_policy as emp
+    renewal_cli.CONFIG_DIR = str(tmp_path / "config")
+    renewal_cli.STATE_DIR = str(tmp_path / "state")
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    os.makedirs(renewal_cli.STATE_DIR, exist_ok=True)
+    emp.save_policy_settings(renewal_cli.CONFIG_DIR,
+                              emp.ExhaustedBandwidthPolicy(mode=emp.MODE_MANUAL_REVIEW))
+
+    class _Args:
+        node = None
+    rc = renewal_cli.cmd_check_exhausted(_Args())
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "no inventory records" in out.lower()
+
+
+def test_cmd_check_exhausted_evaluates_real_inventory(tmp_path, capsys):
+    import renewal_cli
+    import emergency_policy as emp
+    import inventory as inv
+    from decimal import Decimal
+
+    renewal_cli.CONFIG_DIR = str(tmp_path / "config")
+    renewal_cli.STATE_DIR = str(tmp_path / "state")
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    os.makedirs(renewal_cli.STATE_DIR, exist_ok=True)
+    emp.save_policy_settings(renewal_cli.CONFIG_DIR,
+                              emp.ExhaustedBandwidthPolicy(mode=emp.MODE_MANUAL_REVIEW))
+
+    conn_inv = inv.open_db(os.path.join(renewal_cli.STATE_DIR, "inventory.sqlite3"))
+    parse_result = {
+        "complete": True,
+        "records": [{"vpsid": 9, "hostname": "h9", "status": "unknown", "quota_gb": Decimal("100"),
+                      "used_gb": Decimal("150"), "ram_mb": "1024", "cores": "1", "disk_gb": "20",
+                      "virtualization": "kvm", "locked": "unavailable", "node_serid": "unavailable",
+                      "ip_primary": "unavailable", "ip_count": "unavailable", "ip_list": "unavailable",
+                      "runtime_status": "running", "network_suspended_reason": None}],
+        "skipped_count": 0, "error": None, "authoritative_total": 1,
+    }
+    inv.ingest_snapshot(conn_inv, "self", parse_result)
+    conn_inv.close()
+
+    class _Args:
+        node = "self"
+    rc = renewal_cli.cmd_check_exhausted(_Args())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "VPS 9" in out
+    assert "QUEUED_FOR_REVIEW" in out

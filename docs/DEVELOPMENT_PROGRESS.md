@@ -212,7 +212,9 @@ process is not — see "Deliberately NOT done" below)*
   `tests/test_control_center_api.py`, `tests/test_telegram_transport.py`,
   `tests/test_telegram_config.py`, `tests/test_telegram_bot.py`, and several new cases added
   to `tests/test_menu.py` for CLI wiring.
-- **Total: 847 passing** (verified by running the full suite), no skips, no mocked-away
+- **Total: 853 passing** (verified by running the full suite; +6 more from the
+  `check-exhausted` CLI wiring and `check_fleet_exhaustion` shared-logic tests added
+  right after this checkpoint), no skips, no mocked-away
   failures.
 
 ---
@@ -266,10 +268,13 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
    Restart=always), generated-but-never-installed the same way the existing 5 timer
    templates are — wire it into `renewal_cli.py install`'s existing
    `write_systemd_units`-style output. **This is the current next step.**
-2. Extend `renewal_cli.py`'s `dry-run`/`apply-due` commands (or add a parallel
-   `check-exhausted`/`apply-emergency-grants` pair) so the exhausted-bandwidth check and
-   (approved) auto-apply can run on the existing systemd timer cadence, not just
-   interactively from the menu. Not yet done.
+2. ~~Extend `renewal_cli.py`'s `dry-run`/`apply-due` commands...~~ **DONE**: added a
+   `check-exhausted` subcommand (`renewal_cli.cmd_check_exhausted`), sharing
+   `emergency_policy.check_fleet_exhaustion()` with the menu's interactive screen (the SAME
+   implementation, not a parallel one). Still not wired to any systemd timer cadence (no
+   new/modified timer this session) and the emergency-grant *auto-apply* step still
+   requires the separate `EMERGENCY_GRANTS_APPROVED` marker and is only reachable
+   interactively from the menu, never from a noninteractive command yet.
 3. Reporting/alerts/backup scheduling (builds on `control_center_api.get_full_snapshot` for
    report content, and the now-working Telegram transports for delivery).
 4. The relay worker process + an end-to-end two-host validation (needs a second host).

@@ -1650,14 +1650,11 @@ def action_check_exhausted_bandwidth(style: Style):
               f"first.{style.RESET}")
         return
     conn_ep = emp.open_db(_emergency_policy_db_path())
-    counts = {}
-    for r in records:
-        result = emp.evaluate_exhaustion(conn_ep, r["vpsid"], r.get("quota_gb"), r.get("used_gb"), policy)
-        counts[result["result"]] = counts.get(result["result"], 0) + 1
-        if result["result"] in (emp.RESULT_GRANT_PROPOSED, emp.RESULT_QUEUED_FOR_REVIEW):
-            print(f"  VPS {r['vpsid']} ({r.get('hostname')}): {result['result']}")
-    print(f"\nChecked {len(records)} VPS record(s) against mode={policy.mode}.")
-    for label, count in sorted(counts.items()):
+    result = emp.check_fleet_exhaustion(conn_ep, records, policy)
+    for item in result["actionable"]:
+        print(f"  VPS {item['vpsid']} ({item['hostname']}): {item['result']}")
+    print(f"\nChecked {result['total_checked']} VPS record(s) against mode={policy.mode}.")
+    for label, count in sorted(result["counts"].items()):
         print(f"  {label}: {count}")
 
 
