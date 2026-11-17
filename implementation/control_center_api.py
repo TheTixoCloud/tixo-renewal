@@ -150,6 +150,18 @@ def get_emergency_policy_overview(config_dir: str, state_dir: str) -> dict:
     }
 
 
+def get_host_time_overview(config_dir: str, state_dir: str) -> dict:
+    """Current server-local time, uptime, boot time/ID, monitoring activation/elapsed, last
+    persistent sample, data coverage, and a clearly-separate raw kernel-counter reading --
+    a thin pass-through to host_time.get_host_time_snapshot (never re-derived here). Uses
+    the configured hostnet interface automatically, if any."""
+    import host_time
+    import hostnet_sync
+    settings = hostnet_sync.load_settings(config_dir)
+    interface = settings.get("interface")
+    return host_time.get_host_time_snapshot(config_dir, state_dir, interface=interface)
+
+
 def get_full_snapshot(config_dir: str, state_dir: str) -> dict:
     """Everything-in-one-call convenience bundle -- what a Web dashboard's main overview
     page or a Telegram /status command wants, bounded to a small, fixed number of
@@ -160,6 +172,7 @@ def get_full_snapshot(config_dir: str, state_dir: str) -> dict:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "display_timezone": tz_name,
         "host": get_host_snapshot(),
+        "host_time": get_host_time_overview(config_dir, state_dir),
         "network": get_network_overview(config_dir, state_dir, tz_name=tz_name),
         "inventory": get_vps_inventory_overview(state_dir),
         "renewal": get_renewal_overview(config_dir, state_dir),

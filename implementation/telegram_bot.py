@@ -133,6 +133,10 @@ def _handle_status(config_dir, state_dir) -> str:
     ]
     if net.get("configured"):
         lines.append(f"Network interface: {net['interface']}")
+    host_time = snap.get("host_time", {})
+    if host_time:
+        lines.append(f"Server time: {host_time.get('current_local')}")
+        lines.append(f"Uptime: {host_time.get('uptime_human')}")
     else:
         lines.append("Network interface: not configured")
     return "\n".join(lines)
@@ -147,7 +151,17 @@ def _handle_host(config_dir, state_dir) -> str:
     if "memory" in host:
         lines.append(f"Memory: {host['memory']}")
     if "uptime" in host:
-        lines.append(f"Uptime: {host['uptime']}")
+        lines.append(f"Uptime (load): {host['uptime']}")
+
+    host_time = api.get_host_time_overview(config_dir, state_dir)
+    lines.append(f"Server local time: {host_time.get('current_local')}")
+    lines.append(f"Uptime: {host_time.get('uptime_human')}")
+    lines.append(f"Last boot: {host_time.get('boot_time_local')}")
+    lines.append(f"Boot ID: {host_time.get('boot_id')}")
+    if host_time.get("network_configured"):
+        lines.append(f"Monitoring activation: {host_time.get('monitoring_activation_local')}")
+        lines.append(f"Monitoring elapsed: {host_time.get('monitoring_elapsed_human')}")
+
     return "\n".join(lines) if len(lines) > 1 else "Host status unavailable."
 
 

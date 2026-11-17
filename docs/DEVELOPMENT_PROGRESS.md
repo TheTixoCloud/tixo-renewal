@@ -234,14 +234,67 @@ process is not — see "Deliberately NOT done" below)*
 - **Tests:** `tests/test_reports.py` (21) + 8 more in `tests/test_telegram_bot.py` (loop
   integration + `send-report` CLI wiring) + 2 updated `/reports` tests.
 
+### 8. Timezone-aware host uptime, boot time, and monitoring uptime — DONE
+- **File:** `implementation/host_time.py` (new) — the one shared implementation for the
+  CLI, `control_center_api.py`, the Telegram bot, and (when built) reports/Web.
+- **Uptime:** `read_uptime_seconds()` reads `/proc/uptime` directly (the kernel's monotonic
+  since-boot counter, immune to clock adjustments) — real smoke-tested against this host's
+  actual file, not mocked. `format_duration_human()` always shows days, hours, minutes, AND
+  seconds (e.g. `"2d 3h 12m 45s"`), distinct from `menu.py`'s existing shorter
+  `_format_uptime_human` (left untouched — that one deliberately omits seconds for the
+  compact dashboard view; this is a new, more detailed formatter for the new screens).
+- **Boot time:** `compute_boot_time_utc()` = `now - uptime` (the same method `uptime`/
+  `who -b` use), explicitly documented as an ESTIMATE, never claimed as a kernel-reported
+  absolute value (Linux doesn't expose one). **Boot ID:** reuses `hostnet.get_boot_id()`
+  unchanged (no second implementation of that one-line `/proc/sys/kernel/random/boot_id`
+  read).
+- **Timezone:** `detect_default_display_timezone()` suggests the HOST's own system
+  timezone (read-only via `hostinfo.get_host_timezone()`, which was already read-only and
+  unchanged) as a default, falling back to the project's existing `Asia/Tehran` default if
+  the host timezone is unavailable or not a valid IANA name — the host's actual system
+  timezone/clock are never touched, only read for the suggestion.
+- **Calendar preference:** a new, additive `calendar_preference` key (`auto`/`jalali`/
+  `gregorian`/`both`, default `auto` — zero behavior change for existing installations)
+  stored in the SAME `display-settings.json` file `menu.py` already manages (merged in,
+  never a second divergent settings file). `format_local_datetime()` honors it — `auto`
+  preserves the exact pre-existing "Jalali only for Asia/Tehran" behavior; `jalali`/
+  `gregorian` force one calendar regardless of timezone (an explicit administrator
+  override); `both` shows both together. Always 24-hour clock time. A real DST-transition
+  test (Europe/London's spring-forward) confirms the underlying `zoneinfo` conversion is
+  correctly wired through, not broken by this module's thin formatting layer.
+- **Monitoring activation/elapsed, last persistent sample, data coverage:** read straight
+  from `hostnet.py`'s existing cumulative/sample tables — no new persistence, no new
+  polling. **Kernel counter section:** one raw RX/TX read (via the SAME primitive
+  `control_center_api.get_live_network_reading` already uses) presented as `combined_bytes`
+  plus an explicit, always-present "reset semantics" label stating it is reset-on-reboot
+  and NEVER added to the persistent recorded totals — verified by a dedicated test that
+  deliberately records a huge fake persistent total and confirms the live kernel reading
+  (this host's real, unrelated `lo` counters) is never summed into it.
+- **Wired into:** `control_center_api.get_host_time_overview()` (new, included in
+  `get_full_snapshot()`); `menu.py`'s "System & Virtualizor information" screen (new
+  "SERVER TIME & UPTIME" section, backward-compatible — omitted entirely if no snapshot is
+  passed, so every pre-existing call site/test is unaffected) and the hostnet panel (new
+  "KERNEL COUNTER" section, same backward-compatible opt-in pattern); `menu.py`'s
+  "Configure display timezone" screen (now also suggests the detected host timezone and
+  prompts for calendar preference); `telegram_bot.py`'s `/host` (full detail) and `/status`
+  (one-line summary) commands.
+- No Virtualizor API call anywhere in this feature; no new systemd timer; no change to any
+  stored UTC timestamp anywhere in the project — only new, additive display conversions.
+- **Tests:** `tests/test_host_time.py` (40 tests) covering uptime formatting (including a
+  real `/proc/uptime` read and a real boot-ID read), boot time estimation, calendar
+  preference persistence/validation, DST-correct conversion, all four calendar-preference
+  modes, and honest missing-data handling (no interface configured, no samples yet, kernel
+  counter unavailable) — plus CLI/Telegram wiring smoke tests.
+
 ### Combined test count
 - Pre-existing (as of v1.7.3): 675 passing.
-- New this session: 206, across `tests/test_traffic_analytics.py`,
+- New this session: 247, across `tests/test_traffic_analytics.py`,
   `tests/test_emergency_policy.py`, `tests/test_security.py`,
   `tests/test_control_center_api.py`, `tests/test_telegram_transport.py`,
   `tests/test_telegram_config.py`, `tests/test_telegram_bot.py`, `tests/test_reports.py`,
-  and several new cases added to `tests/test_menu.py` for CLI wiring.
-- **Total: 881 passing** (verified by running the full suite), no skips, no mocked-away
+  `tests/test_host_time.py`, and several new cases added to `tests/test_menu.py` for CLI
+  wiring.
+- **Total: 922 passing** (verified by running the full suite), no skips, no mocked-away
   failures.
 
 ---

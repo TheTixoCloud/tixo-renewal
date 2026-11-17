@@ -181,9 +181,23 @@ def test_full_snapshot_has_all_top_level_sections(tmp_path):
                                                                  db_filename="self.sqlite3")])
     snapshot = api.get_full_snapshot(config_dir, state_dir)
     assert set(snapshot.keys()) == {
-        "generated_at", "display_timezone", "host", "network", "inventory",
+        "generated_at", "display_timezone", "host", "host_time", "network", "inventory",
         "renewal", "emergency_policy",
     }
     assert snapshot["network"]["configured"] is False
     assert snapshot["inventory"]["fleet"]["total_vps"] == 0
     assert snapshot["emergency_policy"]["mode"] == emp.MODE_DISABLED
+    assert snapshot["host_time"]["network_configured"] is False
+    assert snapshot["host_time"]["uptime_human"] != "unavailable"
+
+
+def test_get_host_time_overview_uses_configured_interface(tmp_path):
+    import hostnet_sync
+    config_dir = _config_dir(tmp_path)
+    state_dir = _state_dir(tmp_path)
+    hostnet_sync.save_monitored_interface(config_dir, "lo", confirmed=True,
+                                           get_network_interfaces=lambda: [
+                                               {"name": "lo", "is_virtual": False}])
+    result = api.get_host_time_overview(config_dir, state_dir)
+    assert result["network_configured"] is True
+    assert result["interface"] == "lo"

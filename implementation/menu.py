@@ -685,6 +685,27 @@ def render_host_info(info: dict, style: Style, show_virtual_interfaces: bool = F
     lines.append("")
     lines.append(_section(style, "TIMEZONE"))
     lines.append(f"  Host system timezone: {info['host_timezone']}")
+
+    host_time_snapshot = info.get("host_time_snapshot")
+    if host_time_snapshot:
+        lines.append("")
+        lines.append(_section(style, "SERVER TIME & UPTIME"))
+        lines.append(f"  Current local time: {host_time_snapshot['current_local']} "
+                      f"({host_time_snapshot['display_timezone']})")
+        lines.append(f"  Uptime: {host_time_snapshot['uptime_human']}")
+        lines.append(f"  Last boot: {host_time_snapshot['boot_time_local']}")
+        lines.append(f"  Boot ID: {host_time_snapshot['boot_id']}")
+        if host_time_snapshot.get("network_configured"):
+            lines.append(f"  Monitoring activation: {host_time_snapshot['monitoring_activation_local']}")
+            lines.append(f"  Monitoring elapsed: {host_time_snapshot['monitoring_elapsed_human']}")
+            lines.append(f"  Last persistent sample: {host_time_snapshot['last_persistent_sample_local']}")
+            discontinuity = host_time_snapshot.get("data_coverage_discontinuity")
+            gap = host_time_snapshot.get("data_coverage_gap_seconds")
+            if discontinuity:
+                lines.append(f"  {style.YELLOW}Data coverage: discontinuity ({discontinuity}) at "
+                              f"last sample{style.RESET}")
+            elif gap:
+                lines.append(f"  Data coverage: OK (last gap {gap:.0f}s)")
     return "\n".join(lines)
 
 
@@ -851,7 +872,8 @@ def render_vps_detail(record: dict, style: Style) -> str:
 
 
 def render_hostnet_panel(interface: str, cumulative: dict, live_rate: dict,
-                          recent_sample: dict, style: Style, display_tz: str = "UTC") -> str:
+                          recent_sample: dict, style: Style, display_tz: str = "UTC",
+                          kernel_counter: dict = None) -> str:
     """HOST NETWORK -- <interface> panel per the spec layout. `cumulative`/`recent_sample`
     may be None (never sampled yet); `live_rate` may be None (fewer than 2 samples, or the
     most recent pair spans a discontinuity) -- both cases rendered honestly, never
@@ -895,6 +917,19 @@ def render_hostnet_panel(interface: str, cumulative: dict, live_rate: dict,
                      f"at last sample -- some traffic in this gap is not observable, never invented.{style.RESET}")
     elif gap and gap > 0:
         lines.append(f"  Data Quality: OK (last gap {gap:.0f}s)")
+
+    if kernel_counter is not None:
+        lines.append("")
+        lines.append(f"  {style.BOLD}KERNEL COUNTER -- since last interface counter reset{style.RESET}")
+        if kernel_counter.get("ok"):
+            lines.append(f"    RX: {_format_bytes_human(kernel_counter['rx_bytes'])}  "
+                          f"TX: {_format_bytes_human(kernel_counter['tx_bytes'])}  "
+                          f"Combined: {_format_bytes_human(kernel_counter['combined_bytes'])}")
+        else:
+            lines.append(f"    {style.GRAY}unavailable{style.RESET}")
+        lines.append(f"    Source: {kernel_counter.get('source', 'unavailable')}")
+        lines.append(f"    {style.GRAY}{kernel_counter.get('reset_semantics', '')}{style.RESET}")
+
     lines.append(f"\n  {style.GRAY}Download (RX) = bytes received by this HOST's monitored interface. "
                  f"Upload (TX) = bytes transmitted. Total Traffic = Download + Upload. These are "
                  f"from the physical host's perspective, not necessarily any one VPS customer's "
@@ -1065,7 +1100,12 @@ def action_dashboard(style: Style):
 
 
 def action_configure_timezone():
+    import host_time as ht
     current = load_display_tz(renewal_cli.CONFIG_DIR)
+    suggested_host_tz = ht.detect_default_display_timezone()
+    if suggested_host_tz != current:
+        print(f"Detected host system timezone: {suggested_host_tz} (current display "
+              f"setting: {current})")
     raw = input(f"Display timezone (IANA name, e.g. Asia/Tehran) [{current}]: ").strip() or current
     try:
         save_display_tz(renewal_cli.CONFIG_DIR, raw)
@@ -1074,6 +1114,16 @@ def action_configure_timezone():
         return
     print(f"Display timezone set to {raw}. This only affects how times are SHOWN in this "
           f"menu -- the host's actual system timezone is never changed.")
+
+    current_pref = ht.load_calendar_preference(renewal_cli.CONFIG_DIR)
+    pref_raw = input(f"Calendar preference [{current_pref}] "
+                      f"({'/'.join(ht.VALID_CALENDAR_PREFERENCES)}): ").strip() or current_pref
+    try:
+        ht.save_calendar_preference(renewal_cli.CONFIG_DIR, pref_raw)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+    print(f"Calendar preference set to {pref_raw}.")
 
 
 def action_configure_gift():
@@ -1228,8 +1278,14 @@ def action_system_info(style: Style, show_virtual_interfaces: bool = False):
     separate, explicitly-labeled main-menu action (see action_system_info_advanced below),
     not a nested prompt inside this screen -- so the default and advanced views are reached
     through two visibly different menu entries, never confusable with each other."""
-    print(render_host_info(hostinfo.collect_host_info(), style,
-                            show_virtual_interfaces=show_virtual_interfaces))
+    info = hostinfo.collect_host_info()
+    try:
+        import control_center_api as api
+        info["host_time_snapshot"] = api.get_host_time_overview(renewal_cli.CONFIG_DIR,
+                                                                  renewal_cli.STATE_DIR)
+    except Exception:
+        pass  # a host-time snapshot failure must never take down the whole system-info screen
+    print(render_host_info(info, style, show_virtual_interfaces=show_virtual_interfaces))
     print()
     print(render_virtualizor_info(collect_virtualizor_info(), style))
 
@@ -1491,7 +1547,17 @@ def action_view_hostnet(style: Style):
         live_rate = hostnet.compute_live_throughput(conn, interface)
         recent = hostnet.get_recent_samples(conn, interface, limit=1)
         recent_sample = recent[-1] if recent else None
-        print(render_hostnet_panel(interface, cumulative, live_rate, recent_sample, style, display_tz=tz))
+        import control_center_api as api
+        kernel_counter = api.get_live_network_reading(interface)
+        kernel_counter["source"] = f"/sys/class/net/{interface}/statistics/{{rx,tx}}_bytes"
+        kernel_counter["reset_semantics"] = (
+            "Resets to zero on interface reset or host reboot -- NEVER added to the "
+            "persistent recorded totals above; reflects only the time since the counter's "
+            "last reset.")
+        if kernel_counter["ok"]:
+            kernel_counter["combined_bytes"] = kernel_counter["rx_bytes"] + kernel_counter["tx_bytes"]
+        print(render_hostnet_panel(interface, cumulative, live_rate, recent_sample, style,
+                                    display_tz=tz, kernel_counter=kernel_counter))
         print(f"\n  {style.GRAY}(live auto-refresh unavailable in this terminal -- showing a "
               f"single static snapshot instead){style.RESET}")
         input(f"{style.GRAY}[0] Press Enter to return{style.RESET}")
