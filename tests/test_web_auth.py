@@ -251,3 +251,34 @@ def test_login_rate_limit_is_per_remote_addr(tmp_path):
         wa.check_login_rate_limit(conn, "1.2.3.4", now=now)
     other = wa.check_login_rate_limit(conn, "5.6.7.8", now=now)
     assert other["allowed"] is True
+
+
+# ---------- CSRF secret / derived token --------------------------------------------------------
+
+def test_get_or_create_csrf_secret_persists(tmp_path):
+    config_dir = _config_dir(tmp_path)
+    s1 = wa.get_or_create_csrf_secret(config_dir)
+    s2 = wa.get_or_create_csrf_secret(config_dir)
+    assert s1 == s2
+
+
+def test_csrf_secret_file_has_0600_permissions(tmp_path):
+    config_dir = _config_dir(tmp_path)
+    wa.get_or_create_csrf_secret(config_dir)
+    import stat as _stat
+    mode = _stat.S_IMODE(os.stat(wa.csrf_secret_path(config_dir)).st_mode)
+    assert mode == 0o600
+
+
+def test_derive_csrf_token_deterministic_for_same_session():
+    secret = "s1"
+    assert wa.derive_csrf_token(secret, "session-a") == wa.derive_csrf_token(secret, "session-a")
+
+
+def test_derive_csrf_token_differs_per_session():
+    secret = "s1"
+    assert wa.derive_csrf_token(secret, "session-a") != wa.derive_csrf_token(secret, "session-b")
+
+
+def test_derive_csrf_token_differs_per_secret():
+    assert wa.derive_csrf_token("secret1", "session-a") != wa.derive_csrf_token("secret2", "session-a")

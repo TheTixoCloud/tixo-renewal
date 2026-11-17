@@ -1252,6 +1252,40 @@ def cmd_send_report(args):
     return 0 if all(r["ok"] for r in delivery.values()) else 1
 
 
+def cmd_web_run(args):
+    """Runs the Web Control Center (see web_server.py). Blocks forever (Type=simple,
+    Restart=always -- the real deployment shape; no systemd unit template exists yet for
+    this one, see docs/DEVELOPMENT_PROGRESS.md). Refuses to start unless explicitly enabled
+    via web_config.WebSettings -- never auto-activates just because at least one user has
+    been created."""
+    import web_config as wcfg
+    import web_server as websrv
+
+    settings = wcfg.load_web_settings(CONFIG_DIR)
+    if not settings.enabled:
+        print("BLOCKED: Web Control Center is not enabled. Enable it via the menu's "
+              "'Configure Web Control Center' screen first.")
+        return 1
+    print(f"Starting Web Control Center on {settings.bind_host}:{settings.bind_port} "
+          f"(Ctrl+C to stop)...")
+    server, _ = websrv.run_server_in_thread(CONFIG_DIR, STATE_DIR, settings.bind_host,
+                                             settings.bind_port)
+    try:
+        server.socket.settimeout(1.0)
+        import time
+        max_iterations = getattr(args, "max_iterations", None)
+        iterations = 0
+        while max_iterations is None or iterations < max_iterations:
+            time.sleep(1)
+            iterations += 1
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    print("Web Control Center stopped.")
+    return 0
+
+
 def cmd_telegram_bot_run(args):
     """Runs the Telegram long-polling loop (see telegram_bot.run_polling_loop). Blocks
     forever by default (the real deployment shape for a systemd service, Type=simple,
@@ -1380,6 +1414,14 @@ def main():
         help="Bound the loop to N getUpdates iterations then exit (for manual smoke-testing; "
              "omit for the real deployment shape, which runs forever)")
     telegram_bot_run_p.set_defaults(func=cmd_telegram_bot_run)
+
+    web_run_p = sub.add_parser(
+        "web-run",
+        help="Run the Web Control Center (blocks; requires enabling via the menu's "
+             "'Configure Web Control Center' screen first)")
+    web_run_p.add_argument("--max-iterations", type=int, default=None,
+                            help="Bound the run to N one-second ticks then exit (manual testing)")
+    web_run_p.set_defaults(func=cmd_web_run)
 
     sub.add_parser("hostinfo").set_defaults(func=cmd_hostinfo)
 

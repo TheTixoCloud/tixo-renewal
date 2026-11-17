@@ -40,6 +40,7 @@ import hostnet_sync
 import traffic_analytics
 import emergency_policy as emp
 import telegram_config as tgc
+import web_config as wcfg
 
 GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/TheTixoCloud/tixo-renewal/releases/latest"
 DEFAULT_DISPLAY_TZ = "Asia/Tehran"
@@ -1942,6 +1943,60 @@ def action_configure_telegram_bot(style: Style):
         print(f"Connectivity test: {'OK' if result['ok'] else 'FAILED'} -- {result['detail']}")
 
 
+def action_configure_web(style: Style):
+    """Configures the optional Web Control Center -- DISABLED and localhost-only by
+    default, exactly matching the required defaults. Never starts a server process from
+    here (see renewal_cli.py's `web-run`); only writes settings/creates the first admin
+    user, same safety shape as the Telegram bot's configuration screen."""
+    import web_auth as wa
+    settings = wcfg.load_web_settings(renewal_cli.CONFIG_DIR)
+    print(f"Enabled: {settings.enabled}")
+    print(f"Bind: {settings.bind_host}:{settings.bind_port}")
+
+    host_raw = input(f"Bind host [{settings.bind_host}] (127.0.0.1 = local only, "
+                      f"0.0.0.0 = all interfaces -- never do this without a reverse proxy/TLS "
+                      f"in front): ").strip() or settings.bind_host
+    port_raw = input(f"Bind port [{settings.bind_port}]: ").strip()
+    lang_raw = input(f"Default language [{settings.default_language}] "
+                      f"({'/'.join(wcfg.VALID_LANGUAGES)}): ").strip() or settings.default_language
+    theme_raw = input(f"Default theme [{settings.default_theme}] "
+                       f"({'/'.join(wcfg.VALID_THEMES)}): ").strip() or settings.default_theme
+    try:
+        new_settings = wcfg.WebSettings(
+            enabled=settings.enabled, bind_host=host_raw,
+            bind_port=int(port_raw) if port_raw else settings.bind_port,
+            domain=settings.domain, tls_cert_path=settings.tls_cert_path,
+            tls_key_path=settings.tls_key_path, default_language=lang_raw,
+            default_theme=theme_raw)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+
+    enable_raw = input(f"Enable the Web Control Center now? [y/N] "
+                        f"(enabled={settings.enabled}): ").strip().lower()
+    new_settings.enabled = enable_raw == "y"
+
+    existing_users = wa.list_users(renewal_cli.CONFIG_DIR)
+    if not existing_users:
+        print("\nNo Web admin user exists yet.")
+        if _confirm("Create the first admin user now?"):
+            username = input("Admin username: ").strip()
+            import getpass
+            password = getpass.getpass("Admin password (never echoed): ")
+            try:
+                wa.create_user(renewal_cli.CONFIG_DIR, username, password, role=wa.ROLE_ADMIN)
+                print(f"Admin user {username!r} created.")
+            except ValueError as e:
+                print(f"Rejected: {e}")
+                return
+
+    if not _confirm("Save these Web Control Center settings?"):
+        print("Cancelled.")
+        return
+    wcfg.save_web_settings(renewal_cli.CONFIG_DIR, new_settings)
+    print(f"Saved. Start it with: renewal_cli.py web-run (only works while enabled).")
+
+
 MENU_ITEMS = [
     ("Install / Initial Setup", action_install),
     ("Dashboard", None),  # needs style, wired specially below
@@ -1967,6 +2022,7 @@ MENU_ITEMS = [
     ("Manual review queue", None),  # needs style, wired specially below
     ("Emergency grants (proposed)", None),  # needs style, wired specially below
     ("Configure Telegram bot (optional)", None),  # needs style, wired specially below
+    ("Configure Web Control Center (optional)", None),  # needs style, wired specially below
     ("Enable automatic renewal", lambda: action_toggle_auto_renewal(True)),
     ("Disable automatic renewal", lambda: action_toggle_auto_renewal(False)),
     ("View logs and renewal history", action_view_logs),
@@ -2047,6 +2103,8 @@ def run_menu():
                     action_view_emergency_grants(style)
                 elif label == "Configure Telegram bot (optional)":
                     action_configure_telegram_bot(style)
+                elif label == "Configure Web Control Center (optional)":
+                    action_configure_web(style)
                 else:
                     fn()
             except Exception as e:

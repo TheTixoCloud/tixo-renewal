@@ -316,6 +316,46 @@ process is not — see "Deliberately NOT done" below)*
 
 ---
 
+### 10. Web Control Center — DONE (real, functional, all 16 reachable pages)
+Stdlib-only (`http.server`, zero third-party dependency). New modules: `web_auth.py`
+(sessions/CSRF/users — committed previously), `web_config.py` (settings, disabled/
+localhost-only by default), `web_server.py` (`WebApp.handle_request()` is the pure,
+socket-free core; `TixoRequestHandler`/`run_server_in_thread` the thin real-socket layer).
+
+- **All 16 pages render with real data**, wired to `control_center_api.py` /
+  `emergency_policy.py` / `reports.py` / `host_time.py` / `menu.py` — never fabricated.
+  Backups page honestly says "not yet implemented" (true — no backup module exists yet).
+  Telegram Settings page is read-only (editing stays in the CLI menu, to limit scope).
+- **Auth:** session-cookie login, server-side SQLite sessions, login rate limiting
+  (reuses `security.py`), RBAC (`admin` vs `viewer`) enforced on every mutating route.
+- **CSRF:** every POST (mode changes, review resolve/ack, user management, settings,
+  manual report send) requires a per-session derived token — verified by dedicated
+  reject/accept tests.
+- **Audit:** every mutating action is recorded via `audit_log.py` and visible on `/audit`.
+- **Localization/theme:** `en`/`fa` with correct `dir="rtl"` for Farsi, `dark`/`light` via
+  CSS variables — both verified by test.
+- **Live monitoring:** `/host` polls `/api/live` every 2s via vanilla JS — one raw kernel
+  counter read per poll, **zero Virtualizor API calls** (verified by a test that
+  monkeypatches `writer.call_vs_api` to raise if ever reached).
+- **Real end-to-end test:** one test spins up an actual server on a real ephemeral
+  localhost port and makes genuine HTTP requests via `urllib` — not just direct function
+  calls.
+- Wired into `renewal_cli.py` as `web-run` (blocks; refuses to start unless explicitly
+  enabled, same pattern as the Telegram bot) and `menu.py`'s "Configure Web Control
+  Center" screen (settings + first-admin-user creation; never starts a server itself).
+- **NOT done:** no systemd unit template yet for `web-run` (same category of follow-up as
+  the Telegram bot's, which now has one); no HTTPS/certificate handling; no reverse-proxy
+  guidance page.
+- **Tests:** `tests/test_web_auth.py` (34), `tests/test_web_config.py` (7),
+  `tests/test_audit_log.py` (4), `tests/test_web_server.py` (44) = **89 new tests**.
+
+### Combined test count
+- **Total: 1012 passing** (verified by running the full suite), up from 923 at the start
+  of this sprint (675 pre-existing + 89 web + prior sprint's 248 — some net additions from
+  wiring tests along the way).
+
+---
+
 ## Deliberately NOT done in this checkpoint (and why)
 
 These are honestly reported as **not implemented**, not "mostly done" or "mocked":

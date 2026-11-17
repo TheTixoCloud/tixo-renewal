@@ -229,7 +229,39 @@ def prune_expired_sessions(conn: sqlite3.Connection, now: datetime = None) -> in
     return cur.rowcount
 
 
-# ---------- CSRF tokens (per-session, double-submit pattern) ---------------------------------
+# ---------- CSRF tokens (derived from the session token + a server secret -- stateless,
+# never stored per-session, so a GET page render can always compute the exact value a
+# following POST must present without any extra DB lookup/table) -----------------------------
+
+def csrf_secret_path(config_dir: str) -> str:
+    return os.path.join(config_dir, "web", "csrf_secret.key")
+
+
+def get_or_create_csrf_secret(config_dir: str) -> str:
+    path = csrf_secret_path(config_dir)
+    if os.path.exists(path):
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        if mode & 0o077:
+            raise WebAuthSecurityError(
+                f"{path} has insecure permissions ({oct(mode)}) -- expected 0600.")
+        return Path(path).read_text().strip()
+    Path(path).parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    value = secrets.token_hex(32)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(value)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    return value
+
+
+def derive_csrf_token(csrf_secret: str, session_token: str) -> str:
+    import hmac
+    import hashlib
+    return hmac.new(csrf_secret.encode("utf-8"), session_token.encode("utf-8"),
+                     hashlib.sha256).hexdigest()
+
 
 def generate_csrf_token() -> str:
     return secrets.token_hex(32)
