@@ -721,3 +721,35 @@ def test_format_bytes_human_decimal_units():
 def test_format_bits_per_sec_human():
     assert menu._format_bits_per_sec_human(12_500_000) == "100.00 Mbps"
     assert menu._format_bits_per_sec_human(125_000_000) == "1.00 Gbps"
+
+
+# ---------- v1.8.0: exhausted-bandwidth policy menu wiring -----------------------------------
+
+def test_menu_items_includes_exhausted_bandwidth_policy_screens():
+    labels = [label for label, _ in menu.MENU_ITEMS]
+    assert "Configure exhausted-bandwidth policy" in labels
+    assert "Check exhausted VPS bandwidth" in labels
+    assert "Manual review queue" in labels
+    assert "Emergency grants (proposed)" in labels
+
+
+def test_action_check_exhausted_bandwidth_noop_when_policy_disabled(tmp_path, capsys):
+    menu.renewal_cli.CONFIG_DIR = str(tmp_path)
+    menu.renewal_cli.STATE_DIR = str(tmp_path)
+    menu.action_check_exhausted_bandwidth(menu.Style(enabled=False))
+    out = capsys.readouterr().out
+    assert "disabled" in out.lower()
+
+
+def test_action_view_manual_review_queue_empty_state(tmp_path, capsys):
+    menu.renewal_cli.STATE_DIR = str(tmp_path)
+    menu.action_view_manual_review_queue(menu.Style(enabled=False))
+    out = capsys.readouterr().out
+    assert "No pending manual-review items" in out
+
+
+def test_action_view_emergency_grants_empty_state(tmp_path, capsys):
+    menu.renewal_cli.STATE_DIR = str(tmp_path)
+    menu.action_view_emergency_grants(menu.Style(enabled=False))
+    out = capsys.readouterr().out
+    assert "No proposed emergency grants" in out

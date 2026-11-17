@@ -38,6 +38,7 @@ import virtualizor_info as vinfo
 import hostnet
 import hostnet_sync
 import traffic_analytics
+import emergency_policy as emp
 
 GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/TheTixoCloud/tixo-renewal/releases/latest"
 DEFAULT_DISPLAY_TZ = "Asia/Tehran"
@@ -1582,6 +1583,133 @@ def action_view_traffic_analytics(style: Style):
     print(render_traffic_analytics_report(bundle, style, display_tz=tz))
 
 
+def _emergency_policy_db_path() -> str:
+    return os.path.join(renewal_cli.STATE_DIR, "emergency_policy.sqlite3")
+
+
+def action_configure_exhausted_bandwidth_policy(style: Style):
+    """Configures the v1.8.0 exhausted-bandwidth-with-no-grant-due policy (see
+    emergency_policy.py). SAFETY: this ONLY writes a local settings file read by the
+    (separately invoked, read-only-toward-Virtualizor) 'Check exhausted VPS bandwidth'
+    action below -- it never itself changes a customer quota, and the default remains
+    DISABLED (identical to pre-v1.8.0 behavior) until the operator explicitly changes it
+    here."""
+    current = emp.load_policy_settings(renewal_cli.CONFIG_DIR)
+    print(f"Current mode: {current.mode}")
+    if current.mode == emp.MODE_EMERGENCY_GRANT:
+        print(f"  Emergency grant amount: {current.emergency_grant_amount_gb} GB")
+        print(f"  Cooldown: {current.cooldown_hours} hours")
+        print(f"  Max grants/month: {current.max_grants_per_month}")
+    print(f"\nModes: [{emp.MODE_DISABLED}] no automatic action (default/current pre-v1.8.0 "
+          f"behavior), [{emp.MODE_EMERGENCY_GRANT}] propose a small rate-limited top-up, "
+          f"[{emp.MODE_MANUAL_REVIEW}] queue for human review, never auto-grant.")
+    raw_mode = input(f"New mode [{current.mode}]: ").strip() or current.mode
+    kwargs = {"mode": raw_mode}
+    if raw_mode == emp.MODE_EMERGENCY_GRANT:
+        amount_raw = input(f"Emergency grant amount in GB "
+                            f"[{current.emergency_grant_amount_gb}]: ").strip()
+        cooldown_raw = input(f"Cooldown hours between grants for the same VPS "
+                              f"[{current.cooldown_hours}]: ").strip()
+        max_raw = input(f"Maximum grants per VPS per calendar month "
+                         f"[{current.max_grants_per_month}]: ").strip()
+        kwargs["emergency_grant_amount_gb"] = Decimal(amount_raw) if amount_raw else current.emergency_grant_amount_gb
+        kwargs["cooldown_hours"] = int(cooldown_raw) if cooldown_raw else current.cooldown_hours
+        kwargs["max_grants_per_month"] = int(max_raw) if max_raw else current.max_grants_per_month
+    try:
+        new_policy = emp.ExhaustedBandwidthPolicy(**kwargs)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+    if not _confirm(f"Save exhausted-bandwidth policy as mode={new_policy.mode}?"):
+        print("Cancelled.")
+        return
+    emp.save_policy_settings(renewal_cli.CONFIG_DIR, new_policy)
+    print(f"Saved. Mode is now: {new_policy.mode}. This does NOT retroactively apply to any "
+          f"already-queued review or already-proposed grant, and does NOT itself change any "
+          f"customer quota -- see 'Check exhausted VPS bandwidth' to evaluate the current "
+          f"fleet against this policy.")
+
+
+def action_check_exhausted_bandwidth(style: Style):
+    """Evaluates every VPS in the EXISTING, already-synced local inventory cache (inv.
+    latest_records -- populated by the regular, independent inventory-sync timer; this
+    action makes NO Virtualizor API call of its own) against the configured exhausted-
+    bandwidth policy. Writes only to emergency_policy.sqlite3 (a local decision-tracking
+    database, separate from both the renewal ledger and the inventory cache) -- never a
+    customer quota."""
+    policy = emp.load_policy_settings(renewal_cli.CONFIG_DIR)
+    if policy.mode == emp.MODE_DISABLED:
+        print(f"{style.GRAY}Exhausted-bandwidth policy is disabled -- nothing to check. "
+              f"Use 'Configure exhausted-bandwidth policy' to enable it.{style.RESET}")
+        return
+    conn_inv = inv.open_db(os.path.join(renewal_cli.STATE_DIR, "inventory.sqlite3"))
+    records = inv.latest_records(conn_inv, "self")
+    if not records:
+        print(f"{style.YELLOW}No inventory records available yet -- run an inventory sync "
+              f"first.{style.RESET}")
+        return
+    conn_ep = emp.open_db(_emergency_policy_db_path())
+    counts = {}
+    for r in records:
+        result = emp.evaluate_exhaustion(conn_ep, r["vpsid"], r.get("quota_gb"), r.get("used_gb"), policy)
+        counts[result["result"]] = counts.get(result["result"], 0) + 1
+        if result["result"] in (emp.RESULT_GRANT_PROPOSED, emp.RESULT_QUEUED_FOR_REVIEW):
+            print(f"  VPS {r['vpsid']} ({r.get('hostname')}): {result['result']}")
+    print(f"\nChecked {len(records)} VPS record(s) against mode={policy.mode}.")
+    for label, count in sorted(counts.items()):
+        print(f"  {label}: {count}")
+
+
+def action_view_manual_review_queue(style: Style):
+    conn = emp.open_db(_emergency_policy_db_path())
+    pending = emp.list_pending_reviews(conn)
+    tz = load_display_tz(renewal_cli.CONFIG_DIR)
+    if not pending:
+        print(f"{style.GRAY}No pending manual-review items.{style.RESET}")
+        return
+    for item in pending:
+        print(f"  [{item['id']}] VPS {item['vpsid']} -- {item['status']} -- "
+              f"detected {format_local_time(item['detected_at'], tz)}")
+        print(f"      Reason: {item['reason']}")
+    choice = input("\nEnter an id to acknowledge/resolve, or blank to go back: ").strip()
+    if not choice:
+        return
+    try:
+        review_id = int(choice)
+    except ValueError:
+        print("Invalid id.")
+        return
+    action = input("[a]cknowledge or [r]esolve? ").strip().lower()
+    if action == "a":
+        who = input("Your admin identifier: ").strip() or "unknown"
+        emp.acknowledge_review(conn, review_id, acknowledged_by=who)
+        print("Acknowledged.")
+    elif action == "r":
+        notes = input("Resolution notes: ").strip()
+        emp.resolve_review(conn, review_id, resolution_notes=notes)
+        print("Resolved.")
+    else:
+        print("Cancelled.")
+
+
+def action_view_emergency_grants(style: Style):
+    """Read-only view of PROPOSED emergency grants -- deliberately does NOT offer an
+    'apply' action here: actually applying a grant to a live customer quota must go through
+    writer.py's existing WRITE_APPROVED-gated, idempotent apply path (not yet wired to this
+    feature, see docs/DEVELOPMENT_PROGRESS.md), never a shortcut from this review screen."""
+    conn = emp.open_db(_emergency_policy_db_path())
+    proposed = emp.list_proposed_grants(conn)
+    tz = load_display_tz(renewal_cli.CONFIG_DIR)
+    if not proposed:
+        print(f"{style.GRAY}No proposed emergency grants.{style.RESET}")
+        return
+    for item in proposed:
+        print(f"  [{item['id']}] VPS {item['vpsid']} -- {item['amount_gb']} GB -- "
+              f"detected {format_local_time(item['detected_at'], tz)}")
+    print(f"\n{style.GRAY}These are PROPOSED only -- applying them to a live quota is not "
+          f"yet wired into this menu (see docs/DEVELOPMENT_PROGRESS.md).{style.RESET}")
+
+
 MENU_ITEMS = [
     ("Install / Initial Setup", action_install),
     ("Dashboard", None),  # needs style, wired specially below
@@ -1602,6 +1730,10 @@ MENU_ITEMS = [
     ("Configure host network monitoring interface", action_configure_hostnet_interface),
     ("Host network traffic (live)", None),  # needs style, wired specially below
     ("Host network traffic analytics (historical)", None),  # needs style, wired specially below
+    ("Configure exhausted-bandwidth policy", None),  # needs style, wired specially below
+    ("Check exhausted VPS bandwidth", None),  # needs style, wired specially below
+    ("Manual review queue", None),  # needs style, wired specially below
+    ("Emergency grants (proposed)", None),  # needs style, wired specially below
     ("Enable automatic renewal", lambda: action_toggle_auto_renewal(True)),
     ("Disable automatic renewal", lambda: action_toggle_auto_renewal(False)),
     ("View logs and renewal history", action_view_logs),
@@ -1672,6 +1804,14 @@ def run_menu():
                     action_view_hostnet(style)
                 elif label == "Host network traffic analytics (historical)":
                     action_view_traffic_analytics(style)
+                elif label == "Configure exhausted-bandwidth policy":
+                    action_configure_exhausted_bandwidth_policy(style)
+                elif label == "Check exhausted VPS bandwidth":
+                    action_check_exhausted_bandwidth(style)
+                elif label == "Manual review queue":
+                    action_view_manual_review_queue(style)
+                elif label == "Emergency grants (proposed)":
+                    action_view_emergency_grants(style)
                 else:
                     fn()
             except Exception as e:
