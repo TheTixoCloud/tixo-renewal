@@ -197,7 +197,8 @@ def test_install_generates_all_three_unit_pairs_including_notifier(cli_env):
                  "virt-renewal-apply.service", "virt-renewal-apply.timer",
                  "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
                  "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer",
-                 "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer"):
+                 "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer",
+                 "virt-renewal-telegram-bot.service"):
         assert os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, name)), f"missing {name}"
     notifier_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
                                           "virt-renewal-readiness-notifier.service")).read_text()
@@ -219,7 +220,8 @@ def test_uninstall_removes_all_three_unit_pairs_not_just_monitor(cli_env):
                  "virt-renewal-apply.service", "virt-renewal-apply.timer",
                  "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
                  "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer",
-                 "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer"):
+                 "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer",
+                 "virt-renewal-telegram-bot.service"):
         assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, name)), f"{name} still present"
     # Data must still survive a non-purge uninstall.
     assert os.path.exists(os.path.join(cli_env["state_dir"], "test-node.sqlite3"))
@@ -1149,3 +1151,17 @@ def test_cmd_hostnet_suggest_never_saves_anything(cli_env, capsys):
     settings = hns_mod.load_settings(renewal_cli.CONFIG_DIR)
     assert settings["interface"] is None  # suggest never configures
     assert "auto_selected=" in capsys.readouterr().out
+
+
+def test_telegram_bot_unit_is_simple_restart_always_not_a_timer(cli_env):
+    """REGRESSION guard: this unit is a persistent long-poll process, not a periodic task --
+    it must be Type=simple/Restart=always and have NO corresponding .timer file, unlike
+    every other generated unit pair."""
+    renewal_cli.cmd_install(argparse_namespace())
+    content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
+                                 "virt-renewal-telegram-bot.service")).read_text()
+    assert "Type=simple" in content
+    assert "Restart=always" in content
+    assert "telegram-bot-run" in content
+    assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
+                                            "virt-renewal-telegram-bot.timer"))

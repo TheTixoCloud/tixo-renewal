@@ -239,6 +239,31 @@ Unit=virt-renewal-hostnet-sync.service
 WantedBy=timers.target
 """
 
+# UNLIKE every other unit above, this is Type=simple/Restart=always, not a timer-triggered
+# oneshot -- it holds a persistent long-poll connection to Telegram (see
+# telegram_bot.run_polling_loop), so a periodic timer would be the wrong shape entirely.
+# Generated-but-never-installed/enabled, exactly like every other unit here -- the bot
+# itself also independently refuses to start unless explicitly enabled via the menu's
+# "Configure Telegram bot" screen, so installing this unit alone does not activate anything.
+TELEGRAM_BOT_SERVICE_UNIT_TEMPLATE = """[Unit]
+Description=TixoCloud Telegram bot (long-polling; optional -- also requires enabling via the menu)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=10
+Environment=PYTHONPATH={libdir}
+Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
+ExecStart={python} {cli} telegram-bot-run
+WorkingDirectory={workdir}
+User={user}
+
+[Install]
+WantedBy=multi-user.target
+"""
+
 
 # ---------- install ----------
 
@@ -314,6 +339,13 @@ def write_systemd_units(monitor_interval_min: int = DEFAULT_MONITOR_INTERVAL_MIN
                                               libdir=lib_dir))
     Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-hostnet-sync.timer")).write_text(
         HOSTNET_TIMER_UNIT_TEMPLATE.format(interval=hostnet_interval_min))
+
+    # No .timer counterpart -- see TELEGRAM_BOT_SERVICE_UNIT_TEMPLATE's docstring-comment:
+    # this is a persistent long-poll process, not a periodic task.
+    Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-telegram-bot.service")).write_text(
+        TELEGRAM_BOT_SERVICE_UNIT_TEMPLATE.format(python=python_path, cli=cli_path,
+                                                   workdir=os.path.abspath(WORKSPACE_ROOT),
+                                                   user=user, libdir=lib_dir))
 
 
 def cmd_install(args):
@@ -613,6 +645,7 @@ UNINSTALL_UNIT_NAMES = (
     "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
     "virt-renewal-inventory-sync.service", "virt-renewal-inventory-sync.timer",
     "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer",
+    "virt-renewal-telegram-bot.service",
 )
 
 
@@ -624,8 +657,8 @@ def cmd_uninstall(args):
     print("Local systemd unit files removed from", SYSTEMD_OUT_DIR)
     print("If any were installed system-wide, also run (as root, your own explicit action --")
     print("the apply timer is write-capable, disable it FIRST if it was ever enabled):")
-    print("  sudo systemctl disable --now virt-renewal-apply.timer virt-renewal-monitor.timer virt-renewal-readiness-notifier.timer virt-renewal-inventory-sync.timer")
-    print("  sudo rm /etc/systemd/system/virt-renewal-{apply,monitor,readiness-notifier,inventory-sync}.{service,timer}")
+    print("  sudo systemctl disable --now virt-renewal-apply.timer virt-renewal-monitor.timer virt-renewal-readiness-notifier.timer virt-renewal-inventory-sync.timer virt-renewal-telegram-bot.service")
+    print("  sudo rm /etc/systemd/system/virt-renewal-{apply,monitor,readiness-notifier,inventory-sync}.{service,timer} /etc/systemd/system/virt-renewal-telegram-bot.service")
     print("  sudo systemctl daemon-reload")
     print("  rm -f " + WRITE_APPROVAL_MARKER + "  # belt-and-suspenders: ensure no write capability survives uninstall")
     if args.purge:
