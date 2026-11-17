@@ -141,13 +141,56 @@ bumped" below).
 - **Tests:** `tests/test_security.py` (23 tests) + `tests/test_control_center_api.py`
   (12 tests).
 
+### 5. Telegram bot: Direct + SOCKS5 transports, command dispatch — DONE (this checkpoint)
+*(relay transport: signing/verification protocol done and tested; the separate relay WORKER
+process is not — see "Deliberately NOT done" below)*
+- **Files:** `implementation/telegram_transport.py`, `implementation/telegram_config.py`,
+  `implementation/telegram_bot.py` (all new), zero third-party dependency (pure stdlib
+  `urllib`/`socket`/`ssl`, matching `writer.py`'s own existing convention for talking to
+  Virtualizor).
+- **DirectTransport** (default): real HTTPS to `api.telegram.org`, token redacted from every
+  exception message (same discipline as `writer.py`'s credential redaction).
+- **Socks5Transport**: a REAL, from-scratch SOCKS5 CONNECT handshake (RFC 1928, with RFC
+  1929 username/password sub-negotiation) over a raw socket, then TLS + a minimal hand-built
+  HTTP/1.1 request/response — no third-party SOCKS library. **Tested against a real local
+  SOCKS5-speaking TCP test server** (not a mock of the handshake) — this caught a real bug
+  in the test server itself (a malformed greeting-read that caused a handshake deadlock),
+  fixed before any of this touched real code.
+- **Relay mode**: `sign_relay_request`/`verify_relay_request` implement an HMAC-signed,
+  replay-resistant, timestamp-bounded envelope scheme for the Iran host to hand outgoing
+  requests to a separate relay worker and verify what comes back — fully implemented and
+  tested (tamper detection, replay rejection via a caller-supplied seen-nonce set, expiry).
+  **`telegram_bot.build_transport()` deliberately refuses to construct a direct-network
+  transport object for RELAY mode at all** — there is no code path by which relay mode could
+  silently fall back to talking to Telegram directly.
+- **telegram_config.py**: secrets (bot token, SOCKS5 password, relay shared secret) use
+  `credentials.py`'s exact 0600-enforced storage discipline (atomic write, permission check
+  on read, fails closed on loose permissions). Settings (admin/viewer IDs, connectivity
+  mode, report schedule) default to `enabled=False`, `connectivity_mode=DIRECT` — the
+  mission's required defaults — and fall back to those same defaults on any read error.
+- **telegram_bot.py**: `process_update()` is the pure, network-independent dispatch core --
+  parses a Telegram update dict, enforces rate limiting (`security.check_rate_limit`, per
+  numeric user ID) BEFORE any command logic runs, enforces numeric-ID-only authorization
+  (`security.is_authorized_telegram_id` — a dedicated test confirms a spoofed/matching
+  `username` field can never substitute for a real admin ID), then dispatches to one of 10
+  command handlers, ALL built on `control_center_api.py` (never re-deriving business logic).
+  `/reports` and `/backup` report themselves as not-yet-implemented rather than fabricating
+  a status. Every handler is wrapped so one bad update can never crash the dispatch loop.
+- Wired into the CLI as "Configure Telegram bot (optional)" — sets mode/admins/secrets,
+  never starts a bot process, offers an explicit opt-in connectivity test (a real `getMe`
+  call) before saving anything live.
+- **Tests:** `tests/test_telegram_transport.py` (17, including the real local SOCKS5
+  server), `tests/test_telegram_config.py` (14), `tests/test_telegram_bot.py` (27) + 1 CLI
+  wiring test in `tests/test_menu.py`.
+
 ### Combined test count
 - Pre-existing (as of v1.7.3): 675 passing.
-- New this session: 101, across `tests/test_traffic_analytics.py`,
+- New this session: 158, across `tests/test_traffic_analytics.py`,
   `tests/test_emergency_policy.py`, `tests/test_security.py`,
-  `tests/test_control_center_api.py`, and several new cases added to
-  `tests/test_menu.py` for CLI wiring.
-- **Total: 776 passing** (verified by running the full suite), no skips, no mocked-away
+  `tests/test_control_center_api.py`, `tests/test_telegram_transport.py`,
+  `tests/test_telegram_config.py`, `tests/test_telegram_bot.py`, and several new cases added
+  to `tests/test_menu.py` for CLI wiring.
+- **Total: 833 passing** (verified by running the full suite), no skips, no mocked-away
   failures.
 
 ---
@@ -156,13 +199,19 @@ bumped" below).
 
 These are honestly reported as **not implemented**, not "mostly done" or "mocked":
 
-- **Telegram bot (all 3 connectivity modes).** Not started. This is a substantial, separate
-  subsystem (bot command handling, direct/SOCKS5/relay transport, multi-admin RBAC, scheduled
-  reports, encrypted backup delivery) — genuinely weeks of work, not something safely
-  approximated in this session. No stub, no placeholder menu entry was added, to avoid
-  implying partial completion.
+- **The Telegram long-polling loop / systemd service.** `process_update()` is fully
+  implemented and tested, but nothing yet calls Telegram's `getUpdates` in a loop and feeds
+  results to it — there is no running bot process, no systemd unit for it, and no
+  `renewal_cli.py` subcommand to start one. This is explicitly the next step (see below).
+- **The relay worker process.** The signing/verification *protocol* (`sign_relay_request`/
+  `verify_relay_request`) is done and tested; the actual second program meant to run on an
+  external VPS (receiving signed envelopes, calling Telegram, signing results back) does not
+  exist, and there is no second host available this session to validate an end-to-end
+  two-host integration even if it did.
+- **Scheduled reports and backup delivery.** `/reports` and `/backup` commands exist and
+  correctly report "not yet implemented" rather than fabricating output.
 - **Web dashboard (backend + frontend, all 17 pages, SSE/WebSocket live updates, auth/RBAC,
-  TLS).** Not started, for the same reason.
+  TLS).** Not started.
 - **Remote management/agent mode.** Not started.
 - **Unified installer (interactive + noninteractive, module install/upgrade/repair/
   reconfigure/disable/uninstall for Web/Telegram/remote-agent).** Not started — the existing
@@ -188,19 +237,22 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
 
 ## Exact next steps (in priority order, matching the mission's own ordering)
 
-1. Telegram bot: start with Direct mode only, built directly on `control_center_api.py` +
-   `security.is_authorized_telegram_id`/`check_rate_limit` (both already implemented and
-   tested) — `/status` and `/traffic` commands first, before attempting SOCKS5/relay
-   transports. **This is the current next step.**
+1. Build the actual Telegram long-polling loop: a `renewal_cli.py` subcommand (e.g.
+   `telegram-bot-run`) that calls `getUpdates` in a loop via `telegram_bot.build_transport()`
+   and feeds each update to `telegram_bot.process_update()`, sending back any `reply` via
+   the same transport's `call("sendMessage", ...)`. Needs an `offset` cursor persisted
+   somewhere (a new tiny SQLite table or a settings-file field) so a restart doesn't
+   re-deliver old updates. Not yet done. **This is the current next step.**
 2. Extend `renewal_cli.py`'s `dry-run`/`apply-due` commands (or add a parallel
    `check-exhausted`/`apply-emergency-grants` pair) so the exhausted-bandwidth check and
    (approved) auto-apply can run on the existing systemd timer cadence, not just
    interactively from the menu. Not yet done.
 3. Reporting/alerts/backup scheduling (builds on `control_center_api.get_full_snapshot` for
-   report content).
-4. Web dashboard backend (reusing `control_center_api.py` + `security.py` directly), then
+   report content, and the now-working Telegram transports for delivery).
+4. The relay worker process + an end-to-end two-host validation (needs a second host).
+5. Web dashboard backend (reusing `control_center_api.py` + `security.py` directly), then
    frontend.
-5. Local + remote install modes, then the unified installer.
+6. Local + remote install modes, then the unified installer.
 
 ## Known limitations of what WAS built
 

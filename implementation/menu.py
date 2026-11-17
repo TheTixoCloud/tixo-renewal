@@ -39,6 +39,7 @@ import hostnet
 import hostnet_sync
 import traffic_analytics
 import emergency_policy as emp
+import telegram_config as tgc
 
 GITHUB_API_LATEST_RELEASE = "https://api.github.com/repos/TheTixoCloud/tixo-renewal/releases/latest"
 DEFAULT_DISPLAY_TZ = "Asia/Tehran"
@@ -1762,6 +1763,92 @@ def action_view_emergency_grants(style: Style):
               f"`resolve-operation` if a ledger operation was created but is stuck.{style.RESET}")
 
 
+def action_configure_telegram_bot(style: Style):
+    """Configures the optional Telegram bot (v1.8.0 Part 3) -- DISABLED and DIRECT mode by
+    default, exactly matching the required defaults. This action only writes local settings/
+    secrets files; it never starts a bot process (the long-polling loop is not yet
+    implemented, see docs/DEVELOPMENT_PROGRESS.md) and never sends a real Telegram message
+    unless the operator explicitly runs the connectivity test below."""
+    import telegram_bot as tbot
+    settings = tgc.load_telegram_settings(renewal_cli.CONFIG_DIR)
+    print(f"Enabled: {settings.enabled}")
+    print(f"Connectivity mode: {settings.connectivity_mode}")
+    print(f"Admins: {settings.admin_ids}  Viewers: {settings.viewer_ids}")
+
+    raw_mode = input(f"Connectivity mode [{settings.connectivity_mode}] "
+                      f"({'/'.join(tgc.VALID_CONNECTIVITY_MODES)}): ").strip() or settings.connectivity_mode
+    admin_raw = input(f"Admin numeric Telegram IDs, comma-separated "
+                       f"[{','.join(str(i) for i in settings.admin_ids)}]: ").strip()
+    viewer_raw = input(f"Viewer numeric Telegram IDs, comma-separated "
+                        f"[{','.join(str(i) for i in settings.viewer_ids)}]: ").strip()
+    try:
+        admin_ids = [int(x) for x in admin_raw.split(",") if x.strip()] if admin_raw else settings.admin_ids
+        viewer_ids = [int(x) for x in viewer_raw.split(",") if x.strip()] if viewer_raw else settings.viewer_ids
+    except ValueError:
+        print("Rejected: admin/viewer IDs must be numeric Telegram user IDs, never usernames.")
+        return
+
+    kwargs = dict(connectivity_mode=raw_mode, admin_ids=admin_ids, viewer_ids=viewer_ids,
+                  enabled=settings.enabled, socks5_host=settings.socks5_host,
+                  socks5_port=settings.socks5_port, socks5_username=settings.socks5_username,
+                  relay_host=settings.relay_host, report_hour=settings.report_hour,
+                  report_minute=settings.report_minute, report_timezone=settings.report_timezone)
+    if raw_mode == tgc.MODE_SOCKS5:
+        kwargs["socks5_host"] = input(f"SOCKS5 proxy host [{settings.socks5_host or ''}]: ").strip() \
+            or settings.socks5_host
+        port_raw = input(f"SOCKS5 proxy port [{settings.socks5_port or ''}]: ").strip()
+        kwargs["socks5_port"] = int(port_raw) if port_raw else settings.socks5_port
+        kwargs["socks5_username"] = input(f"SOCKS5 username (blank for none) "
+                                           f"[{settings.socks5_username or ''}]: ").strip() \
+            or settings.socks5_username
+    elif raw_mode == tgc.MODE_RELAY:
+        kwargs["relay_host"] = input(f"Relay worker host/URL [{settings.relay_host or ''}]: ").strip() \
+            or settings.relay_host
+        print(f"{style.YELLOW}NOTE: the relay WORKER itself is not yet implemented -- this only "
+              f"records the configured relay host for when it is (see "
+              f"docs/DEVELOPMENT_PROGRESS.md).{style.RESET}")
+
+    try:
+        new_settings = tgc.TelegramSettings(**kwargs)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+
+    enable_raw = input(f"Enable the bot module now? [y/N] (enabled={settings.enabled}): ").strip().lower()
+    new_settings.enabled = enable_raw == "y"
+
+    import getpass
+    secrets_path = tgc.default_secrets_path(renewal_cli.CONFIG_DIR)
+    set_token = input("Set/update the bot token now? [y/N]: ").strip().lower() == "y"
+    if set_token:
+        token = getpass.getpass("Bot token (never echoed, never stored in plain settings): ")
+        socks5_password = None
+        if new_settings.connectivity_mode == tgc.MODE_SOCKS5 and new_settings.socks5_username:
+            socks5_password = getpass.getpass("SOCKS5 proxy password: ")
+        tgc.store_telegram_secrets(secrets_path, bot_token=token, socks5_password=socks5_password)
+        print(f"Secrets stored at {secrets_path} (0600 permissions).")
+
+    if not _confirm("Save these Telegram bot settings?"):
+        print("Cancelled.")
+        return
+    tgc.save_telegram_settings(renewal_cli.CONFIG_DIR, new_settings)
+    print("Saved.")
+
+    if _confirm("Run a connectivity test now? (sends a real getMe call to Telegram)"):
+        try:
+            secrets = tgc.load_telegram_secrets(secrets_path)
+        except (FileNotFoundError, tgc.TelegramConfigSecurityError) as e:
+            print(f"Cannot test: {e}")
+            return
+        try:
+            transport = tbot.build_transport(new_settings, secrets)
+        except ValueError as e:
+            print(f"Cannot build transport: {e}")
+            return
+        result = tbot.test_transport_connectivity(transport)
+        print(f"Connectivity test: {'OK' if result['ok'] else 'FAILED'} -- {result['detail']}")
+
+
 MENU_ITEMS = [
     ("Install / Initial Setup", action_install),
     ("Dashboard", None),  # needs style, wired specially below
@@ -1786,6 +1873,7 @@ MENU_ITEMS = [
     ("Check exhausted VPS bandwidth", None),  # needs style, wired specially below
     ("Manual review queue", None),  # needs style, wired specially below
     ("Emergency grants (proposed)", None),  # needs style, wired specially below
+    ("Configure Telegram bot (optional)", None),  # needs style, wired specially below
     ("Enable automatic renewal", lambda: action_toggle_auto_renewal(True)),
     ("Disable automatic renewal", lambda: action_toggle_auto_renewal(False)),
     ("View logs and renewal history", action_view_logs),
@@ -1864,6 +1952,8 @@ def run_menu():
                     action_view_manual_review_queue(style)
                 elif label == "Emergency grants (proposed)":
                     action_view_emergency_grants(style)
+                elif label == "Configure Telegram bot (optional)":
+                    action_configure_telegram_bot(style)
                 else:
                     fn()
             except Exception as e:
