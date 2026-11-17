@@ -615,6 +615,54 @@ def cmd_backup(args):
         print(f"{node.node_id}: backed up -> {dest}")
 
 
+def cmd_backup_full(args):
+    """Builds one archived, integrity-verified, retention-pruned backup covering all known
+    state databases plus allowlisted non-secret config (see backup.py). Optional --encrypt
+    passphrase is read from the TIXO_BACKUP_PASSPHRASE env var, never a CLI argument (which
+    `ps` could reveal). Every action is recorded to the audit log."""
+    import audit_log as alog
+
+    archive = backup_mod.create_full_backup_archive(STATE_DIR, CONFIG_DIR, BACKUP_DIR,
+                                                      label=args.label)
+    verification = backup_mod.verify_backup_archive(archive)
+    if not verification["ok"]:
+        print(f"WARNING: backup archive failed integrity verification: {verification}")
+
+    final_path = archive
+    if args.encrypt:
+        passphrase = os.environ.get("TIXO_BACKUP_PASSPHRASE")
+        if not passphrase:
+            print("ERROR: --encrypt requires TIXO_BACKUP_PASSPHRASE to be set in the "
+                  "environment (never pass a passphrase as a CLI argument).")
+            return 1
+        try:
+            final_path = backup_mod.encrypt_backup_file(archive, passphrase)
+        except backup_mod.BackupEncryptionUnavailable as exc:
+            print(f"ERROR: {exc}")
+            return 1
+        os.remove(archive)
+
+    removed = []
+    if args.keep:
+        removed = backup_mod.apply_retention(BACKUP_DIR, keep_count=args.keep)
+
+    conn = alog.open_db(os.path.join(STATE_DIR, "audit_log.sqlite3"))
+    try:
+        alog.record_event(conn, actor="cli", action="backup_full_created",
+                           detail=f"archive={os.path.basename(final_path)} "
+                                  f"encrypted={args.encrypt} integrity_ok={verification['ok']} "
+                                  f"retention_removed={len(removed)}",
+                           remote_addr="local")
+    finally:
+        conn.close()
+
+    print(f"Backup archive created: {final_path}")
+    print(f"Integrity: {'ok' if verification['ok'] else verification}")
+    if removed:
+        print(f"Retention removed {len(removed)} older archive(s): {removed}")
+    return 0 if verification["ok"] else 1
+
+
 def cmd_rollback(args):
     if not args.backup_file:
         print("Available backups:")
@@ -1335,6 +1383,12 @@ def main():
     sub.add_parser("dry-run").set_defaults(func=cmd_dry_run)
     sub.add_parser("verify").set_defaults(func=cmd_verify)
     sub.add_parser("backup").set_defaults(func=cmd_backup)
+
+    backup_full_p = sub.add_parser("backup-full")
+    backup_full_p.add_argument("--label")
+    backup_full_p.add_argument("--encrypt", action="store_true")
+    backup_full_p.add_argument("--keep", type=int, default=None)
+    backup_full_p.set_defaults(func=cmd_backup_full)
 
     rollback_p = sub.add_parser("rollback")
     rollback_p.add_argument("--node")

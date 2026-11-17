@@ -324,7 +324,7 @@ socket-free core; `TixoRequestHandler`/`run_server_in_thread` the thin real-sock
 
 - **All 16 pages render with real data**, wired to `control_center_api.py` /
   `emergency_policy.py` / `reports.py` / `host_time.py` / `menu.py` — never fabricated.
-  Backups page honestly says "not yet implemented" (true — no backup module exists yet).
+  Backups page now creates/lists real archives (see section 11 below).
   Telegram Settings page is read-only (editing stays in the CLI menu, to limit scope).
 - **Auth:** session-cookie login, server-side SQLite sessions, login rate limiting
   (reuses `security.py`), RBAC (`admin` vs `viewer`) enforced on every mutating route.
@@ -349,10 +349,56 @@ socket-free core; `TixoRequestHandler`/`run_server_in_thread` the thin real-sock
 - **Tests:** `tests/test_web_auth.py` (34), `tests/test_web_config.py` (7),
   `tests/test_audit_log.py` (4), `tests/test_web_server.py` (44) = **89 new tests**.
 
+### 11. Secure backup functionality — DONE (archive, retention, GPG encryption, safe restore)
+Extends the pre-existing `implementation/backup.py` (per-node `backup_db`/`list_backups`/
+`restore_db`, unchanged) rather than duplicating it:
+
+- **`create_full_backup_archive(state_dir, config_dir, backup_root, label=None)`** — bundles
+  consistent `Connection.backup()` snapshots of every known state DB (`inventory.sqlite3`,
+  `hostnet.sqlite3`, `emergency_policy.sqlite3`, `self.sqlite3`) plus a deliberately
+  **ALLOWLISTED** (never blocklisted) set of non-secret config files (`policy.json`,
+  `nodes.json`, `display-settings.json`, `hostnet-settings.json`,
+  `emergency-policy-settings.json`, `telegram/settings.json`, `web/settings.json`) into one
+  `tar.gz`. `credentials/`, `telegram/secrets.json`, `web/users.json`, `web/csrf_secret.key`
+  are never read, regardless of future config additions — verified by
+  `test_create_full_backup_archive_never_includes_secrets` and the Web-UI-level
+  `test_backups_page_never_exposes_secret_files`.
+- **`verify_backup_archive(path)`** — tar readability + `PRAGMA integrity_check` on every
+  bundled `.sqlite3`; corruption is detected (test deliberately corrupts DB bytes and confirms
+  `ok: False`).
+- **`apply_retention(backup_root, keep_count)`** — deletes all but the N most recent archives.
+- **`encrypt_backup_file`/`decrypt_backup_file`** — symmetric AES256 via the system `gpg`/
+  `gpg2` binary (confirmed present on this host), passphrase piped over **stdin**
+  (`--passphrase-fd 0`), never a CLI argument `ps` could reveal. Raises
+  `BackupEncryptionUnavailable` with a clear message if neither binary exists, rather than
+  silently writing an unencrypted file when encryption was requested. No cryptography is
+  hand-rolled.
+- **`restore_full_backup_archive(archive_path, staging_dir)`** — extracts to a staging
+  directory ONLY; verifies integrity first and refuses a failed archive; never overwrites
+  live `state_dir`/`config_dir` files itself (that remains a deliberate, separate, manual
+  step for an operator).
+- **CLI:** `renewal_cli.py backup-full [--label L] [--encrypt] [--keep N]` — encryption
+  passphrase must come from the `TIXO_BACKUP_PASSPHRASE` env var (refuses with a clear error
+  if unset, rather than silently skipping encryption); records a `backup_full_created` audit
+  event via `audit_log.py` every time.
+- **Web UI:** `/backups` page replaced its former placeholder — admin+CSRF-gated "Create
+  backup now" button (calls the same `create_full_backup_archive`/`verify_backup_archive`),
+  lists existing archives, records `backup_created` audit events, and documents that
+  encryption/retention/scheduling live in the CLI for now.
+- **Tests:** `tests/test_backup_archive.py` (16: archive contents, secret exclusion,
+  integrity verification incl. corruption detection, retention, GPG encrypt/decrypt
+  roundtrip, wrong-passphrase rejection, `BackupEncryptionUnavailable`, staging-only restore,
+  corrupt-archive refusal, and 4 CLI-level tests for `backup-full`) + 4 new tests appended to
+  `tests/test_web_server.py` (viewer blocked, admin creates + audited, page lists archives,
+  secrets never in the produced tarball) = **20 new tests**.
+- **NOT done:** no scheduling (cron/timer) for `backup-full` yet — it is a manual/CLI-only
+  trigger today, same category of follow-up as the systemd units already built for the
+  Telegram bot and (not yet) the Web server; no Telegram delivery of backup archives yet
+  (explicitly listed in the mission but not started this pass — see below).
+
 ### Combined test count
-- **Total: 1012 passing** (verified by running the full suite), up from 923 at the start
-  of this sprint (675 pre-existing + 89 web + prior sprint's 248 — some net additions from
-  wiring tests along the way).
+- **Total: 1032 passing** (verified by running the full suite), up from 1012 after the Web
+  Control Center milestone and 923 at the start of this sprint.
 
 ---
 
@@ -365,21 +411,18 @@ These are honestly reported as **not implemented**, not "mostly done" or "mocked
   external VPS (receiving signed envelopes, calling Telegram, signing results back) does not
   exist, and there is no second host available this session to validate an end-to-end
   two-host integration even if it did.
-- **Encrypted/scheduled backup delivery via Telegram.** The `/backup` command still
-  honestly reports "not yet implemented" — this is genuinely not built (no backup content
-  generation, no encryption, no delivery). Scheduled REPORTS, by contrast, ARE now done
-  (see section 7 below) — these were previously bundled together in this checkpoint's
-  wording but are different features at different states of completion.
-- **Web dashboard (backend + frontend, all 17 pages, SSE/WebSocket live updates, auth/RBAC,
-  TLS).** Not started.
+- **Secure Telegram delivery of backup archives.** `backup-full` and the Web `/backups` page
+  create/verify/encrypt/retain archives, but nothing yet sends one through the Telegram bot
+  transport. Explicitly listed in the mission's backup section but not started this pass —
+  next step would be a size-capped, admin-only, encrypted-only (never plaintext) send path
+  reusing `telegram_bot.build_transport` the same way `/reports` already does.
+- **Web dashboard TLS/certificate handling, reverse-proxy guidance.** Not started.
 - **Remote management/agent mode.** Not started.
 - **Unified installer (interactive + noninteractive, module install/upgrade/repair/
   reconfigure/disable/uninstall for Web/Telegram/remote-agent).** Not started — the existing
   `deploy/install.sh`/`deploy/bootstrap.sh` continue to work exactly as before (regression-
-  tested at 730/730); no new installer surface was added since there is nothing optional yet
-  to install.
-- **Encrypted off-host backups, audit logging for admin actions beyond what already exists,
-  rate limiting, TLS/cert handling.** Not started (these are mostly Web/Telegram-adjacent).
+  tested); no new installer surface was added since there is nothing optional yet to install
+  beyond what the menu's "Configure..." screens already cover.
 
 ---
 
@@ -407,13 +450,16 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
    requires the separate `EMERGENCY_GRANTS_APPROVED` marker and is only reachable
    interactively from the menu, never from a noninteractive command yet.
 3. ~~Reporting/alerts scheduling...~~ **DONE** (see section 7 above: `reports.py`,
-   checked per polling-loop iteration, no new timer). **Backup delivery is still not
-   done** — no backup content generation, no encryption, no delivery mechanism at all.
-   This is the current next step.
-4. The relay worker process + an end-to-end two-host validation (needs a second host).
-5. Web dashboard backend (reusing `control_center_api.py` + `security.py` directly), then
-   frontend.
-6. Local + remote install modes, then the unified installer.
+   checked per polling-loop iteration, no new timer).
+4. ~~Web dashboard (all pages, auth, CSRF, RBAC, audit, live monitoring)...~~ **DONE**
+   (see section 10 above).
+5. ~~Secure backup functionality (archive, retention, encryption, verified restore)...~~
+   **DONE** (see section 11 above). **Still open:** no scheduling/timer for `backup-full`
+   yet (manual/CLI-only trigger), and secure Telegram delivery of backup archives is not
+   wired up — this is the current next step for this feature area.
+6. The relay worker process + an end-to-end two-host validation (needs a second host).
+7. Remote management/agent mode, then the unified installer (local/remote mode, optional
+   component install/upgrade/repair/reconfigure/uninstall).
 
 ## Known limitations of what WAS built
 

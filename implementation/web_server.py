@@ -610,8 +610,48 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
 """
         return WebResponse(body=self._render_page("Telegram Settings", body, lang, theme, "telegram"))
 
+    def _backup_root(self) -> str:
+        return os.path.join(os.path.dirname(self.state_dir), "backups")
+
     def _page_backups(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
-        body = '<div class="card">Backup scheduling/encryption/restore is not yet implemented.</div>'
+        import backup as backup_mod
+        message = ""
+        backup_root = self._backup_root()
+        if method == "POST":
+            if not self._require_admin(user):
+                return self._forbidden("Admin role required.")
+            if not self._check_csrf(token, form.get("csrf_token")):
+                return self._forbidden("Invalid CSRF token.")
+            try:
+                archive = backup_mod.create_full_backup_archive(self.state_dir, self.config_dir,
+                                                                   backup_root)
+                verification = backup_mod.verify_backup_archive(archive)
+                self._audit(user.username, "backup_created",
+                            detail=f"archive={os.path.basename(archive)} "
+                                   f"integrity_ok={verification['ok']}",
+                            remote_addr=remote_addr)
+                message = (f'<p>Created: {_html_escape(os.path.basename(archive))} '
+                           f'(integrity: {"ok" if verification["ok"] else verification})</p>')
+            except Exception as e:
+                message = f"<p>Backup failed: {_html_escape(str(e))}</p>"
+
+        archives = backup_mod.list_backup_archives(backup_root)
+        rows = "".join(f"<tr><td>{_html_escape(a)}</td></tr>" for a in reversed(archives))
+        csrf = self._csrf_field(token)
+        admin_controls = (f'<form method="post">{csrf}'
+                           f'<button type="submit">Create backup now</button></form>'
+                           if self._require_admin(user) else "")
+        body = f"""
+<div class="card">{message}{admin_controls}
+<p class="muted">Archives bundle all known state databases plus non-secret config
+(never credentials, tokens, or password hashes). Encryption and scheduled/retention
+backups are available via the CLI: <code>renewal_cli.py backup-full --encrypt --keep N</code>
+(passphrase via the <code>TIXO_BACKUP_PASSPHRASE</code> environment variable, never a CLI
+argument). Restoration always extracts to a staging directory for manual review -- it never
+overwrites live data automatically.</p>
+<table><tr><th>Archive</th></tr>{rows or '<tr><td class="muted">No backups yet.</td></tr>'}</table>
+</div>
+"""
         return WebResponse(body=self._render_page("Backups", body, lang, theme, "backups"))
 
     def _page_settings(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:

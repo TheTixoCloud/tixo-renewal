@@ -371,3 +371,70 @@ def test_menu_items_includes_web_control_center_config():
     import menu
     labels = [label for label, _ in menu.MENU_ITEMS]
     assert "Configure Web Control Center (optional)" in labels
+
+
+# ---------- backups page: real archive creation, audit, RBAC -----------------------------------
+
+def test_viewer_cannot_create_backup_via_web(tmp_path):
+    config_dir, state_dir = _dirs(tmp_path)
+    wa.create_user(config_dir, "viewer1", "pw123456", role=wa.ROLE_VIEWER)
+    app = ws.WebApp(config_dir, state_dir)
+    cookies, token = _login(app, "viewer1", "pw123456")
+    secret = wa.get_or_create_csrf_secret(config_dir)
+    csrf = wa.derive_csrf_token(secret, token)
+    body = f"csrf_token={csrf}".encode()
+    r = app.handle_request("POST", "/backups", {}, cookies, body, "127.0.0.1")
+    assert r.status == 403
+    import backup as backup_mod
+    assert backup_mod.list_backup_archives(app._backup_root()) == []
+
+
+def test_admin_can_create_backup_via_web_and_it_is_audited(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    cookies, token = _login(app)
+    secret = wa.get_or_create_csrf_secret(config_dir)
+    csrf = wa.derive_csrf_token(secret, token)
+    body = f"csrf_token={csrf}".encode()
+    r = app.handle_request("POST", "/backups", {}, cookies, body, "127.0.0.1")
+    assert r.status == 200
+    assert b"Created:" in r.body
+
+    import backup as backup_mod
+    archives = backup_mod.list_backup_archives(app._backup_root())
+    assert len(archives) == 1
+
+    import audit_log
+    conn = audit_log.open_db(os.path.join(state_dir, "audit_log.sqlite3"))
+    events = audit_log.list_recent_events(conn)
+    conn.close()
+    assert any(e["action"] == "backup_created" for e in events)
+
+
+def test_backups_page_lists_created_archives(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    cookies, token = _login(app)
+    import backup as backup_mod
+    archive = backup_mod.create_full_backup_archive(state_dir, config_dir, app._backup_root(),
+                                                       label="pre-existing")
+    r = app.handle_request("GET", "/backups", {}, cookies, b"", "127.0.0.1")
+    assert r.status == 200
+    assert os.path.basename(archive).encode() in r.body
+
+
+def test_backups_page_never_exposes_secret_files(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    cookies, token = _login(app)
+    secret = wa.get_or_create_csrf_secret(config_dir)
+    csrf = wa.derive_csrf_token(secret, token)
+    body = f"csrf_token={csrf}".encode()
+    app.handle_request("POST", "/backups", {}, cookies, body, "127.0.0.1")
+
+    import backup as backup_mod
+    import tarfile
+    archives = backup_mod.list_backup_archives(app._backup_root())
+    archive_path = os.path.join(app._backup_root(), archives[0])
+    with tarfile.open(archive_path, "r:gz") as tar:
+        names = tar.getnames()
+    joined = "\n".join(names)
+    assert "csrf_secret.key" not in joined
+    assert "users.json" not in joined
