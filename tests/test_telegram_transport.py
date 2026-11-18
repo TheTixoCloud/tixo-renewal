@@ -58,6 +58,66 @@ def test_direct_transport_raises_on_invalid_json_response():
         transport.call("getMe", http_post=lambda u, d, t: "not json")
 
 
+# ---------- DirectTransport.send_document (backup delivery) ----------------------------------
+
+def test_send_document_uploads_multipart_with_file_bytes(tmp_path):
+    file_path = str(tmp_path / "archive.tar.gz")
+    with open(file_path, "wb") as f:
+        f.write(b"fake archive bytes")
+
+    captured = {}
+    def fake_post(url, data, timeout, content_type):
+        captured["url"] = url
+        captured["data"] = data
+        captured["content_type"] = content_type
+        return '{"ok": true, "result": {"message_id": 1}}'
+
+    transport = tt.DirectTransport(bot_token="123:ABC")
+    result = transport.send_document(chat_id=42, file_path=file_path, caption="backup",
+                                        http_post=fake_post)
+    assert result == {"ok": True, "result": {"message_id": 1}}
+    assert captured["url"] == "https://api.telegram.org/bot123:ABC/sendDocument"
+    assert "multipart/form-data" in captured["content_type"]
+    assert b"fake archive bytes" in captured["data"]
+    assert b'name="chat_id"' in captured["data"]
+    assert b'name="caption"' in captured["data"]
+
+
+def test_send_document_refuses_oversized_file(tmp_path):
+    file_path = str(tmp_path / "big.tar.gz")
+    with open(file_path, "wb") as f:
+        f.write(b"x" * 1000)
+    transport = tt.DirectTransport(bot_token="t")
+    with pytest.raises(tt.TelegramTransportError, match="exceeds max_size_bytes"):
+        transport.send_document(chat_id=1, file_path=file_path, max_size_bytes=500)
+
+
+def test_send_document_redacts_token_on_network_failure(tmp_path):
+    file_path = str(tmp_path / "f.tar.gz")
+    with open(file_path, "wb") as f:
+        f.write(b"data")
+    def failing_post(url, data, timeout, content_type):
+        raise OSError(f"connection failed to {url}")
+    transport = tt.DirectTransport(bot_token="SECRETTOKEN123")
+    with pytest.raises(tt.TelegramTransportError) as exc_info:
+        transport.send_document(chat_id=1, file_path=file_path, http_post=failing_post)
+    assert "SECRETTOKEN123" not in str(exc_info.value)
+
+
+def test_socks5_transport_send_document_not_implemented():
+    proxy = tt.Socks5ProxyConfig(host="x", port=1080)
+    transport = tt.Socks5Transport(bot_token="t", proxy=proxy)
+    with pytest.raises(NotImplementedError, match="SOCKS5"):
+        transport.send_document(chat_id=1, file_path="/tmp/whatever")
+
+
+def test_relay_client_transport_send_document_not_implemented():
+    transport = tt.RelayClientTransport(bot_token="t", shared_secret="s",
+                                          relay_host="relay.example", relay_port=8765)
+    with pytest.raises(NotImplementedError, match="RELAY"):
+        transport.send_document(chat_id=1, file_path="/tmp/whatever")
+
+
 # ---------- SOCKS5 transport: real handshake against a real local test server ----------------
 
 class _FakeSocks5Server(threading.Thread):

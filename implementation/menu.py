@@ -1090,8 +1090,50 @@ def _confirm(prompt: str) -> bool:
         return False
 
 
-def action_install():
-    renewal_cli.cmd_install(argparse.Namespace())
+def action_install(style: Style):
+    """Unified installer entry point (v1.8.0 Part 17): detects fresh vs. existing install
+    and offers the right path -- fresh install, upgrade, repair, or rollback after a failed
+    one. Reconfiguring an already-installed optional module stays on its own dedicated
+    "Configure ..." screen (Telegram/Web/Relay Worker/Remote Agent/Backup Schedule/
+    Timezone) rather than being duplicated here."""
+    import installer as inst
+    state = inst.detect_installation_state(renewal_cli.CONFIG_DIR, renewal_cli.STATE_DIR)
+
+    if not state["existing"]:
+        print("No existing installation detected -- running a fresh install.")
+        renewal_cli.cmd_install(argparse.Namespace())
+        return
+
+    print(f"Existing installation detected (nodes.json={state['has_nodes']}, "
+          f"policy.json={state['has_policy']}, databases={state['db_files']}).")
+    print("All existing Virtualizor renewal configuration and historical SQLite records "
+          "are preserved by every path below.")
+    choice = input("[u]pgrade / [r]epair / [b]ack to menu: ").strip().lower()
+
+    if choice == "u":
+        result = inst.upgrade(renewal_cli.CONFIG_DIR, renewal_cli.STATE_DIR, renewal_cli.BACKUP_DIR)
+        print(f"Upgrade {'succeeded' if result['ok'] else 'FAILED'}. "
+              f"Pre-upgrade backup: {result['backup']}")
+    elif choice == "r":
+        result = inst.repair(renewal_cli.CONFIG_DIR, renewal_cli.STATE_DIR, renewal_cli.BACKUP_DIR)
+        print(f"Repair {'succeeded' if result['ok'] else 'FAILED'}. "
+              f"Pre-repair backup: {result['backup']}")
+        if result["fixed_permissions"]:
+            print(f"Fixed loosened permissions on: {result['fixed_permissions']}")
+    else:
+        print("Cancelled.")
+        return
+
+    health = inst.health_check(renewal_cli.CONFIG_DIR, renewal_cli.STATE_DIR)
+    if health["ok"]:
+        print(f"{style.GREEN}Post-change health check: OK.{style.RESET}")
+    else:
+        print(f"{style.RED}Post-change health check found problems:{style.RESET}")
+        for problem in health["problems"]:
+            print(f"  - {problem}")
+        print("If this change should be undone, use:")
+        print("  renewal_cli.py install-rollback --backup-file <the pre-change backup "
+              "printed above> --yes")
 
 
 def action_dashboard(style: Style):
@@ -1972,12 +2014,39 @@ def action_configure_web(style: Style):
                       f"({'/'.join(wcfg.VALID_LANGUAGES)}): ").strip() or settings.default_language
     theme_raw = input(f"Default theme [{settings.default_theme}] "
                        f"({'/'.join(wcfg.VALID_THEMES)}): ").strip() or settings.default_theme
+    bind_port = int(port_raw) if port_raw else settings.bind_port
+
+    domain_raw = input(f"Domain/subdomain for this Web UI, blank for IP-based access "
+                        f"[{settings.domain or ''}]: ").strip() or settings.domain
+
+    import installer as inst
+    tls_cert_path, tls_key_path = settings.tls_cert_path, settings.tls_key_path
+    https_raw = input(f"Configure HTTPS now with manual certificate paths? [y/N]: ").strip().lower()
+    if https_raw == "y":
+        cert_raw = input(f"Path to certificate (.pem/.crt) [{tls_cert_path or ''}]: ").strip() \
+            or tls_cert_path
+        key_raw = input(f"Path to private key (.pem/.key) [{tls_key_path or ''}]: ").strip() \
+            or tls_key_path
+        report = inst.validate_https_prerequisites(cert_raw, key_raw, host_raw, bind_port)
+        if not report["ok"]:
+            print(f"{style.RED}HTTPS prerequisites NOT satisfied:{style.RESET}")
+            for problem in report["problems"]:
+                print(f"  - {problem}")
+            print("Settings will be saved WITHOUT TLS cert/key paths -- fix the above and "
+                  "re-run this screen.")
+        else:
+            tls_cert_path, tls_key_path = cert_raw, key_raw
+            print(f"{style.GREEN}HTTPS prerequisites satisfied.{style.RESET}")
+    elif not inst.check_port_available(host_raw, bind_port):
+        print(f"{style.YELLOW}NOTE: port {bind_port} on {host_raw} is currently in use by "
+              f"something else -- the Web Control Center will fail to bind until that is "
+              f"resolved or a different port is chosen.{style.RESET}")
+
     try:
         new_settings = wcfg.WebSettings(
-            enabled=settings.enabled, bind_host=host_raw,
-            bind_port=int(port_raw) if port_raw else settings.bind_port,
-            domain=settings.domain, tls_cert_path=settings.tls_cert_path,
-            tls_key_path=settings.tls_key_path, default_language=lang_raw,
+            enabled=settings.enabled, bind_host=host_raw, bind_port=bind_port,
+            domain=domain_raw, tls_cert_path=tls_cert_path,
+            tls_key_path=tls_key_path, default_language=lang_raw,
             default_theme=theme_raw)
     except ValueError as e:
         print(f"Rejected: {e}")
@@ -2103,8 +2172,76 @@ def action_configure_remote_agent(style: Style):
     print("Saved. Start it with: renewal_cli.py agent-run (only works while enabled).")
 
 
+def action_configure_backup_schedule(style: Style):
+    """Configures the optional scheduled-backup timer -- DISABLED by default. An unattended
+    encrypted backup needs its passphrase available without an interactive prompt, so this
+    screen is the ONLY place that passphrase is stored (0600-enforced, same discipline as
+    every other secret). Never installs/enables the generated systemd unit itself."""
+    import backup_config as bcfg
+    settings = bcfg.load_backup_schedule_settings(renewal_cli.CONFIG_DIR)
+    print(f"Enabled: {settings.enabled}")
+    print(f"Interval: every {settings.interval_hours}h, keep last {settings.retention_keep}")
+    print(f"Encrypt: {settings.encrypt}  Telegram delivery: {settings.telegram_delivery_enabled}")
+
+    interval_raw = input(f"Backup interval in hours [{settings.interval_hours}]: ").strip()
+    keep_raw = input(f"Retention -- keep last N archives [{settings.retention_keep}]: ").strip()
+    encrypt_raw = input(f"Encrypt archives with GPG? [y/N] "
+                         f"(currently {settings.encrypt}): ").strip().lower()
+    encrypt = encrypt_raw == "y" if encrypt_raw else settings.encrypt
+
+    telegram_delivery = settings.telegram_delivery_enabled
+    if encrypt:
+        deliver_raw = input(f"Also deliver each encrypted backup to Telegram admins? [y/N] "
+                             f"(currently {telegram_delivery}): ").strip().lower()
+        telegram_delivery = deliver_raw == "y" if deliver_raw else telegram_delivery
+    elif settings.telegram_delivery_enabled:
+        print(f"{style.YELLOW}Disabling encryption also disables Telegram delivery -- never "
+              f"sends a plaintext backup.{style.RESET}")
+        telegram_delivery = False
+
+    try:
+        new_settings = bcfg.BackupScheduleSettings(
+            enabled=settings.enabled,
+            interval_hours=int(interval_raw) if interval_raw else settings.interval_hours,
+            retention_keep=int(keep_raw) if keep_raw else settings.retention_keep,
+            encrypt=encrypt, telegram_delivery_enabled=telegram_delivery)
+    except ValueError as e:
+        print(f"Rejected: {e}")
+        return
+
+    if encrypt:
+        import getpass
+        set_pass = input("Set/update the backup encryption passphrase now? [y/N]: ").strip().lower() == "y"
+        if set_pass:
+            passphrase = getpass.getpass("Backup passphrase (never echoed): ")
+            bcfg.store_backup_passphrase(bcfg.default_passphrase_path(renewal_cli.CONFIG_DIR),
+                                           passphrase)
+            print("Passphrase stored (0600 permissions).")
+        elif not os.path.exists(bcfg.default_passphrase_path(renewal_cli.CONFIG_DIR)):
+            print(f"{style.YELLOW}WARNING: encryption is enabled but no passphrase is stored "
+                  f"yet -- the scheduled backup will fail until one is set.{style.RESET}")
+
+    enable_raw = input(f"Enable the scheduled backup timer now? [y/N] "
+                        f"(enabled={settings.enabled}): ").strip().lower()
+    new_settings.enabled = enable_raw == "y" if enable_raw else settings.enabled
+
+    if not _confirm("Save this backup schedule?"):
+        print("Cancelled.")
+        return
+    bcfg.save_backup_schedule_settings(renewal_cli.CONFIG_DIR, new_settings)
+    renewal_cli.write_backup_systemd_unit(new_settings.interval_hours)
+    print(f"Saved. Regenerated {os.path.join(renewal_cli.SYSTEMD_OUT_DIR, 'virt-renewal-backup.service')} "
+          f"and .timer -- install/enable them yourself (as root, a separate explicit step):")
+    print("  sudo cp " + os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
+                                        "virt-renewal-backup.service") +
+          " " + os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-backup.timer") +
+          " /etc/systemd/system/")
+    print("  sudo systemctl daemon-reload")
+    print("  sudo systemctl enable --now virt-renewal-backup.timer")
+
+
 MENU_ITEMS = [
-    ("Install / Initial Setup", action_install),
+    ("Install / Initial Setup", None),  # needs style, wired specially below
     ("Dashboard", None),  # needs style, wired specially below
     ("System & Virtualizor information", None),  # needs style, wired specially below
     ("Show all network interfaces (advanced)", None),  # needs style, wired specially below
@@ -2131,6 +2268,7 @@ MENU_ITEMS = [
     ("Configure Web Control Center (optional)", None),  # needs style, wired specially below
     ("Configure Relay Worker (optional, run on a SEPARATE host)", None),  # wired specially below
     ("Configure Remote Agent (optional, read-only)", None),  # wired specially below
+    ("Configure Backup Schedule (optional)", None),  # wired specially below
     ("Enable automatic renewal", lambda: action_toggle_auto_renewal(True)),
     ("Disable automatic renewal", lambda: action_toggle_auto_renewal(False)),
     ("View logs and renewal history", action_view_logs),
@@ -2191,6 +2329,8 @@ def run_menu():
             try:
                 if label == "Dashboard":
                     action_dashboard(style)
+                elif label == "Install / Initial Setup":
+                    action_install(style)
                 elif label == "System & Virtualizor information":
                     action_system_info(style)
                 elif label == "Show all network interfaces (advanced)":
@@ -2217,6 +2357,8 @@ def run_menu():
                     action_configure_relay_worker(style)
                 elif label == "Configure Remote Agent (optional, read-only)":
                     action_configure_remote_agent(style)
+                elif label == "Configure Backup Schedule (optional)":
+                    action_configure_backup_schedule(style)
                 else:
                     fn()
             except Exception as e:

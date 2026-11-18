@@ -823,9 +823,20 @@ def _build_handler_class(app: "WebApp"):
     return TixoRequestHandler
 
 
-def build_server(config_dir: str, state_dir: str, host: str, port: int):
+class TlsCertificateError(Exception):
+    pass
+
+
+def build_server(config_dir: str, state_dir: str, host: str, port: int,
+                  tls_cert_path: str = None, tls_key_path: str = None):
     """Returns a real, bound (but not yet serving) HTTPServer. Caller is responsible for
-    calling `.serve_forever()` (blocking) or running it in a thread for tests."""
+    calling `.serve_forever()` (blocking) or running it in a thread for tests.
+
+    If BOTH tls_cert_path and tls_key_path are given, the listening socket is wrapped with
+    a real TLS server context (manual certificate paths only -- this module never requests
+    or provisions a certificate itself; see installer.py's explicit, operator-triggered-only
+    automatic-provisioning helper for that). Raises TlsCertificateError (never silently
+    falls back to plain HTTP) if the cert/key cannot be loaded."""
     import http.server
     import socketserver
 
@@ -835,14 +846,30 @@ def build_server(config_dir: str, state_dir: str, host: str, port: int):
 
     app = WebApp(config_dir, state_dir)
     handler_cls = _build_handler_class(app)
-    return ThreadingHTTPServer((host, port), handler_cls)
+    server = ThreadingHTTPServer((host, port), handler_cls)
+
+    if tls_cert_path or tls_key_path:
+        if not (tls_cert_path and tls_key_path):
+            raise TlsCertificateError(
+                "both tls_cert_path and tls_key_path must be set together, never just one")
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            ctx.load_cert_chain(certfile=tls_cert_path, keyfile=tls_key_path)
+        except (ssl.SSLError, OSError) as e:
+            server.server_close()
+            raise TlsCertificateError(f"failed to load TLS cert/key: {e}") from None
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+
+    return server
 
 
-def run_server_in_thread(config_dir: str, state_dir: str, host: str, port: int):
+def run_server_in_thread(config_dir: str, state_dir: str, host: str, port: int,
+                          tls_cert_path: str = None, tls_key_path: str = None):
     """Starts the server on a background daemon thread and returns (server, thread) -- the
     caller calls `server.shutdown()` to stop it cleanly. Used by tests and by
     renewal_cli.py's `web-run` command alike."""
-    server = build_server(config_dir, state_dir, host, port)
+    server = build_server(config_dir, state_dir, host, port, tls_cert_path, tls_key_path)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, thread

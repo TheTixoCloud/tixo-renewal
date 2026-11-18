@@ -280,3 +280,171 @@ def test_cmd_backup_full_applies_retention(tmp_path, capsys):
     capsys.readouterr()
     archives = backup.list_backup_archives(renewal_cli.BACKUP_DIR)
     assert len(archives) == 1
+
+
+# ---------- send_backup_to_telegram -------------------------------------------------------------
+
+class _FakeTransportWithDocument:
+    def __init__(self, fail_for=None):
+        self.sent = []
+        self.fail_for = fail_for or set()
+
+    def send_document(self, chat_id, file_path, caption=None):
+        if chat_id in self.fail_for:
+            raise Exception(f"simulated failure for {chat_id}")
+        self.sent.append((chat_id, file_path, caption))
+
+
+class _FakeTransportWithoutDocument:
+    def call(self, method, params=None):
+        return {"ok": True}
+
+
+def test_send_backup_to_telegram_requires_encrypted_archive(tmp_path):
+    plain = tmp_path / "backup.tar.gz"
+    plain.write_bytes(b"plaintext data")
+    transport = _FakeTransportWithDocument()
+    with pytest.raises(backup.BackupDeliverySecurityError, match="not an encrypted"):
+        backup.send_backup_to_telegram(transport, [1, 2], str(plain))
+
+
+def test_send_backup_to_telegram_enforces_size_limit(tmp_path):
+    encrypted = tmp_path / "backup.tar.gz.gpg"
+    encrypted.write_bytes(b"x" * 1000)
+    transport = _FakeTransportWithDocument()
+    with pytest.raises(backup.BackupDeliverySecurityError, match="exceeds max_size_bytes"):
+        backup.send_backup_to_telegram(transport, [1], str(encrypted), max_size_bytes=500)
+
+
+def test_send_backup_to_telegram_rejects_transport_without_send_document(tmp_path):
+    encrypted = tmp_path / "backup.tar.gz.gpg"
+    encrypted.write_bytes(b"data")
+    transport = _FakeTransportWithoutDocument()
+    with pytest.raises(backup.BackupDeliverySecurityError, match="does not support"):
+        backup.send_backup_to_telegram(transport, [1], str(encrypted))
+
+
+def test_send_backup_to_telegram_delivers_to_all_admins(tmp_path):
+    encrypted = tmp_path / "backup.tar.gz.gpg"
+    encrypted.write_bytes(b"data")
+    transport = _FakeTransportWithDocument()
+    result = backup.send_backup_to_telegram(transport, [1, 2, 3], str(encrypted))
+    assert all(r["ok"] for r in result.values())
+    assert len(transport.sent) == 3
+
+
+def test_send_backup_to_telegram_one_failure_does_not_block_others(tmp_path):
+    encrypted = tmp_path / "backup.tar.gz.gpg"
+    encrypted.write_bytes(b"data")
+    transport = _FakeTransportWithDocument(fail_for={2})
+    result = backup.send_backup_to_telegram(transport, [1, 2, 3], str(encrypted))
+    assert result[1]["ok"] is True
+    assert result[2]["ok"] is False
+    assert result[3]["ok"] is True
+
+
+def test_send_backup_to_telegram_allows_plaintext_when_explicitly_overridden(tmp_path):
+    plain = tmp_path / "backup.tar.gz"
+    plain.write_bytes(b"data")
+    transport = _FakeTransportWithDocument()
+    result = backup.send_backup_to_telegram(transport, [1], str(plain), require_encrypted=False)
+    assert result[1]["ok"] is True
+
+
+# ---------- renewal_cli `backup-scheduled-run` command ------------------------------------------
+
+def test_cmd_backup_scheduled_run_blocked_when_disabled(tmp_path, capsys):
+    import renewal_cli
+    _configure_cli_dirs(renewal_cli, tmp_path)
+
+    class _Args:
+        pass
+    rc = renewal_cli.cmd_backup_scheduled_run(_Args())
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "BLOCKED" in out
+
+
+def test_cmd_backup_scheduled_run_unencrypted_succeeds(tmp_path, capsys):
+    import renewal_cli
+    import backup_config as bcfg
+    _configure_cli_dirs(renewal_cli, tmp_path)
+    bcfg.save_backup_schedule_settings(renewal_cli.CONFIG_DIR,
+                                         bcfg.BackupScheduleSettings(enabled=True))
+
+    class _Args:
+        pass
+    rc = renewal_cli.cmd_backup_scheduled_run(_Args())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Scheduled backup created" in out
+    archives = backup.list_backup_archives(renewal_cli.BACKUP_DIR)
+    assert len(archives) == 1
+
+
+def test_cmd_backup_scheduled_run_encrypted_without_passphrase_fails(tmp_path, capsys):
+    import renewal_cli
+    import backup_config as bcfg
+    _configure_cli_dirs(renewal_cli, tmp_path)
+    bcfg.save_backup_schedule_settings(renewal_cli.CONFIG_DIR,
+                                         bcfg.BackupScheduleSettings(enabled=True, encrypt=True))
+
+    class _Args:
+        pass
+    rc = renewal_cli.cmd_backup_scheduled_run(_Args())
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "ERROR" in out
+
+
+def test_cmd_backup_scheduled_run_encrypted_with_passphrase_succeeds(tmp_path, capsys):
+    import renewal_cli
+    import backup_config as bcfg
+    _configure_cli_dirs(renewal_cli, tmp_path)
+    bcfg.save_backup_schedule_settings(renewal_cli.CONFIG_DIR,
+                                         bcfg.BackupScheduleSettings(enabled=True, encrypt=True))
+    bcfg.store_backup_passphrase(bcfg.default_passphrase_path(renewal_cli.CONFIG_DIR), "shh")
+
+    class _Args:
+        pass
+    rc = renewal_cli.cmd_backup_scheduled_run(_Args())
+    out = capsys.readouterr().out
+    assert rc == 0
+    archives = backup.list_backup_archives(renewal_cli.BACKUP_DIR)
+    assert len(archives) == 1
+    assert archives[0].endswith(".gpg")
+
+
+def test_cmd_backup_scheduled_run_records_audit_event(tmp_path, capsys):
+    import renewal_cli
+    import backup_config as bcfg
+    import audit_log
+    _configure_cli_dirs(renewal_cli, tmp_path)
+    bcfg.save_backup_schedule_settings(renewal_cli.CONFIG_DIR,
+                                         bcfg.BackupScheduleSettings(enabled=True))
+
+    class _Args:
+        pass
+    renewal_cli.cmd_backup_scheduled_run(_Args())
+    capsys.readouterr()
+    conn = audit_log.open_db(os.path.join(renewal_cli.STATE_DIR, "audit_log.sqlite3"))
+    events = audit_log.list_recent_events(conn)
+    conn.close()
+    assert any(e["action"] == "backup_full_created" for e in events)
+
+
+def test_cmd_backup_scheduled_run_telegram_delivery_skipped_when_bot_disabled(tmp_path, capsys):
+    import renewal_cli
+    import backup_config as bcfg
+    _configure_cli_dirs(renewal_cli, tmp_path)
+    bcfg.save_backup_schedule_settings(
+        renewal_cli.CONFIG_DIR,
+        bcfg.BackupScheduleSettings(enabled=True, encrypt=True, telegram_delivery_enabled=True))
+    bcfg.store_backup_passphrase(bcfg.default_passphrase_path(renewal_cli.CONFIG_DIR), "shh")
+
+    class _Args:
+        pass
+    rc = renewal_cli.cmd_backup_scheduled_run(_Args())
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Telegram delivery skipped" in out

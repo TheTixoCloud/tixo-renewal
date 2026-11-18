@@ -438,3 +438,84 @@ def test_backups_page_never_exposes_secret_files(tmp_path):
     joined = "\n".join(names)
     assert "csrf_secret.key" not in joined
     assert "users.json" not in joined
+
+
+# ---------- TLS (manual certificate paths) ------------------------------------------------------
+
+def _generate_self_signed_cert(tmp_path):
+    import subprocess
+    cert_path = str(tmp_path / "cert.pem")
+    key_path = str(tmp_path / "key.pem")
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", key_path,
+         "-out", cert_path, "-days", "1", "-nodes", "-subj", "/CN=localhost"],
+        check=True, capture_output=True)
+    return cert_path, key_path
+
+
+def test_build_server_with_valid_cert_wraps_socket_in_tls(tmp_path):
+    cert_path, key_path = _generate_self_signed_cert(tmp_path)
+    config_dir, state_dir = _dirs(tmp_path)
+    server = ws.build_server(config_dir, state_dir, "127.0.0.1", 0,
+                              tls_cert_path=cert_path, tls_key_path=key_path)
+    try:
+        import ssl
+        assert isinstance(server.socket, ssl.SSLSocket)
+    finally:
+        server.server_close()
+
+
+def test_build_server_rejects_cert_without_key(tmp_path):
+    cert_path, _ = _generate_self_signed_cert(tmp_path)
+    config_dir, state_dir = _dirs(tmp_path)
+    with pytest.raises(ws.TlsCertificateError, match="both"):
+        ws.build_server(config_dir, state_dir, "127.0.0.1", 0, tls_cert_path=cert_path)
+
+
+def test_build_server_rejects_unreadable_cert_path(tmp_path):
+    config_dir, state_dir = _dirs(tmp_path)
+    with pytest.raises(ws.TlsCertificateError):
+        ws.build_server(config_dir, state_dir, "127.0.0.1", 0,
+                         tls_cert_path="/nonexistent/cert.pem",
+                         tls_key_path="/nonexistent/key.pem")
+
+
+def test_real_tls_server_end_to_end_over_a_real_socket(tmp_path):
+    import ssl
+    import urllib.request
+
+    cert_path, key_path = _generate_self_signed_cert(tmp_path)
+    config_dir, state_dir = _dirs(tmp_path)
+    wa.create_user(config_dir, "admin", "pw123456", role=wa.ROLE_ADMIN)
+    server, thread = ws.run_server_in_thread(config_dir, state_dir, "127.0.0.1", 0,
+                                               tls_cert_path=cert_path, tls_key_path=key_path)
+    try:
+        port = server.server_address[1]
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # self-signed test cert -- not a trust assertion
+        resp = urllib.request.urlopen(f"https://127.0.0.1:{port}/login", context=ctx, timeout=5)
+        assert resp.status == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_cmd_web_run_blocked_on_bad_tls_cert(tmp_path, capsys):
+    import renewal_cli
+    import web_config as wcfg
+    renewal_cli.CONFIG_DIR = str(tmp_path / "config")
+    renewal_cli.STATE_DIR = str(tmp_path / "state")
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    os.makedirs(renewal_cli.STATE_DIR, exist_ok=True)
+    wcfg.save_web_settings(renewal_cli.CONFIG_DIR,
+                            wcfg.WebSettings(enabled=True, bind_host="127.0.0.1",
+                                              bind_port=18444, tls_cert_path="/nonexistent/c.pem",
+                                              tls_key_path="/nonexistent/k.pem"))
+
+    class _Args:
+        max_iterations = 1
+    rc = renewal_cli.cmd_web_run(_Args())
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "BLOCKED" in out

@@ -239,6 +239,60 @@ Unit=virt-renewal-hostnet-sync.service
 WantedBy=timers.target
 """
 
+# Optional scheduled backup: strictly LOCAL (reads/writes only under shadow-monitor-state/
+# and backups/, never touches Virtualizor or any production VPS). Entirely independent of
+# every renewal timer's lock. Like every optional-module unit in this project, generated-
+# but-never-installed/enabled by default -- backup_scheduled_run() itself ALSO independently
+# refuses to run unless backup_config.BackupScheduleSettings.enabled is True, so generating
+# this file alone activates nothing. Written by its own dedicated
+# write_backup_systemd_unit() rather than the shared write_systemd_units() so reconfiguring
+# the backup schedule's interval can never accidentally reset an operator's previously
+# customized monitor/apply/notifier/inventory/hostnet interval.
+BACKUP_SERVICE_UNIT_TEMPLATE = """[Unit]
+Description=Tixo Renewal scheduled backup (optional; local-only; also requires enabling via the menu)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH={libdir}
+Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
+ExecStart={python} {cli} backup-scheduled-run
+WorkingDirectory={workdir}
+User={user}
+"""
+
+BACKUP_TIMER_UNIT_TEMPLATE = """[Unit]
+Description=Run the Tixo Renewal scheduled backup approximately every {interval}h
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec={interval}h
+Unit=virt-renewal-backup.service
+
+[Install]
+WantedBy=timers.target
+"""
+
+DEFAULT_BACKUP_INTERVAL_HOURS = 24
+
+
+def write_backup_systemd_unit(interval_hours: int = DEFAULT_BACKUP_INTERVAL_HOURS) -> None:
+    """Writes ONLY the backup service/timer pair -- deliberately separate from
+    write_systemd_units() so reconfiguring the backup interval never touches any other
+    timer's already-generated interval."""
+    Path(SYSTEMD_OUT_DIR).mkdir(parents=True, exist_ok=True)
+    python_path = sys.executable
+    cli_path = os.path.abspath(__file__)
+    user = os.environ.get("USER", "root")
+    lib_dir = os.path.abspath(os.path.join(WORKSPACE_ROOT, "lib"))
+
+    Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-backup.service")).write_text(
+        BACKUP_SERVICE_UNIT_TEMPLATE.format(python=python_path, cli=cli_path,
+                                              workdir=os.path.abspath(WORKSPACE_ROOT),
+                                              user=user, libdir=lib_dir))
+    Path(os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-backup.timer")).write_text(
+        BACKUP_TIMER_UNIT_TEMPLATE.format(interval=interval_hours))
+
 # UNLIKE every other unit above, this is Type=simple/Restart=always, not a timer-triggered
 # oneshot -- it holds a persistent long-poll connection to Telegram (see
 # telegram_bot.run_polling_loop), so a periodic timer would be the wrong shape entirely.
@@ -452,6 +506,7 @@ def cmd_install(args):
     inventory_min = validate_interval_minutes(os.environ.get("TIXO_RENEWAL_INVENTORY_INTERVAL_MIN", DEFAULT_INVENTORY_INTERVAL_MIN))
     hostnet_min = validate_interval_minutes(os.environ.get("TIXO_RENEWAL_HOSTNET_INTERVAL_MIN", DEFAULT_HOSTNET_INTERVAL_MIN))
     write_systemd_units(monitor_min, apply_min, notifier_min, inventory_min, hostnet_min)
+    write_backup_systemd_unit()
     service_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-monitor.service")
     timer_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-monitor.timer")
 
@@ -739,6 +794,88 @@ def cmd_backup_full(args):
     return 0 if verification["ok"] else 1
 
 
+def cmd_backup_scheduled_run(args):
+    """The ENTRY POINT for the optional `virt-renewal-backup.timer` -- unlike `backup-full`
+    (manual/CLI, passphrase from env var), this reads its behavior entirely from
+    backup_config.BackupScheduleSettings/the stored passphrase file, since an unattended
+    timer has no interactive terminal and no env var to read. Refuses to run unless
+    explicitly enabled, same pattern as every other optional-module `*-run` command."""
+    import audit_log as alog
+    import backup_config as bcfg
+
+    settings = bcfg.load_backup_schedule_settings(CONFIG_DIR)
+    if not settings.enabled:
+        print("BLOCKED: Scheduled backup is not enabled. Enable it via the menu's "
+              "'Configure Backup Schedule' screen first.")
+        return 1
+
+    conn = alog.open_db(os.path.join(STATE_DIR, "audit_log.sqlite3"))
+    try:
+        archive = backup_mod.create_full_backup_archive(STATE_DIR, CONFIG_DIR, BACKUP_DIR,
+                                                           label="scheduled")
+        verification = backup_mod.verify_backup_archive(archive)
+        if not verification["ok"]:
+            print(f"WARNING: backup archive failed integrity verification: {verification}")
+
+        final_path = archive
+        if settings.encrypt:
+            try:
+                passphrase = bcfg.load_backup_passphrase(bcfg.default_passphrase_path(CONFIG_DIR))
+            except (FileNotFoundError, bcfg.BackupScheduleSecurityError) as e:
+                print(f"ERROR: {e}")
+                alog.record_event(conn, actor="scheduled-backup", action="backup_failed",
+                                   detail=str(e), remote_addr="local")
+                return 1
+            try:
+                final_path = backup_mod.encrypt_backup_file(archive, passphrase)
+            except backup_mod.BackupEncryptionUnavailable as exc:
+                print(f"ERROR: {exc}")
+                alog.record_event(conn, actor="scheduled-backup", action="backup_failed",
+                                   detail=str(exc), remote_addr="local")
+                return 1
+            os.remove(archive)
+
+        removed = backup_mod.apply_retention(BACKUP_DIR, keep_count=settings.retention_keep)
+        alog.record_event(conn, actor="scheduled-backup", action="backup_full_created",
+                           detail=f"archive={os.path.basename(final_path)} "
+                                  f"encrypted={settings.encrypt} integrity_ok={verification['ok']} "
+                                  f"retention_removed={len(removed)}",
+                           remote_addr="local")
+        print(f"Scheduled backup created: {final_path}")
+        if removed:
+            print(f"Retention removed {len(removed)} older archive(s): {removed}")
+
+        if settings.telegram_delivery_enabled:
+            import telegram_config as tgc
+            import telegram_bot as tbot
+            tg_settings = tgc.load_telegram_settings(CONFIG_DIR)
+            if not tg_settings.enabled or not tg_settings.admin_ids:
+                print("Telegram delivery skipped: bot not enabled or no admins configured.")
+            else:
+                try:
+                    secrets_obj = tgc.load_telegram_secrets(tgc.default_secrets_path(CONFIG_DIR))
+                    transport = tbot.build_transport(tg_settings, secrets_obj)
+                    delivery = backup_mod.send_backup_to_telegram(
+                        transport, tg_settings.admin_ids, final_path)
+                    alog.record_event(conn, actor="scheduled-backup",
+                                       action="backup_telegram_delivery",
+                                       detail=json.dumps({k: v["ok"] for k, v in delivery.items()}),
+                                       remote_addr="local")
+                    for admin_id, result in delivery.items():
+                        status = "delivered" if result["ok"] else f"FAILED ({result['error']})"
+                        print(f"  Telegram delivery to admin {admin_id}: {status}")
+                except (backup_mod.BackupDeliverySecurityError, ValueError,
+                        FileNotFoundError, tgc.TelegramConfigSecurityError) as e:
+                    print(f"Telegram delivery blocked: {e}")
+                    alog.record_event(conn, actor="scheduled-backup",
+                                       action="backup_telegram_delivery_blocked",
+                                       detail=str(e), remote_addr="local")
+
+        return 0 if verification["ok"] else 1
+    finally:
+        conn.close()
+
+
 def cmd_rollback(args):
     if not args.backup_file:
         print("Available backups:")
@@ -761,6 +898,73 @@ def cmd_rollback(args):
     print(f"Restored {args.backup_file} -> {target} (previous state saved as {target}.pre-restore.sqlite3)")
 
 
+# ---------- unified installer: detect / upgrade / repair / rollback -----------------------------
+
+def cmd_install_detect(args):
+    """Read-only: reports whether this looks like a fresh or existing install, without
+    changing anything. The first step any installer flow (interactive or noninteractive)
+    should take before choosing fresh-install vs. upgrade/repair."""
+    import installer as inst
+    result = inst.detect_installation_state(CONFIG_DIR, STATE_DIR)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_install_upgrade(args):
+    """Backs up config/state first, then re-runs the idempotent install steps and
+    regenerates every systemd unit template. Never overwrites an existing nodes.json/
+    policy.json -- preserves all existing Virtualizor renewal configuration."""
+    import installer as inst
+    result = inst.upgrade(CONFIG_DIR, STATE_DIR, BACKUP_DIR)
+    print(f"Upgrade {'succeeded' if result['ok'] else 'FAILED'}.")
+    print(f"Pre-upgrade backup: {result['backup']}")
+    return 0 if result["ok"] else 1
+
+
+def cmd_install_repair(args):
+    """Recreates missing directories/files/schemas and fixes any loosened secret-file
+    permission, after first backing up. Never touches anything that already exists and is
+    valid."""
+    import installer as inst
+    result = inst.repair(CONFIG_DIR, STATE_DIR, BACKUP_DIR)
+    print(f"Repair {'succeeded' if result['ok'] else 'FAILED'}.")
+    print(f"Pre-repair backup: {result['backup']}")
+    if result["fixed_permissions"]:
+        print(f"Fixed loosened permissions on: {result['fixed_permissions']}")
+    else:
+        print("No permission issues found.")
+    return 0 if result["ok"] else 1
+
+
+def cmd_install_rollback(args):
+    """Restores config/state from a full backup archive -- an explicit recovery action for
+    a FAILED upgrade/repair. Safety-copies the current state first; refuses (raises) a
+    failed-integrity-check archive before touching anything live."""
+    if not args.yes:
+        print(f"This will OVERWRITE live config/state from {args.backup_file}. The CURRENT "
+              f"state is safety-copied first. Re-run with --yes to confirm.")
+        return 1
+    import installer as inst
+    archive_path = os.path.join(BACKUP_DIR, args.backup_file)
+    try:
+        result = inst.rollback(archive_path, CONFIG_DIR, STATE_DIR)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        return 1
+    print(f"Restored databases: {result['restored_databases']}")
+    print(f"Restored config: {result['restored_config']}")
+    print(f"Safety backup of pre-rollback state: {result['safety_backup']}")
+    return 0
+
+
+def cmd_install_health_check(args):
+    """Read-only post-change sanity check -- never restarts or enables anything."""
+    import installer as inst
+    result = inst.health_check(CONFIG_DIR, STATE_DIR)
+    print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
 # ---------- uninstall ----------
 
 UNINSTALL_UNIT_NAMES = (
@@ -771,6 +975,7 @@ UNINSTALL_UNIT_NAMES = (
     "virt-renewal-hostnet-sync.service", "virt-renewal-hostnet-sync.timer",
     "virt-renewal-telegram-bot.service",
     "virt-renewal-web.service", "virt-renewal-relay-worker.service", "virt-renewal-agent.service",
+    "virt-renewal-backup.service", "virt-renewal-backup.timer",
 )
 
 
@@ -1391,10 +1596,16 @@ def cmd_web_run(args):
         print("BLOCKED: Web Control Center is not enabled. Enable it via the menu's "
               "'Configure Web Control Center' screen first.")
         return 1
-    print(f"Starting Web Control Center on {settings.bind_host}:{settings.bind_port} "
+    scheme = "https" if (settings.tls_cert_path and settings.tls_key_path) else "http"
+    print(f"Starting Web Control Center on {scheme}://{settings.bind_host}:{settings.bind_port} "
           f"(Ctrl+C to stop)...")
-    server, _ = websrv.run_server_in_thread(CONFIG_DIR, STATE_DIR, settings.bind_host,
-                                             settings.bind_port)
+    try:
+        server, _ = websrv.run_server_in_thread(CONFIG_DIR, STATE_DIR, settings.bind_host,
+                                                  settings.bind_port, settings.tls_cert_path,
+                                                  settings.tls_key_path)
+    except websrv.TlsCertificateError as e:
+        print(f"BLOCKED: {e}")
+        return 1
     try:
         server.socket.settimeout(1.0)
         import time
@@ -1538,6 +1749,22 @@ def main():
     sub = ap.add_subparsers(dest="command", required=True)
 
     sub.add_parser("install").set_defaults(func=cmd_install)
+    sub.add_parser("install-detect", help="Read-only: report fresh vs. existing install state"
+                   ).set_defaults(func=cmd_install_detect)
+    sub.add_parser("install-upgrade", help="Backup first, then re-run idempotent install steps "
+                   "and regenerate systemd units").set_defaults(func=cmd_install_upgrade)
+    sub.add_parser("install-repair", help="Backup first, then recreate missing files/schemas "
+                   "and fix loosened secret-file permissions").set_defaults(func=cmd_install_repair)
+
+    install_rollback_p = sub.add_parser(
+        "install-rollback",
+        help="Restore config/state from a full backup archive (explicit recovery action)")
+    install_rollback_p.add_argument("--backup-file", required=True)
+    install_rollback_p.add_argument("--yes", action="store_true")
+    install_rollback_p.set_defaults(func=cmd_install_rollback)
+
+    sub.add_parser("install-health-check", help="Read-only post-change sanity check"
+                   ).set_defaults(func=cmd_install_health_check)
     sub.add_parser("status").set_defaults(func=cmd_status)
     sub.add_parser("dry-run").set_defaults(func=cmd_dry_run)
     sub.add_parser("verify").set_defaults(func=cmd_verify)
@@ -1548,6 +1775,12 @@ def main():
     backup_full_p.add_argument("--encrypt", action="store_true")
     backup_full_p.add_argument("--keep", type=int, default=None)
     backup_full_p.set_defaults(func=cmd_backup_full)
+
+    sub.add_parser("backup-scheduled-run",
+                    help="Entry point for the optional scheduled-backup timer (reads "
+                         "backup_config.BackupScheduleSettings; requires enabling via the "
+                         "menu's 'Configure Backup Schedule' screen first)").set_defaults(
+        func=cmd_backup_scheduled_run)
 
     rollback_p = sub.add_parser("rollback")
     rollback_p.add_argument("--node")

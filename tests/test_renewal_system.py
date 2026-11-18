@@ -1169,6 +1169,47 @@ def test_telegram_bot_unit_is_simple_restart_always_not_a_timer(cli_env):
                                             "virt-renewal-telegram-bot.timer"))
 
 
+def test_cmd_install_generates_backup_systemd_unit_as_oneshot_timer_pair(cli_env):
+    renewal_cli.cmd_install(argparse_namespace())
+    service_path = os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-backup.service")
+    timer_path = os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-backup.timer")
+    assert os.path.exists(service_path)
+    assert os.path.exists(timer_path)
+    content = Path(service_path).read_text()
+    assert "Type=oneshot" in content
+    assert "backup-scheduled-run" in content
+    timer_content = Path(timer_path).read_text()
+    assert "OnUnitActiveSec=24h" in timer_content
+
+
+def test_write_backup_systemd_unit_custom_interval_does_not_touch_other_units(cli_env):
+    """REGRESSION guard: reconfiguring the backup interval must never reset a previously
+    customized monitor/apply/notifier/inventory/hostnet interval -- that's exactly why
+    write_backup_systemd_unit() is a separate function from write_systemd_units()."""
+    renewal_cli.cmd_install(argparse_namespace())
+    renewal_cli.write_systemd_units(monitor_interval_min=99)
+    renewal_cli.write_backup_systemd_unit(interval_hours=6)
+    monitor_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
+                                          "virt-renewal-monitor.timer")).read_text()
+    assert "OnUnitActiveSec=99min" in monitor_content
+    timer_content = Path(os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
+                                        "virt-renewal-backup.timer")).read_text()
+    assert "OnUnitActiveSec=6h" in timer_content
+
+
+def test_uninstall_removes_backup_unit_files(cli_env):
+    renewal_cli.cmd_install(argparse_namespace())
+    renewal_cli.cmd_uninstall(argparse_namespace(purge=False))
+    assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-backup.service"))
+    assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-backup.timer"))
+
+
+def test_menu_items_includes_backup_schedule_config():
+    import menu
+    labels = [label for label, _ in menu.MENU_ITEMS]
+    assert "Configure Backup Schedule (optional)" in labels
+
+
 @pytest.mark.parametrize("unit_name,cli_command", [
     ("virt-renewal-web.service", "web-run"),
     ("virt-renewal-relay-worker.service", "relay-worker-run"),

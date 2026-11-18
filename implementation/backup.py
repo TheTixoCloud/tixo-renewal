@@ -246,3 +246,53 @@ def restore_full_backup_archive(archive_path: str, staging_dir: str) -> dict:
             for f in files:
                 config_files.append(os.path.relpath(os.path.join(root, f), cfg_dir))
     return {"databases": databases, "config": sorted(config_files), "staging_dir": staging_dir}
+
+
+class BackupDeliverySecurityError(Exception):
+    """Raised instead of ever sending a backup to Telegram when a security requirement
+    (encryption, size, transport capability) is not satisfied -- never silently degrades
+    to an insecure send."""
+    pass
+
+
+def send_backup_to_telegram(transport, admin_ids: list, archive_path: str,
+                             require_encrypted: bool = True,
+                             max_size_bytes: int = 50 * 1024 * 1024) -> dict:
+    """Delivers a backup archive to every admin via the given Telegram transport's
+    `send_document`. SECURITY REQUIREMENTS, enforced here rather than left to the caller:
+      - `archive_path` MUST end in `.gpg` (i.e. already encrypted by encrypt_backup_file())
+        unless `require_encrypted=False` is explicitly passed -- never sends a plaintext
+        database/config bundle to Telegram by default.
+      - size is checked against `max_size_bytes` BEFORE any upload attempt.
+      - a transport that does not support `send_document` (SOCKS5/RELAY -- see
+        telegram_transport.py's documented limitations) raises a clear
+        BackupDeliverySecurityError rather than silently failing per-recipient.
+    Returns {admin_id: {"ok": bool, "error": str|None}} -- one delivery attempt per admin,
+    a failure for one admin never blocks delivery to the others."""
+    if require_encrypted and not archive_path.endswith(".gpg"):
+        raise BackupDeliverySecurityError(
+            f"{archive_path} is not an encrypted (.gpg) archive -- refusing to send a "
+            f"plaintext backup to Telegram. Pass require_encrypted=False to override "
+            f"(not recommended).")
+
+    size = os.path.getsize(archive_path)
+    if size > max_size_bytes:
+        raise BackupDeliverySecurityError(
+            f"{archive_path} is {size} bytes, exceeds max_size_bytes={max_size_bytes} -- "
+            f"refusing to attempt delivery")
+
+    if not hasattr(transport, "send_document"):
+        raise BackupDeliverySecurityError(
+            f"{type(transport).__name__} does not support sending documents")
+
+    results = {}
+    for admin_id in admin_ids:
+        try:
+            transport.send_document(admin_id, archive_path,
+                                      caption=f"Backup: {os.path.basename(archive_path)}")
+            results[admin_id] = {"ok": True, "error": None}
+        except NotImplementedError as e:
+            results[admin_id] = {"ok": False, "error": str(e)}
+        except Exception as e:  # noqa: BLE001 -- one admin's delivery failure must never
+            results[admin_id] = {"ok": False, "error": str(e)}  # block the others
+    return results
