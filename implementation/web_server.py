@@ -149,6 +149,7 @@ class WebApp:
     def _render_page(self, title: str, body_html: str, lang: str, theme: str,
                       active_nav: str = None) -> bytes:
         import web_config as wc
+        import renewal_cli
         lang = lang if lang in wc.VALID_LANGUAGES else "en"
         theme = theme if theme in wc.VALID_THEMES else "dark"
         labels = LABELS[lang]
@@ -165,6 +166,7 @@ class WebApp:
 <form method="post" action="/logout"><button type="submit">{labels['logout']}</button></form>
 </nav>
 <main><h1>{_html_escape(title)}</h1>{body_html}</main>
+<footer class="muted">TixoCloud Control Center v{renewal_cli.VERSION}</footer>
 </body></html>""".encode("utf-8")
 
     def _redirect(self, location: str, extra_headers: dict = None) -> WebResponse:

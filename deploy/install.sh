@@ -107,6 +107,9 @@ cp -f "$SCRIPT_DIR"/lib/*.py "$INSTALL_DIR/lib/"
 cp -f "$SCRIPT_DIR"/bin/*.py "$INSTALL_DIR/bin/"
 chmod +x "$INSTALL_DIR"/bin/*.py
 
+APP_VERSION="$(PYTHONPATH="$INSTALL_DIR/lib" "$PYTHON_BIN" -c 'import renewal_cli; print(renewal_cli.VERSION)')"
+echo "TixoCloud Control Center: v$APP_VERSION"
+
 # Idempotent: the CLI's own `install` subcommand writes default configs only if absent, and
 # re-creates the SQLite schema only if missing (CREATE TABLE IF NOT EXISTS everywhere).
 export TIXO_RENEWAL_INSTALL_DIR="$INSTALL_DIR"
