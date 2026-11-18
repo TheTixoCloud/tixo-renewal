@@ -36,6 +36,21 @@ MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 THEME_COOKIE_NAME = "tixo_theme"
 LANG_COOKIE_NAME = "tixo_lang"
 
+# Static assets (v1.10.0) -- a fixed allowlist, never a user-supplied filename, so this can
+# never be used for path traversal or to expose anything outside this one directory
+# (shipped alongside this file: implementation/static/ in dev, lib/static/ once deployed --
+# never /root, never anything outside the application's own install tree). Served WITHOUT
+# requiring login (the login page itself needs the logo, and browsers request /favicon.ico
+# unauthenticated) -- every file here is public-safe branding/script content, nothing
+# sensitive.
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+STATIC_FILES = {
+    "/static/tixocloud.png": ("tixocloud.png", "image/png"),
+    "/static/tixocloud-dark.png": ("tixocloud-dark.png", "image/png"),
+    "/static/live-bandwidth.js": ("live-bandwidth.js", "application/javascript; charset=utf-8"),
+    "/favicon.ico": ("tixocloud.png", "image/png"),
+}
+
 LABELS = {
     "en": {
         "overview": "Overview", "host": "Live Host Monitoring", "network": "Network Traffic",
@@ -99,6 +114,10 @@ UI = {
         "timer": "Timer", "health": "Health", "save": "Save", "save_mode": "Save mode",
         "create": "Create", "send_report_now": "Send report now", "create_backup_now": "Create backup now",
         "saved": "Saved.", "fleet": "Fleet",
+        "live_bandwidth": "Live Network Bandwidth", "live_history": "Persistent Totals",
+        "pause": "Pause", "resume": "Resume", "live": "Live", "stale": "Stale",
+        "collecting": "Collecting live data...", "unit": "Unit", "window": "Window",
+        "last_1m": "1 min", "last_5m": "5 min", "last_15m": "15 min", "auto": "Auto",
     },
     "fa": {
         "total_vps": "تعداد کل VPS", "cpu_load": "بار CPU (۱ دقیقه)", "memory": "حافظه",
@@ -137,6 +156,10 @@ UI = {
         "timer": "تایمر", "health": "سلامت", "save": "ذخیره", "save_mode": "ذخیره حالت",
         "create": "ایجاد", "send_report_now": "ارسال گزارش اکنون", "create_backup_now": "ایجاد پشتیبان اکنون",
         "saved": "ذخیره شد.", "fleet": "ناوگان",
+        "live_bandwidth": "پهنای باند زنده شبکه", "live_history": "مجموع‌های پایدار",
+        "pause": "توقف", "resume": "ادامه", "live": "زنده", "stale": "قدیمی",
+        "collecting": "در حال جمع‌آوری داده زنده...", "unit": "واحد", "window": "بازه زمانی",
+        "last_1m": "۱ دقیقه", "last_5m": "۵ دقیقه", "last_15m": "۱۵ دقیقه", "auto": "خودکار",
     },
 }
 
@@ -194,8 +217,8 @@ a { color: inherit; }
 nav { width:236px; background:var(--bg-elevated); border-right:1px solid var(--border);
   padding:20px 14px; flex-shrink:0; position:sticky; top:0; height:100vh; overflow-y:auto; }
 [dir="rtl"] nav { border-right:none; border-left:1px solid var(--border); }
-nav h1 { font-size:17px; font-weight:700; letter-spacing:.2px; margin:4px 10px 18px;
-  color:var(--accent); display:flex; align-items:center; gap:8px; }
+.brand-logo { display:block; height:34px; width:auto; max-width:100%; object-fit:contain;
+  margin:4px 10px 18px; }
 nav a { display:flex; align-items:center; gap:10px; color:var(--muted); text-decoration:none;
   padding:9px 12px; border-radius:8px; margin-bottom:2px; font-size:13.5px; font-weight:500;
   transition: background .12s ease, color .12s ease; }
@@ -275,6 +298,25 @@ form { margin-bottom:8px; }
 .empty-state { color:var(--muted); font-size:13px; padding:20px; text-align:center; }
 .freshness { font-size:11.5px; padding:2px 8px; border-radius:6px; }
 
+/* ---------- login ---------- */
+.login-card { max-width:360px; margin:10vh auto 0; text-align:center; }
+.login-logo { display:block; height:48px; width:auto; max-width:100%; object-fit:contain;
+  margin:0 auto 22px; }
+.login-card input { width:100%; }
+.login-card button { width:100%; }
+
+/* ---------- live bandwidth widget ---------- */
+.live-bw-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between;
+  gap:10px; margin-bottom:12px; }
+.live-bw-controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+.live-bw-controls select, .live-bw-controls button { font-size:12.5px; padding:6px 10px; }
+.live-bw-iface { font-size:12px; }
+.live-bw-status { margin-top:8px; }
+.live-bw-ok { color:var(--ok); }
+.live-bw-warn { color:var(--warn); }
+.live-bw-bad { color:var(--bad); }
+.live-bw-svg { width:100%; height:auto; }
+
 @media (max-width: 900px) {
   body { flex-direction:column; }
   nav { width:100%; height:auto; position:static; padding:12px; }
@@ -353,12 +395,14 @@ class WebApp:
         # page with a dynamic title (e.g. "VPS 42") keeps that exact title untouched, since
         # it has no corresponding catalog entry.
         heading = labels[active_nav] if active_nav and title == LABELS["en"].get(active_nav) else title
+        logo_file = "/static/tixocloud.png" if theme == "dark" else "/static/tixocloud-dark.png"
         return f"""<!DOCTYPE html>
 <html lang="{lang}" dir="{direction}" data-theme="{theme}">
 <head><meta charset="utf-8"><title>TixoCloud -- {_html_escape(title)}</title>
+<link rel="icon" type="image/png" href="/favicon.ico">
 <style>{CSS}</style></head>
 <body>
-<nav><h1>TixoCloud</h1>{nav_html}
+<nav><img class="brand-logo" src="{logo_file}" alt="TixoCloud">{nav_html}
 <form method="post" action="/logout"><button type="submit">{labels['logout']}</button></form>
 </nav>
 <main><h1>{_html_escape(heading)}</h1>{body_html}</main>
@@ -407,6 +451,9 @@ class WebApp:
         lang = cookies.get(LANG_COOKIE_NAME, "en")
         theme = cookies.get(THEME_COOKIE_NAME, "dark")
 
+        if route in STATIC_FILES and method == "GET":
+            return self._handle_static(route)
+
         if route == "/login":
             return self._handle_login(method, form, cookies, remote_addr, lang, theme)
         if route == "/logout":
@@ -453,9 +500,12 @@ class WebApp:
         import web_auth as wa
         import security as sec
 
+        logo_file = "/static/tixocloud.png" if theme == "dark" else "/static/tixocloud-dark.png"
         if method == "GET":
             body = f"""
-<div class="card"><form method="post" action="/login">
+<div class="card login-card">
+<img class="login-logo" src="{logo_file}" alt="TixoCloud">
+<form method="post" action="/login">
 <p><input name="username" placeholder="Username" required></p>
 <p><input name="password" type="password" placeholder="Password" required></p>
 <p><button type="submit">Login</button></p>
@@ -477,7 +527,8 @@ class WebApp:
         user = wa.verify_login(self.config_dir, username, password)
         if user is None:
             self._audit(username or "unknown", "login_failed", remote_addr=remote_addr)
-            body = ('<div class="card"><p>Invalid credentials.</p>'
+            body = (f'<div class="card login-card"><img class="login-logo" src="{logo_file}" alt="TixoCloud">'
+                    '<p class="badge badge-bad">Invalid credentials.</p>'
                     '<form method="post" action="/login">'
                     '<p><input name="username" placeholder="Username" required></p>'
                     '<p><input name="password" type="password" placeholder="Password" required></p>'
@@ -527,6 +578,19 @@ class WebApp:
         value = wa.derive_csrf_token(secret, token)
         return f'<input type="hidden" name="csrf_token" value="{value}">'
 
+    # ---------- static assets ----------------------------------------------------------------
+
+    def _handle_static(self, route: str) -> WebResponse:
+        filename, content_type = STATIC_FILES[route]
+        path = os.path.join(STATIC_DIR, filename)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._not_found()
+        return WebResponse(status=200, content_type=content_type, body=data,
+                            headers={"Cache-Control": "public, max-age=3600"})
+
     # ---------- live JSON API ---------------------------------------------------------------
 
     def _handle_api_live(self, query) -> WebResponse:
@@ -543,6 +607,47 @@ class WebApp:
         return self._json({"configured": True, "interface": interface, **live, **block})
 
     # ---------- pages (each: user, method, form, session_token, remote_addr, lang, theme) ---
+
+    def _render_live_bandwidth_widget(self, lang: str, widget_id: str) -> str:
+        """The LIVE bandwidth section (v1.10.0) embedded on Overview and Network Traffic --
+        markup + i18n labels only; all polling/rate-computation/charting happens client-side
+        in static/live-bandwidth.js against the existing, already-authenticated /api/live
+        endpoint (one cheap /sys/class/net read per poll -- no new backend process, no extra
+        load). See that file's docstring for the full honesty/bounded-buffer discipline."""
+        return f"""
+<div class="card" id="{widget_id}"
+     data-l-download="{_t('download', lang)}" data-l-upload="{_t('upload', lang)}"
+     data-l-combined="{_t('combined', lang)}" data-l-pause="{_t('pause', lang)}"
+     data-l-resume="{_t('resume', lang)}" data-l-live="{_t('live', lang)}"
+     data-l-stale="{_t('stale', lang)}" data-l-unavailable="{_t('unavailable', lang)}"
+     data-l-collecting="{_t('collecting', lang)}" data-l-interface="{_t('interface', lang)}">
+  <div class="live-bw-header">
+    <div><b>{_t('live_bandwidth', lang)}</b> <span class="muted live-bw-iface"></span></div>
+    <div class="live-bw-controls">
+      <select class="live-bw-unit" aria-label="{_t('unit', lang)}">
+        <option value="auto">{_t('auto', lang)}</option>
+        <option value="mbps">Mbps</option>
+        <option value="gbps">Gbps</option>
+        <option value="MBps">MB/s</option>
+        <option value="GBps">GB/s</option>
+      </select>
+      <select class="live-bw-window" aria-label="{_t('window', lang)}">
+        <option value="60">{_t('last_1m', lang)}</option>
+        <option value="300" selected>{_t('last_5m', lang)}</option>
+        <option value="900">{_t('last_15m', lang)}</option>
+      </select>
+      <button type="button" class="secondary live-bw-pause">{_t('pause', lang)}</button>
+    </div>
+  </div>
+  <div class="kpi-grid live-bw-values"></div>
+  <div class="chart-wrap"><svg class="live-bw-svg" viewBox="0 0 760 200"></svg></div>
+  <div class="live-bw-status muted">{_t('collecting', lang)}</div>
+  <div class="section-title">{_t('live_history', lang)}</div>
+  <div class="kpi-grid live-bw-cumulative"></div>
+</div>
+<script src="/static/live-bandwidth.js"></script>
+<script>TixoLiveBandwidth.mount("{widget_id}");</script>
+"""
 
     def _period_kpi(self, bundle: dict, key: str, label_key: str, lang: str) -> str:
         """Renders one traffic-analytics period as a KPI card -- download/upload/combined via
@@ -631,9 +736,12 @@ class WebApp:
                            f'<a href="/traffic" class="muted" style="text-decoration:none">{_t("view_full_history", lang)} &rarr;</a></div>'
                            f'<div class="card chart-wrap">{chart_svg}</div>')
 
+        live_widget = self._render_live_bandwidth_widget(lang, "live-bw-overview") if net.get("configured") else ""
+
         body = f"""
 <div class="section-title">{_t('fleet_host', lang)}</div>
 <div class="kpi-grid">{kpi_fleet}</div>
+{live_widget}
 <div class="section-title">{_t('network_traffic', lang)}</div>
 <div class="kpi-grid">{traffic_kpis}</div>
 {chart_block}
@@ -728,8 +836,10 @@ poll(); setInterval(poll, 2000);
             rate = net.get("persistent_rate_bytes_per_sec")
             block = tf.format_traffic_block(cum.get("cumulative_rx_bytes"), cum.get("cumulative_tx_bytes"))
             rate_str = tf.format_bits_per_second(rate) if isinstance(rate, (int, float)) else None
+            live_widget = self._render_live_bandwidth_widget(lang, "live-bw-network")
             body = f"""
 <div class="card"><b>{_t('interface', lang)}:</b> {_html_escape(net['interface'])}</div>
+{live_widget}
 <div class="section-title">{_t('persistent_total', lang)}</div>
 <div class="kpi-grid">
 <div class="kpi"><div class="kpi-label">{_t('download', lang)} (RX)</div><div class="kpi-value">{block['download']}</div></div>

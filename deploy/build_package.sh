@@ -26,6 +26,12 @@ done
 cp -f "$IMPL/renewal_cli.py" "$HERE/bin/renewal_cli.py"
 cp -f "$HERE/integration_test_real_vps.py" "$HERE/bin/integration_test_real_vps.py"
 
+# Static Web assets (branding + the live-bandwidth client script) -- web_server.py resolves
+# these as a "static" directory sibling to itself, so this mirrors implementation/static/
+# exactly under lib/.
+mkdir -p "$HERE/lib/static"
+cp -f "$IMPL/static/"* "$HERE/lib/static/"
+
 chmod +x "$HERE/install.sh" "$HERE/uninstall.sh" "$HERE/bin/renewal_cli.py" "$HERE/bin/integration_test_real_vps.py"
 
 find "$HERE/lib" "$HERE/bin" -type d -name __pycache__ -exec rm -rf {} +

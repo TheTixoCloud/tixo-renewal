@@ -651,3 +651,146 @@ def test_vps_detail_page_keeps_dynamic_title_even_in_persian(tmp_path):
     body = r.body.decode()
     assert "<h1>VPS 42</h1>" in body
     assert "فهرست VPS" not in body.split("<main>")[1].split("</h1>")[0]
+
+
+# ---------- v1.10.0: static assets (logo, live-bandwidth.js) ---------------------------------
+
+def test_static_logo_served_without_login(tmp_path):
+    app, _, _ = _app_with_admin(tmp_path)
+    r = app.handle_request("GET", "/static/tixocloud.png", {}, {}, b"", "127.0.0.1")
+    assert r.status == 200
+    assert r.content_type.startswith("image/png")
+    assert r.body[:8] == b"\x89PNG\r\n\x1a\n"  # real PNG magic bytes, not a placeholder
+
+
+def test_static_dark_logo_served_without_login(tmp_path):
+    app, _, _ = _app_with_admin(tmp_path)
+    r = app.handle_request("GET", "/static/tixocloud-dark.png", {}, {}, b"", "127.0.0.1")
+    assert r.status == 200
+    assert r.body[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_static_live_bandwidth_js_served(tmp_path):
+    app, _, _ = _app_with_admin(tmp_path)
+    r = app.handle_request("GET", "/static/live-bandwidth.js", {}, {}, b"", "127.0.0.1")
+    assert r.status == 200
+    assert "javascript" in r.content_type
+    assert b"TixoLiveBandwidth" in r.body
+
+
+def test_favicon_served(tmp_path):
+    app, _, _ = _app_with_admin(tmp_path)
+    r = app.handle_request("GET", "/favicon.ico", {}, {}, b"", "127.0.0.1")
+    assert r.status == 200
+    assert r.content_type.startswith("image/png")
+
+
+def test_static_path_not_in_allowlist_never_reads_filesystem(tmp_path):
+    """Only exact dict keys are ever servable -- a path-traversal attempt or an unknown
+    filename must never read anything off disk; it falls through to the normal (safe)
+    unauthenticated redirect, exactly like any other unknown protected route."""
+    app, _, _ = _app_with_admin(tmp_path)
+    for path in ("/static/../web_server.py", "/static/../../etc/passwd",
+                 "/static/nonexistent.png", "/static/"):
+        r = app.handle_request("GET", path, {}, {}, b"", "127.0.0.1")
+        assert r.status == 302
+        assert r.headers.get("Location") == "/login"
+
+
+def test_login_page_displays_logo(tmp_path):
+    app, _, _ = _app_with_admin(tmp_path)
+    r = app.handle_request("GET", "/login", {}, {}, b"", "127.0.0.1")
+    assert b"login-logo" in r.body
+    assert b"/static/tixocloud.png" in r.body
+
+
+def test_login_page_dark_logo_variant_on_light_theme(tmp_path):
+    app, _, _ = _app_with_admin(tmp_path)
+    r = app.handle_request("GET", "/login", {}, {"tixo_theme": "light"}, b"", "127.0.0.1")
+    assert b"/static/tixocloud-dark.png" in r.body
+
+
+def test_sidebar_logo_present_on_authenticated_page(tmp_path):
+    app, _, _ = _app_with_admin(tmp_path)
+    cookies, _ = _login(app)
+    r = app.handle_request("GET", "/", {}, cookies, b"", "127.0.0.1")
+    assert b"brand-logo" in r.body
+
+
+# ---------- v1.10.0: live bandwidth widget -----------------------------------------------------
+
+def _configure_hostnet(config_dir, state_dir, interface="ens1f1"):
+    import hostnet_sync
+    hostnet_sync.save_monitored_interface(config_dir, interface, confirmed=True, state_dir=state_dir)
+
+
+def test_overview_has_live_widget_when_interface_configured(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    _configure_hostnet(config_dir, state_dir)
+    cookies, _ = _login(app)
+    r = app.handle_request("GET", "/", {}, cookies, b"", "127.0.0.1")
+    assert b"TixoLiveBandwidth.mount" in r.body
+    assert b"live-bw-overview" in r.body
+
+
+def test_overview_has_no_live_widget_when_interface_unconfigured(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    cookies, _ = _login(app)
+    r = app.handle_request("GET", "/", {}, cookies, b"", "127.0.0.1")
+    assert b"TixoLiveBandwidth.mount" not in r.body
+
+
+def test_network_page_has_live_widget_when_interface_configured(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    _configure_hostnet(config_dir, state_dir)
+    cookies, _ = _login(app)
+    r = app.handle_request("GET", "/network", {}, cookies, b"", "127.0.0.1")
+    assert b"TixoLiveBandwidth.mount" in r.body
+    assert b"live-bw-network" in r.body
+
+
+def test_network_page_no_live_widget_when_unconfigured(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    cookies, _ = _login(app)
+    r = app.handle_request("GET", "/network", {}, cookies, b"", "127.0.0.1")
+    assert b"TixoLiveBandwidth.mount" not in r.body
+
+
+def test_live_widget_requires_authentication(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    _configure_hostnet(config_dir, state_dir)
+    r = app.handle_request("GET", "/", {}, {}, b"", "127.0.0.1")
+    assert r.status == 302
+    assert r.headers.get("Location") == "/login"
+
+
+def test_api_live_still_requires_authentication(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    _configure_hostnet(config_dir, state_dir)
+    r = app.handle_request("GET", "/api/live", {}, {}, b"", "127.0.0.1")
+    assert r.status == 302
+
+
+def test_api_live_response_includes_read_at_timestamp_for_client_side_rate_calc(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    _configure_hostnet(config_dir, state_dir)
+    cookies, _ = _login(app)
+    r = app.handle_request("GET", "/api/live", {}, cookies, b"", "127.0.0.1")
+    assert r.status == 200
+    import json as _json
+    data = _json.loads(r.body)
+    assert data["configured"] is True
+    assert "read_at" in data
+    assert "rx_bytes" in data and "tx_bytes" in data
+
+
+def test_live_bandwidth_widget_never_leaks_raw_settings_fields(tmp_path):
+    """The widget's embedded data-l-* attributes are display labels only -- confirms no
+    config/secret dict ever gets dumped into this markup."""
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    _configure_hostnet(config_dir, state_dir)
+    cookies, _ = _login(app)
+    r = app.handle_request("GET", "/", {}, cookies, b"", "127.0.0.1")
+    body = r.body.decode()
+    assert "mac_address" not in body
+    assert "sample_interval_minutes" not in body
