@@ -806,10 +806,71 @@ def _status_color(status, style: Style) -> str:
     return style.GRAY  # "unavailable"/"unknown" and anything unrecognized
 
 
+def _char_display_width(ch: str) -> int:
+    """Approximates terminal column width for one character -- wide/fullwidth East Asian
+    characters occupy two terminal columns, everything else (including combining marks,
+    treated as zero-ish width by most real terminals but approximated as 1 here since a
+    true zero-width table is rare in a hostname) occupies one. Stdlib has no `wcwidth`;
+    this is the standard good-enough approximation used when one isn't available."""
+    import unicodedata
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _display_width(s: str) -> int:
+    return sum(_char_display_width(c) for c in s)
+
+
+def _truncate_display(s: str, max_width: int) -> str:
+    """Truncates to fit `max_width` terminal columns, appending an ellipsis ONLY when
+    truncation actually occurred -- a string that already fits is returned unchanged."""
+    if _display_width(s) <= max_width:
+        return s
+    if max_width <= 0:
+        return ""
+    if max_width == 1:
+        return "…"
+    budget = max_width - 1  # reserve one column for the ellipsis itself
+    out = []
+    width = 0
+    for ch in s:
+        w = _char_display_width(ch)
+        if width + w > budget:
+            break
+        out.append(ch)
+        width += w
+    return "".join(out) + "…"
+
+
+def _pad_display(s: str, width: int, align: str = "<") -> str:
+    """Pads `s` to `width` TERMINAL COLUMNS (not Python character count), so a string
+    containing wide characters doesn't throw off column alignment the way plain
+    `f'{s:<{width}}'` would."""
+    pad = max(0, width - _display_width(s))
+    return (" " * pad + s) if align == ">" else (s + " " * pad)
+
+
+def _vps_usage_fraction(record: dict):
+    """Returns (is_unlimited, percent_or_None) -- shared by every table tier so the
+    unlimited/zero-usage distinction is computed exactly once, consistently."""
+    quota, used = record.get("quota_gb"), record.get("used_gb")
+    try:
+        is_unlimited = Decimal(str(quota)) <= 0
+    except Exception:
+        is_unlimited = False
+    try:
+        pct = (Decimal(str(used)) / Decimal(str(quota))) * 100 if not is_unlimited else None
+    except Exception:
+        pct = None
+    return is_unlimited, pct
+
+
 def render_vps_table(records: list[dict], style: Style) -> str:
-    """VPS ID | Hostname | Primary IP | Status | Quota | Used | Usage% -- column widths
-    adapt to the terminal width (narrower hostname/IP columns on a narrow terminal rather
-    than wrapping/corrupting the table)."""
+    """Adapts to the terminal width across three tiers (wide >=100 cols: ID/Hostname/IP/
+    State/Quota/Used/Usage bar; medium 70-99: ID/Hostname/State/Used-over-Quota/%; narrow
+    <70: ID/Hostname/Usage%% only) -- never overflows horizontally, never changes the
+    underlying quota/used data (full values remain in render_vps_detail). Long hostnames
+    are truncated with a single ellipsis character, display-width-aware so CJK/wide
+    characters don't silently break column alignment."""
     if not records:
         return f"  {style.GRAY}(no VPS records -- run an inventory sync first){style.RESET}"
     try:
@@ -817,31 +878,66 @@ def render_vps_table(records: list[dict], style: Style) -> str:
         term_width = shutil.get_terminal_size(fallback=(100, 24)).columns
     except Exception:
         term_width = 100
-    narrow = term_width < 100
-    host_w, ip_w = (16, 13) if narrow else (22, 15)
 
-    header = (f"  {'VPSID':>7}  {'HOSTNAME':<{host_w}}  {'IP':<{ip_w}}  {'STATUS':<10}  "
-              f"{'QUOTA_GB':>9}  {'USED_GB':>9}  {'USAGE':<14}")
-    lines = [style.BOLD + style.ACCENT + header + style.RESET]
-    for r in records:
-        quota, used = r.get("quota_gb"), r.get("used_gb")
-        try:
-            is_unlimited = Decimal(str(quota)) <= 0
-        except Exception:
-            is_unlimited = False
-        try:
-            pct = (Decimal(str(used)) / Decimal(str(quota))) * 100 if not is_unlimited else None
-        except Exception:
-            pct = None
-        usage_display = "UNLIMITED" if is_unlimited else render_progress_bar(
-            float(pct) if pct is not None else None, width=10, style=style)
-        runtime_status = r.get("runtime_status", "unavailable")
-        color = _status_color(runtime_status, style)
-        ip = str(r.get("ip_primary", "unavailable"))
-        lines.append(f"  {r['vpsid']:>7}  {str(r.get('hostname'))[:host_w]:<{host_w}}  "
-                     f"{ip[:ip_w]:<{ip_w}}  "
-                     f"{color}{str(runtime_status)[:10]:<10}{style.RESET}  "
-                     f"{str(quota):>9}  {str(used):>9}  {usage_display}")
+    if term_width >= 100:
+        tier = "wide"
+    elif term_width >= 70:
+        tier = "medium"
+    else:
+        tier = "narrow"
+
+    lines = []
+
+    if tier == "wide":
+        host_w, ip_w = 22, 15
+        header = (f"  {_pad_display('ID', 7, '>')}  {_pad_display('Hostname', host_w)}  "
+                  f"{_pad_display('IP', ip_w)}  {_pad_display('State', 10)}  "
+                  f"{_pad_display('Quota', 9, '>')}  {_pad_display('Used', 9, '>')}  Usage")
+        lines.append(style.BOLD + style.ACCENT + header + style.RESET)
+        for r in records:
+            is_unlimited, pct = _vps_usage_fraction(r)
+            usage_display = "UNLIMITED" if is_unlimited else render_progress_bar(
+                float(pct) if pct is not None else None, width=10, style=style)
+            runtime_status = r.get("runtime_status", "unavailable")
+            color = _status_color(runtime_status, style)
+            ip = _truncate_display(str(r.get("ip_primary", "unavailable")), ip_w)
+            hostname = _truncate_display(str(r.get("hostname")), host_w)
+            lines.append(
+                f"  {_pad_display(str(r['vpsid']), 7, '>')}  {_pad_display(hostname, host_w)}  "
+                f"{_pad_display(ip, ip_w)}  "
+                f"{color}{_pad_display(_truncate_display(str(runtime_status), 10), 10)}{style.RESET}  "
+                f"{_pad_display(str(r.get('quota_gb')), 9, '>')}  "
+                f"{_pad_display(str(r.get('used_gb')), 9, '>')}  {usage_display}")
+
+    elif tier == "medium":
+        host_w = 16
+        header = (f"  {_pad_display('ID', 6, '>')}  {_pad_display('Hostname', host_w)}  "
+                  f"{_pad_display('State', 9)}  {_pad_display('Used/Quota', 14, '>')}  %")
+        lines.append(style.BOLD + style.ACCENT + header + style.RESET)
+        for r in records:
+            is_unlimited, pct = _vps_usage_fraction(r)
+            quota, used = r.get("quota_gb"), r.get("used_gb")
+            used_quota = "UNLIMITED" if is_unlimited else f"{used}/{quota}"
+            pct_display = "--" if is_unlimited else (f"{float(pct):.0f}%" if pct is not None else "?")
+            runtime_status = r.get("runtime_status", "unavailable")
+            color = _status_color(runtime_status, style)
+            hostname = _truncate_display(str(r.get("hostname")), host_w)
+            lines.append(
+                f"  {_pad_display(str(r['vpsid']), 6, '>')}  {_pad_display(hostname, host_w)}  "
+                f"{color}{_pad_display(_truncate_display(str(runtime_status), 9), 9)}{style.RESET}  "
+                f"{_pad_display(used_quota, 14, '>')}  {pct_display}")
+
+    else:  # narrow
+        host_w = 12
+        header = f"  {_pad_display('ID', 5, '>')}  {_pad_display('Hostname', host_w)}  Usage"
+        lines.append(style.BOLD + style.ACCENT + header + style.RESET)
+        for r in records:
+            is_unlimited, pct = _vps_usage_fraction(r)
+            usage_display = "UNLIM" if is_unlimited else (f"{float(pct):.0f}%" if pct is not None else "?")
+            hostname = _truncate_display(str(r.get("hostname")), host_w)
+            lines.append(f"  {_pad_display(str(r['vpsid']), 5, '>')}  "
+                         f"{_pad_display(hostname, host_w)}  {usage_display}")
+
     return "\n".join(lines)
 
 

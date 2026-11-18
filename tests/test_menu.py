@@ -740,6 +740,99 @@ def test_render_vps_table_shows_primary_ip_column():
     assert "203.0.113.5" in out
 
 
+# ---------- v1.8.0: adaptive VPS table tiers, truncation, Unicode width -----------------------
+
+def _vps_record(**overrides):
+    base = {"vpsid": 1, "hostname": "web1", "status": "running", "runtime_status": "running",
+            "quota_gb": "100", "used_gb": "10", "ip_primary": "203.0.113.5"}
+    base.update(overrides)
+    return base
+
+
+def test_render_vps_table_medium_tier_hides_ip_shows_used_over_quota(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "get_terminal_size",
+                         lambda fallback=None: os.terminal_size((80, 24)))
+    records = [_vps_record(used_gb="10", quota_gb="100")]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    assert "web1" in out
+    assert "10/100" in out
+    assert "203.0.113.5" not in out
+
+
+def test_render_vps_table_narrow_tier_shows_only_id_hostname_usage(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "get_terminal_size",
+                         lambda fallback=None: os.terminal_size((60, 24)))
+    records = [_vps_record(used_gb="25", quota_gb="100")]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    assert "web1" in out
+    assert "25%" in out
+    assert "203.0.113.5" not in out
+    assert "10/100" not in out  # medium-tier-only format never leaks into narrow
+
+
+def test_render_vps_table_medium_tier_marks_unlimited_distinct_from_zero_usage():
+    import shutil
+    orig = shutil.get_terminal_size
+    try:
+        shutil.get_terminal_size = lambda fallback=None: __import__("os").terminal_size((80, 24))
+        unlimited = _vps_record(vpsid=1, hostname="unlimited-vps", quota_gb="0", used_gb="500")
+        zero_usage = _vps_record(vpsid=2, hostname="idle-vps", quota_gb="100", used_gb="0")
+        out = menu.render_vps_table([unlimited, zero_usage], menu.Style(enabled=False))
+        assert "UNLIMITED" in out
+        assert "0/100" in out  # zero usage shown as a real 0, never confused with unlimited
+    finally:
+        shutil.get_terminal_size = orig
+
+
+def test_render_vps_table_truncates_long_hostname_with_ellipsis(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "get_terminal_size",
+                         lambda fallback=None: os.terminal_size((60, 24)))
+    long_name = "a-very-long-hostname-that-does-not-fit"
+    records = [_vps_record(hostname=long_name)]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    assert long_name not in out
+    assert "…" in out
+
+
+def test_render_vps_table_short_hostname_never_gets_an_ellipsis():
+    records = [_vps_record(hostname="web1")]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    assert "…" not in out
+
+
+def test_display_width_helpers_handle_wide_unicode_characters():
+    # CJK characters occupy two terminal columns each.
+    assert menu._display_width("日本語") == 6
+    assert menu._display_width("abc") == 3
+
+
+def test_truncate_display_respects_wide_character_width():
+    truncated = menu._truncate_display("日本語abcdef", 7)
+    assert menu._display_width(truncated) <= 7
+    assert truncated.endswith("…")
+
+
+def test_truncate_display_leaves_fitting_string_unchanged():
+    assert menu._truncate_display("short", 20) == "short"
+
+
+def test_pad_display_accounts_for_wide_characters():
+    padded = menu._pad_display("日本", 10)
+    assert menu._display_width(padded) == 10
+
+
+def test_render_vps_table_unicode_hostname_does_not_crash_narrow_tier(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "get_terminal_size",
+                         lambda fallback=None: os.terminal_size((60, 24)))
+    records = [_vps_record(hostname="日本語サーバー001")]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    assert out  # must render without raising, regardless of exact truncation point
+
+
 # ---------- v1.7.0: host network traffic panel rendering ----------------------------------
 
 def test_render_hostnet_panel_no_samples_yet():
