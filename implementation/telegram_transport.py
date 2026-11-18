@@ -220,10 +220,23 @@ def socks5_connect(proxy_host: str, proxy_port: int, target_host: str, target_po
     logs/raises with the password in the message."""
     sock = socket_factory((proxy_host, proxy_port), timeout=timeout)
     try:
-        auth_methods = bytes([0x02, 0x00]) if username else bytes([0x01, 0x00])
+        # v1.10.1 FIX: this used to build `auth_methods` (intending to offer
+        # USERNAME_PASSWORD(0x02) before NO_AUTH(0x00) as a fallback) but then discard it,
+        # sending a separately hardcoded, differently-ordered byte sequence instead
+        # ([0x00, 0x02], i.e. NO_AUTH listed first). RFC 1928 lets the server pick any
+        # offered method regardless of order, so a strictly compliant proxy wouldn't care --
+        # but some proxy implementations naively pick the first method they also support,
+        # which could cause them to select NO_AUTH when a configured, credential-requiring
+        # proxy was expected to select USERNAME_PASSWORD, silently skipping the auth
+        # sub-negotiation and then failing (or behaving unexpectedly) at the CONNECT stage
+        # instead -- a real contributing candidate for a hard-to-diagnose "proxy auth
+        # failure" that was never actually exercised by the existing test suite (the test
+        # double unconditionally replies with method 0x02 without ever inspecting which
+        # bytes the client actually sent). Fixed by sending exactly the method list this
+        # function decided to offer, in the intended preference order.
+        methods = bytes([0x02, 0x00]) if username else bytes([0x00])
         # greeting: VER=5, NMETHODS, METHODS...
-        sock.sendall(bytes([0x05, len(auth_methods) if username else 1]) +
-                     (bytes([0x00, 0x02]) if username else bytes([0x00])))
+        sock.sendall(bytes([0x05, len(methods)]) + methods)
         chosen = sock.recv(2)
         if len(chosen) != 2 or chosen[0] != 0x05:
             raise Socks5Error("malformed SOCKS5 server greeting response")

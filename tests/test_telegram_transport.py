@@ -307,6 +307,7 @@ class _FakeSocks5Server(threading.Thread):
         self.server_sock.listen(1)
         self.port = self.server_sock.getsockname()[1]
         self.last_target = None
+        self.last_offered_methods = None
 
     def run(self):
         conn, _ = self.server_sock.accept()
@@ -325,6 +326,7 @@ class _FakeSocks5Server(threading.Thread):
         greeting = conn.recv(2)  # VER, NMETHODS
         nmethods = greeting[1]
         methods = conn.recv(nmethods) if nmethods else b""
+        self.last_offered_methods = methods
         if self.require_auth:
             conn.sendall(bytes([0x05, 0x02]))
             auth = conn.recv(256)
@@ -379,6 +381,37 @@ def test_socks5_connect_real_handshake_with_auth_success():
         assert sock.recv(16) == b"TUNNEL-OK"
     finally:
         sock.close()
+
+
+def test_socks5_connect_offers_username_password_before_no_auth(tmp_path=None):
+    """Regression test for a real bug found during Telegram connectivity diagnosis
+    (v1.10.1): the greeting-construction code computed an `auth_methods` byte sequence
+    intending to offer USERNAME_PASSWORD(0x02) before NO_AUTH(0x00) as a fallback, but then
+    discarded it and sent a separately hardcoded, differently-ordered byte sequence instead.
+    A strictly RFC-1928-compliant proxy doesn't care about offer order, but a naive one that
+    just picks the first method it also supports could select NO_AUTH when a credentialed
+    connection was intended -- exactly the kind of silent misbehavior that would surface as
+    a confusing downstream "authentication failed" or unexplained CONNECT rejection. This
+    test inspects the ACTUAL bytes sent on the wire (the previous test server replied with a
+    fixed method regardless of what was offered, so this exact defect was never caught)."""
+    server = _FakeSocks5Server(require_auth=True, expected_user="admin", expected_pass="secret")
+    server.start()
+    sock = tt.socks5_connect("127.0.0.1", server.port, "api.telegram.org", 443,
+                              username="admin", password="secret", timeout=5)
+    sock.close()
+    server.join(timeout=2)
+    assert server.last_offered_methods == bytes([0x02, 0x00]), (
+        f"expected USERNAME_PASSWORD(0x02) offered before NO_AUTH(0x00), "
+        f"got {list(server.last_offered_methods)}")
+
+
+def test_socks5_connect_offers_only_no_auth_when_no_credentials_configured():
+    server = _FakeSocks5Server(require_auth=False)
+    server.start()
+    sock = tt.socks5_connect("127.0.0.1", server.port, "api.telegram.org", 443, timeout=5)
+    sock.close()
+    server.join(timeout=2)
+    assert server.last_offered_methods == bytes([0x00])
 
 
 def test_socks5_connect_auth_failure_raises():
