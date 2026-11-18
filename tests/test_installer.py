@@ -400,6 +400,89 @@ def test_action_install_offers_repair_for_existing_install(cli_env, monkeypatch,
     assert "Repair succeeded" in out
 
 
+def test_uninstall_optional_module_rejects_unknown_module(cli_env):
+    with pytest.raises(ValueError):
+        installer.uninstall_optional_module("nope", cli_env["config_dir"],
+                                              renewal_cli.SYSTEMD_OUT_DIR)
+
+
+@pytest.mark.parametrize("module_name,settings_module,settings_loader,unit_name", [
+    ("telegram", "telegram_config", "load_telegram_settings", "virt-renewal-telegram-bot.service"),
+    ("web", "web_config", "load_web_settings", "virt-renewal-web.service"),
+    ("agent", "agent_config", "load_agent_settings", "virt-renewal-agent.service"),
+])
+def test_uninstall_optional_module_disables_and_removes_unit(cli_env, module_name,
+                                                                settings_module, settings_loader,
+                                                                unit_name):
+    renewal_cli.cmd_install(argparse_namespace())  # generates the systemd units
+    assert os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, unit_name))
+
+    import importlib
+    mod = importlib.import_module(settings_module)
+    # Enable it first so disabling is a real, observable state change.
+    settings = getattr(mod, settings_loader)(cli_env["config_dir"])
+    settings.enabled = True
+    save_fn_name = settings_loader.replace("load_", "save_")
+    getattr(mod, save_fn_name)(cli_env["config_dir"], settings)
+
+    result = installer.uninstall_optional_module(module_name, cli_env["config_dir"],
+                                                    renewal_cli.SYSTEMD_OUT_DIR)
+    assert result["disabled"] is True
+    assert result["secrets_purged"] is False
+    assert unit_name in result["units_removed"]
+    assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, unit_name))
+
+    reloaded = getattr(mod, settings_loader)(cli_env["config_dir"])
+    assert reloaded.enabled is False
+
+
+def test_uninstall_optional_module_keeps_secrets_by_default(cli_env):
+    import telegram_config as tc
+    secrets_path = tc.default_secrets_path(cli_env["config_dir"])
+    tc.store_telegram_secrets(secrets_path, bot_token="123:ABC")
+    installer.uninstall_optional_module("telegram", cli_env["config_dir"],
+                                          renewal_cli.SYSTEMD_OUT_DIR)
+    assert os.path.exists(secrets_path)
+
+
+def test_uninstall_optional_module_purges_secrets_when_requested(cli_env):
+    import telegram_config as tc
+    secrets_path = tc.default_secrets_path(cli_env["config_dir"])
+    tc.store_telegram_secrets(secrets_path, bot_token="123:ABC")
+    result = installer.uninstall_optional_module("telegram", cli_env["config_dir"],
+                                                    renewal_cli.SYSTEMD_OUT_DIR,
+                                                    purge_secrets=True)
+    assert result["secrets_purged"] is True
+    assert not os.path.exists(secrets_path)
+
+
+def test_uninstall_optional_module_never_touches_core_renewal_config(cli_env):
+    renewal_cli.cmd_install(argparse_namespace())
+    nodes_path = os.path.join(cli_env["config_dir"], "nodes.json")
+    before = open(nodes_path).read()
+    installer.uninstall_optional_module("telegram", cli_env["config_dir"],
+                                          renewal_cli.SYSTEMD_OUT_DIR)
+    after = open(nodes_path).read()
+    assert before == after
+    assert os.path.exists(os.path.join(cli_env["state_dir"], "test-node.sqlite3"))
+
+
+def test_cmd_uninstall_module_cli(cli_env, capsys):
+    renewal_cli.cmd_install(argparse_namespace())
+    rc = renewal_cli.cmd_uninstall_module(
+        argparse_namespace(module="telegram", purge_secrets=False))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "disabled" in out
+
+
+def test_cmd_uninstall_module_cli_rejects_unknown_module(cli_env, capsys):
+    rc = renewal_cli.cmd_uninstall_module(argparse_namespace(module="nope", purge_secrets=False))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "unknown module" in out
+
+
 def test_action_install_cancel_does_nothing(cli_env, monkeypatch, capsys):
     import menu
     renewal_cli.cmd_install(argparse_namespace())

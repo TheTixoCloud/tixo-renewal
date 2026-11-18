@@ -238,6 +238,88 @@ def repair(config_dir: str, state_dir: str, backup_root: str) -> dict:
 
 # ---------- post-change health check ----------------------------------------------------------
 
+# ---------- safe uninstall of a single optional module -------------------------------------------
+
+OPTIONAL_MODULES = ("telegram", "web", "relay_worker", "agent", "backup_schedule")
+
+
+def uninstall_optional_module(module_name: str, config_dir: str, systemd_out_dir: str,
+                                purge_secrets: bool = False) -> dict:
+    """Disables ONE optional module (sets its settings.enabled = False) without touching
+    the core renewal install, any other optional module, or any historical data. Optionally
+    (only if explicitly requested) also deletes that module's stored secret file --
+    disabled by default so an operator can re-enable without re-entering credentials.
+    Removes that module's generated-but-never-installed systemd unit file(s) from
+    `systemd_out_dir` -- this NEVER touches `/etc/systemd/system` or runs `systemctl`
+    itself; if the unit was ever actually installed/enabled there, the operator must still
+    run the printed `systemctl disable --now ...` command themselves."""
+    if module_name not in OPTIONAL_MODULES:
+        raise ValueError(f"unknown module: {module_name!r} (must be one of {OPTIONAL_MODULES})")
+
+    report = {"module": module_name, "disabled": False, "secrets_purged": False,
+               "units_removed": []}
+
+    if module_name == "telegram":
+        import telegram_config as tc
+        settings = tc.load_telegram_settings(config_dir)
+        settings.enabled = False
+        tc.save_telegram_settings(config_dir, settings)
+        if purge_secrets:
+            tc.delete_telegram_secrets(tc.default_secrets_path(config_dir))
+        units = ("virt-renewal-telegram-bot.service",)
+    elif module_name == "web":
+        import web_config as wc
+        settings = wc.load_web_settings(config_dir)
+        settings.enabled = False
+        wc.save_web_settings(config_dir, settings)
+        if purge_secrets:
+            import shutil as _shutil
+            users_dir = os.path.join(config_dir, "web")
+            if os.path.isdir(users_dir):
+                _shutil.rmtree(users_dir)
+        units = ("virt-renewal-web.service",)
+    elif module_name == "relay_worker":
+        import telegram_config as tc
+        settings = tc.load_relay_worker_settings(config_dir)
+        settings.enabled = False
+        tc.save_relay_worker_settings(config_dir, settings)
+        if purge_secrets:
+            path = tc.default_relay_worker_secrets_path(config_dir)
+            if os.path.exists(path):
+                os.remove(path)
+        units = ("virt-renewal-relay-worker.service",)
+    elif module_name == "agent":
+        import agent_config as ac
+        settings = ac.load_agent_settings(config_dir)
+        settings.enabled = False
+        ac.save_agent_settings(config_dir, settings)
+        if purge_secrets:
+            path = ac.default_secrets_path(config_dir)
+            if os.path.exists(path):
+                os.remove(path)
+        units = ("virt-renewal-agent.service",)
+    else:  # backup_schedule
+        import backup_config as bcfg
+        settings = bcfg.load_backup_schedule_settings(config_dir)
+        settings.enabled = False
+        bcfg.save_backup_schedule_settings(config_dir, settings)
+        if purge_secrets:
+            path = bcfg.default_passphrase_path(config_dir)
+            if os.path.exists(path):
+                os.remove(path)
+        units = ("virt-renewal-backup.service", "virt-renewal-backup.timer")
+
+    report["disabled"] = True
+    report["secrets_purged"] = purge_secrets
+    for unit in units:
+        unit_path = os.path.join(systemd_out_dir, unit)
+        if os.path.exists(unit_path):
+            os.remove(unit_path)
+            report["units_removed"].append(unit)
+
+    return report
+
+
 def health_check(config_dir: str, state_dir: str) -> dict:
     """Consolidated, read-only report of whether the install looks healthy after a change --
     never restarts or enables anything itself."""

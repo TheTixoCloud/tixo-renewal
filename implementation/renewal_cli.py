@@ -957,6 +957,26 @@ def cmd_install_rollback(args):
     return 0
 
 
+def cmd_uninstall_module(args):
+    """Safely disables ONE optional module (Telegram/Web/relay worker/remote agent/backup
+    schedule) without touching the core renewal install or any other module. Secrets are
+    kept unless --purge-secrets is explicitly passed."""
+    import installer as inst
+    if args.module not in inst.OPTIONAL_MODULES:
+        print(f"ERROR: unknown module {args.module!r} (must be one of {inst.OPTIONAL_MODULES})")
+        return 1
+    result = inst.uninstall_optional_module(args.module, CONFIG_DIR, SYSTEMD_OUT_DIR,
+                                              purge_secrets=args.purge_secrets)
+    print(f"Module {result['module']!r} disabled.")
+    if result["secrets_purged"]:
+        print("Secrets purged.")
+    if result["units_removed"]:
+        print(f"Removed generated systemd unit file(s): {result['units_removed']}")
+        print("If any were ever installed into /etc/systemd/system, disable/remove them "
+              "there yourself (a separate explicit root action).")
+    return 0
+
+
 def cmd_install_health_check(args):
     """Read-only post-change sanity check -- never restarts or enables anything."""
     import installer as inst
@@ -1765,6 +1785,15 @@ def main():
 
     sub.add_parser("install-health-check", help="Read-only post-change sanity check"
                    ).set_defaults(func=cmd_install_health_check)
+
+    uninstall_module_p = sub.add_parser(
+        "uninstall-module",
+        help="Safely disable ONE optional module without touching the core install")
+    uninstall_module_p.add_argument("--module", required=True,
+                                     choices=("telegram", "web", "relay_worker", "agent",
+                                              "backup_schedule"))
+    uninstall_module_p.add_argument("--purge-secrets", action="store_true")
+    uninstall_module_p.set_defaults(func=cmd_uninstall_module)
     sub.add_parser("status").set_defaults(func=cmd_status)
     sub.add_parser("dry-run").set_defaults(func=cmd_dry_run)
     sub.add_parser("verify").set_defaults(func=cmd_verify)
