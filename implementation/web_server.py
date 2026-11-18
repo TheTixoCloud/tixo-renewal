@@ -55,6 +55,100 @@ LABELS = {
     },
 }
 
+# UI string catalog (v1.9.0, §12 localization) -- every recurring piece of page "chrome"
+# (section titles, KPI labels, table column headers, badge/status words, button labels)
+# used across all 17 pages, looked up through _t(key, lang) rather than hardcoded inline.
+# Long one-off help/explanatory paragraphs are intentionally NOT catalogued here (they are
+# lower-value for a quick-glance operational dashboard and would roughly triple this table's
+# size) -- those remain English-only, same as this project's existing CLI help text.
+UI = {
+    "en": {
+        "total_vps": "Total VPS", "cpu_load": "CPU load (1m)", "memory": "Memory",
+        "host_uptime": "Host uptime", "fleet_host": "Fleet & Host", "network_traffic": "Network Traffic",
+        "today": "Today", "yesterday": "Yesterday", "last_7_days": "Last 7 days",
+        "this_month_gregorian": "This month (Gregorian)", "this_month_jalali": "This month (Jalali)",
+        "this_week": "This week", "all_time": "All time", "last_30_days": "Last 30 days",
+        "network_interface": "Network interface", "configured_on": "configured on",
+        "not_configured": "not configured", "renewal": "Renewal", "write_approved": "write-approved",
+        "auto_renewal": "auto-renewal", "emergency_policy_mode": "Emergency policy mode",
+        "write_approved_label": "Write approved", "auto_renewal_label": "Auto-renewal",
+        "monthly_grant_label": "Monthly grant", "grant_amount_label": "Grant amount",
+        "active_alerts": "Active alerts", "daily_history": "Daily history", "standard_periods": "Standard periods",
+        "last_7d_days": "Last 7 Days", "view_full_history": "view full history",
+        "download": "Download", "upload": "Upload", "combined": "Combined", "coverage": "Coverage",
+        "period": "Period", "full_coverage": "full coverage", "partial": "partial", "no_data": "no data",
+        "cpu": "CPU", "model": "Model", "cores_threads": "Cores / Threads", "load_average": "Load average",
+        "ram_used": "RAM used", "swap_used": "Swap used", "uptime": "Uptime", "local_time": "Local time",
+        "last_boot": "Last boot", "host": "Host", "technical_details": "Technical details",
+        "interface": "Interface", "persistent_total": "Persistent Total (since monitoring started)",
+        "current_sampler_rate": "Current sampler rate", "combined_rate": "Combined rate",
+        "vps_id": "VPS ID", "name": "Name", "ip": "IP", "status": "Status", "used": "Used",
+        "limit": "Limit", "usage_pct": "Usage %", "running": "running", "stopped": "stopped",
+        "suspended": "suspended", "unlimited": "unlimited", "unavailable": "unavailable",
+        "node": "Node", "total_ops": "Total ops", "unresolved": "Unresolved",
+        "per_node_operations": "Per-node operations", "monthly_grant": "Monthly grant",
+        "current_mode": "Current mode", "grant_amount": "Grant amount",
+        "grants_approved_marker": "Grants-approved marker", "proposed_grants": "Proposed grants",
+        "id": "ID", "vps": "VPS", "reason": "Reason", "detail": "Detail", "type": "Type",
+        "enabled": "Enabled", "connectivity_mode": "Connectivity mode", "admins_viewers": "Admins / Viewers",
+        "secrets_configured": "Secrets configured", "scheduled": "Scheduled", "schedule": "Schedule",
+        "last_sent": "Last sent", "archives_on_disk": "Archives on disk", "archive": "Archive",
+        "display_timezone": "Display timezone", "calendar_preference": "Calendar preference",
+        "user": "User", "role": "Role", "disabled": "Disabled", "time": "Time", "actor": "Actor",
+        "action": "Action", "timers_tracked": "Timers tracked", "active": "Active", "failed": "Failed",
+        "timer": "Timer", "health": "Health", "save": "Save", "save_mode": "Save mode",
+        "create": "Create", "send_report_now": "Send report now", "create_backup_now": "Create backup now",
+        "saved": "Saved.", "fleet": "Fleet",
+    },
+    "fa": {
+        "total_vps": "تعداد کل VPS", "cpu_load": "بار CPU (۱ دقیقه)", "memory": "حافظه",
+        "host_uptime": "مدت کار میزبان", "fleet_host": "ناوگان و میزبان", "network_traffic": "ترافیک شبکه",
+        "today": "امروز", "yesterday": "دیروز", "last_7_days": "۷ روز گذشته",
+        "this_month_gregorian": "این ماه (میلادی)", "this_month_jalali": "این ماه (شمسی)",
+        "this_week": "این هفته", "all_time": "تمام مدت", "last_30_days": "۳۰ روز گذشته",
+        "network_interface": "واسط شبکه", "configured_on": "پیکربندی‌شده روی",
+        "not_configured": "پیکربندی نشده", "renewal": "تمدید", "write_approved": "نوشتن تأییدشده",
+        "auto_renewal": "تمدید خودکار", "emergency_policy_mode": "حالت سیاست اضطراری",
+        "write_approved_label": "نوشتن تأییدشده", "auto_renewal_label": "تمدید خودکار",
+        "monthly_grant_label": "اعطای ماهانه", "grant_amount_label": "مقدار اعطا",
+        "active_alerts": "هشدارهای فعال", "daily_history": "تاریخچه روزانه", "standard_periods": "دوره‌های استاندارد",
+        "last_7d_days": "۷ روز گذشته", "view_full_history": "مشاهده تاریخچه کامل",
+        "download": "دریافت", "upload": "ارسال", "combined": "مجموع", "coverage": "پوشش",
+        "period": "دوره", "full_coverage": "پوشش کامل", "partial": "ناقص", "no_data": "بدون داده",
+        "cpu": "پردازنده", "model": "مدل", "cores_threads": "هسته‌ها / رشته‌ها", "load_average": "میانگین بار",
+        "ram_used": "رم استفاده‌شده", "swap_used": "سواپ استفاده‌شده", "uptime": "مدت کار", "local_time": "زمان محلی",
+        "last_boot": "آخرین بوت", "host": "میزبان", "technical_details": "جزئیات فنی",
+        "interface": "واسط", "persistent_total": "مجموع پایدار (از زمان شروع نظارت)",
+        "current_sampler_rate": "نرخ نمونه‌گیری فعلی", "combined_rate": "نرخ مجموع",
+        "vps_id": "شناسه VPS", "name": "نام", "ip": "آی‌پی", "status": "وضعیت", "used": "استفاده‌شده",
+        "limit": "سقف", "usage_pct": "درصد استفاده", "running": "در حال اجرا", "stopped": "متوقف",
+        "suspended": "معلق", "unlimited": "نامحدود", "unavailable": "در دسترس نیست",
+        "node": "گره", "total_ops": "کل عملیات", "unresolved": "حل‌نشده",
+        "per_node_operations": "عملیات هر گره", "monthly_grant": "اعطای ماهانه",
+        "current_mode": "حالت فعلی", "grant_amount": "مقدار اعطا",
+        "grants_approved_marker": "نشانگر تأیید اعطا", "proposed_grants": "اعطاهای پیشنهادی",
+        "id": "شناسه", "vps": "VPS", "reason": "دلیل", "detail": "جزئیات", "type": "نوع",
+        "enabled": "فعال", "connectivity_mode": "حالت اتصال", "admins_viewers": "مدیران / بینندگان",
+        "secrets_configured": "اطلاعات محرمانه پیکربندی‌شده", "scheduled": "زمان‌بندی‌شده", "schedule": "زمان‌بندی",
+        "last_sent": "آخرین ارسال", "archives_on_disk": "آرشیوهای موجود", "archive": "آرشیو",
+        "display_timezone": "منطقه زمانی نمایش", "calendar_preference": "ترجیح تقویم",
+        "user": "کاربر", "role": "نقش", "disabled": "غیرفعال", "time": "زمان", "actor": "عامل",
+        "action": "عملیات", "timers_tracked": "تایمرهای پایش‌شده", "active": "فعال", "failed": "ناموفق",
+        "timer": "تایمر", "health": "سلامت", "save": "ذخیره", "save_mode": "ذخیره حالت",
+        "create": "ایجاد", "send_report_now": "ارسال گزارش اکنون", "create_backup_now": "ایجاد پشتیبان اکنون",
+        "saved": "ذخیره شد.", "fleet": "ناوگان",
+    },
+}
+
+
+def _t(key: str, lang: str) -> str:
+    """Looks up `key` in the UI string catalog for `lang`, falling back to the English
+    string (never a raw key or an empty string) if `lang` is invalid or the key is missing
+    -- a missing translation must never surface as a blank label."""
+    table = UI.get(lang) or UI["en"]
+    return table.get(key, UI["en"].get(key, key))
+
+
 NAV_ORDER = ["overview", "host", "network", "traffic", "inventory", "renewals", "emergency",
              "review", "alerts", "reports", "telegram", "backups", "settings", "users",
              "audit", "health"]
@@ -253,6 +347,12 @@ class WebApp:
         nav_html = "".join(
             f'<a href="{NAV_PATHS[key]}" class="{"active" if key == active_nav else ""}">'
             f'{labels[key]}</a>' for key in NAV_ORDER)
+        # A page whose title is exactly its nav entry's English label (every standard page)
+        # gets the localized nav label as its on-page heading too -- so a Persian-language
+        # session never sees an English heading on top of an otherwise-translated page. A
+        # page with a dynamic title (e.g. "VPS 42") keeps that exact title untouched, since
+        # it has no corresponding catalog entry.
+        heading = labels[active_nav] if active_nav and title == LABELS["en"].get(active_nav) else title
         return f"""<!DOCTYPE html>
 <html lang="{lang}" dir="{direction}" data-theme="{theme}">
 <head><meta charset="utf-8"><title>TixoCloud -- {_html_escape(title)}</title>
@@ -261,7 +361,7 @@ class WebApp:
 <nav><h1>TixoCloud</h1>{nav_html}
 <form method="post" action="/logout"><button type="submit">{labels['logout']}</button></form>
 </nav>
-<main><h1>{_html_escape(title)}</h1>{body_html}</main>
+<main><h1>{_html_escape(heading)}</h1>{body_html}</main>
 <footer class="muted">TixoCloud Control Center v{renewal_cli.VERSION}</footer>
 </body></html>""".encode("utf-8")
 
@@ -444,20 +544,21 @@ class WebApp:
 
     # ---------- pages (each: user, method, form, session_token, remote_addr, lang, theme) ---
 
-    def _period_kpi(self, bundle: dict, key: str, label: str) -> str:
+    def _period_kpi(self, bundle: dict, key: str, label_key: str, lang: str) -> str:
         """Renders one traffic-analytics period as a KPI card -- download/upload/combined via
         the shared `traffic_format` layer, with an honest coverage badge (never implying full
-        coverage where samples are missing or partial)."""
+        coverage where samples are missing or partial). `label_key` is a UI catalog key."""
         import traffic_format as tf
+        label = _t(label_key, lang)
         p = bundle.get(key)
         if not p:
             return (f'<div class="kpi"><div class="kpi-label">{_html_escape(label)}</div>'
-                    f'<div class="kpi-value muted">unavailable</div></div>')
+                    f'<div class="kpi-value muted">{_t("unavailable", lang)}</div></div>')
         block = tf.format_traffic_block(p.get("rx_bytes"), p.get("tx_bytes"))
         status = p.get("coverage_status", "")
         badge_class = {"FULL": "badge-ok", "PARTIAL_COVERAGE": "badge-warn"}.get(status, "badge-off")
-        badge_text = {"FULL": "full coverage", "PARTIAL_COVERAGE": "partial",
-                      "NO_DATA": "no data"}.get(status, status.lower() if status else "n/a")
+        badge_text = {"FULL": _t("full_coverage", lang), "PARTIAL_COVERAGE": _t("partial", lang),
+                      "NO_DATA": _t("no_data", lang)}.get(status, status.lower() if status else "n/a")
         return (f'<div class="kpi"><div class="kpi-label">{_html_escape(label)}</div>'
                 f'<div class="kpi-value">{block["combined"]}</div>'
                 f'<div class="kpi-sub">&darr; {block["download"]} &nbsp; &uarr; {block["upload"]}</div>'
@@ -497,25 +598,25 @@ class WebApp:
             return "g-bad" if pct >= 90 else "g-warn" if pct >= 75 else "g-ok"
 
         kpi_fleet = f"""
-<div class="kpi kpi-info"><div class="kpi-label">Total VPS</div><div class="kpi-value">{total_vps}</div>
-<div class="kpi-sub">{running} running &nbsp; {stopped} stopped &nbsp; {suspended} suspended &nbsp; {unknown} unknown</div></div>
-<div class="kpi"><div class="kpi-label">CPU load (1m)</div>
+<div class="kpi kpi-info"><div class="kpi-label">{_t('total_vps', lang)}</div><div class="kpi-value">{total_vps}</div>
+<div class="kpi-sub">{running} {_t('running', lang)} &nbsp; {stopped} {_t('stopped', lang)} &nbsp; {suspended} {_t('suspended', lang)} &nbsp; {unknown} ?</div></div>
+<div class="kpi"><div class="kpi-label">{_t('cpu_load', lang)}</div>
 <div class="kpi-value">{load1 if load1 is not None else 'n/a'}</div>
 <div class="kpi-sub">{logical_cpus if logical_cpus else '?'} logical CPUs</div>
 <div class="gauge {_gauge_class(load_pct)}"><span style="width:{min(load_pct, 100) if load_pct is not None else 0}%"></span></div></div>
-<div class="kpi"><div class="kpi-label">Memory</div>
+<div class="kpi"><div class="kpi-label">{_t('memory', lang)}</div>
 <div class="kpi-value">{mem_pct if mem_pct is not None else 'n/a'}{'%' if mem_pct is not None else ''}</div>
 <div class="gauge {_gauge_class(mem_pct)}"><span style="width:{min(mem_pct, 100) if mem_pct is not None else 0}%"></span></div></div>
-<div class="kpi"><div class="kpi-label">Host uptime</div><div class="kpi-value" style="font-size:16px">{_html_escape(ht.get('uptime_human'))}</div>
+<div class="kpi"><div class="kpi-label">{_t('host_uptime', lang)}</div><div class="kpi-value" style="font-size:16px">{_html_escape(ht.get('uptime_human'))}</div>
 <div class="kpi-sub">{_html_escape(ht.get('current_local'))}</div></div>
 """
         bundle = net.get("traffic_analytics", {}) if net.get("configured") else {}
         traffic_kpis = "".join([
-            self._period_kpi(bundle, "today", "Today"),
-            self._period_kpi(bundle, "yesterday", "Yesterday"),
-            self._period_kpi(bundle, "last_7_days", "Last 7 days"),
-            self._period_kpi(bundle, "current_gregorian_month", "This month (Gregorian)"),
-            self._period_kpi(bundle, "current_jalali_month", "This month (Jalali)"),
+            self._period_kpi(bundle, "today", "today", lang),
+            self._period_kpi(bundle, "yesterday", "yesterday", lang),
+            self._period_kpi(bundle, "last_7_days", "last_7_days", lang),
+            self._period_kpi(bundle, "current_gregorian_month", "this_month_gregorian", lang),
+            self._period_kpi(bundle, "current_jalali_month", "this_month_jalali", lang),
         ]) if bundle else '<div class="empty-state">No network interface configured yet -- traffic figures unavailable.</div>'
 
         n_alerts = len(emp.get("pending_reviews", [])) + len(emp.get("proposed_grants", []))
@@ -526,24 +627,24 @@ class WebApp:
             series = net.get("daily_series_7d", [])
             chart_svg = charts.render_daily_bar_chart(series, width=760, height=190,
                                                         title="Last 7 days download/upload")
-            chart_block = (f'<div class="section-title">Last 7 Days &nbsp; '
-                           f'<a href="/traffic" class="muted" style="text-decoration:none">view full history &rarr;</a></div>'
+            chart_block = (f'<div class="section-title">{_t("last_7d_days", lang)} &nbsp; '
+                           f'<a href="/traffic" class="muted" style="text-decoration:none">{_t("view_full_history", lang)} &rarr;</a></div>'
                            f'<div class="card chart-wrap">{chart_svg}</div>')
 
         body = f"""
-<div class="section-title">Fleet &amp; Host</div>
+<div class="section-title">{_t('fleet_host', lang)}</div>
 <div class="kpi-grid">{kpi_fleet}</div>
-<div class="section-title">Network Traffic</div>
+<div class="section-title">{_t('network_traffic', lang)}</div>
 <div class="kpi-grid">{traffic_kpis}</div>
 {chart_block}
 <div class="card-row">
-<div class="card"><b>Network interface:</b> {'<span class="badge badge-ok">configured on ' + _html_escape(net['interface']) + '</span>' if net.get('configured') else '<span class="badge badge-off">not configured</span>'}</div>
-<div class="card"><b>Renewal:</b> write-approved
+<div class="card"><b>{_t('network_interface', lang)}:</b> {'<span class="badge badge-ok">' + _t('configured_on', lang) + ' ' + _html_escape(net['interface']) + '</span>' if net.get('configured') else '<span class="badge badge-off">' + _t('not_configured', lang) + '</span>'}</div>
+<div class="card"><b>{_t('renewal', lang)}:</b> {_t('write_approved', lang)}
 <span class="badge {'badge-ok' if renewal.get('write_approved') else 'badge-off'}">{renewal.get('write_approved')}</span>
-&nbsp; auto-renewal
+&nbsp; {_t('auto_renewal', lang)}
 <span class="badge {'badge-ok' if renewal.get('auto_renewal_enabled') else 'badge-off'}">{renewal.get('auto_renewal_enabled')}</span></div>
-<div class="card"><b>Emergency policy mode:</b> {_html_escape(emp['mode'])}
-&nbsp; <b>Active alerts:</b> <span class="badge {'badge-warn' if n_alerts else 'badge-ok'}">{n_alerts}</span></div>
+<div class="card"><b>{_t('emergency_policy_mode', lang)}:</b> {_html_escape(emp['mode'])}
+&nbsp; <b>{_t('active_alerts', lang)}:</b> <span class="badge {'badge-warn' if n_alerts else 'badge-ok'}">{n_alerts}</span></div>
 </div>
 """
         return WebResponse(body=self._render_page("Overview", body, lang, theme, "overview"))
@@ -574,34 +675,34 @@ class WebApp:
         body = f"""
 <div class="card" id="live-card"><b>Live network reading</b> <span class="muted">(auto-refreshes every 2s, local kernel read only -- no Virtualizor API call)</span>
 <div id="live-readout" class="kpi-value" style="margin-top:8px">loading...</div></div>
-<div class="section-title">CPU</div>
+<div class="section-title">{_t('cpu', lang)}</div>
 <div class="kpi-grid">
-<div class="kpi"><div class="kpi-label">Model</div><div class="kpi-value" style="font-size:15px">{_html_escape(cpu.get('model'))}</div>
+<div class="kpi"><div class="kpi-label">{_t('model', lang)}</div><div class="kpi-value" style="font-size:15px">{_html_escape(cpu.get('model'))}</div>
 <div class="kpi-sub">{_html_escape(cpu.get('vendor'))}</div></div>
-<div class="kpi"><div class="kpi-label">Cores / Threads</div>
+<div class="kpi"><div class="kpi-label">{_t('cores_threads', lang)}</div>
 <div class="kpi-value">{_html_escape(cpu.get('physical_cores'))} / {_html_escape(cpu.get('logical_cpus'))}</div>
 <div class="kpi-sub">physical cores / logical CPUs</div></div>
-<div class="kpi"><div class="kpi-label">Load average</div>
+<div class="kpi"><div class="kpi-label">{_t('load_average', lang)}</div>
 <div class="kpi-value">{_html_escape(load.get('1m'))}</div>
 <div class="kpi-sub">1m / 5m / 15m: {_html_escape(load.get('1m'))} / {_html_escape(load.get('5m'))} / {_html_escape(load.get('15m'))}</div></div>
 </div>
-<div class="section-title">Memory</div>
+<div class="section-title">{_t('memory', lang)}</div>
 <div class="kpi-grid">
-<div class="kpi"><div class="kpi-label">RAM used</div>
+<div class="kpi"><div class="kpi-label">{_t('ram_used', lang)}</div>
 <div class="kpi-value">{mem_pct if mem_pct is not None else 'n/a'}{'%' if mem_pct is not None else ''}</div>
 <div class="kpi-sub">{mem_used if mem_used is not None else '?'} MB of {_html_escape(mem_total)} MB</div>
 <div class="gauge {_gauge_class(mem_pct)}"><span style="width:{min(mem_pct, 100) if mem_pct is not None else 0}%"></span></div></div>
-<div class="kpi"><div class="kpi-label">Swap used</div>
+<div class="kpi"><div class="kpi-label">{_t('swap_used', lang)}</div>
 <div class="kpi-value">{swap_used if swap_used is not None else 'n/a'} MB</div>
 <div class="kpi-sub">of {_html_escape(swap_total)} MB total</div></div>
 </div>
-<div class="section-title">Host</div>
+<div class="section-title">{_t('host', lang)}</div>
 <div class="kpi-grid">
-<div class="kpi"><div class="kpi-label">Uptime</div><div class="kpi-value" style="font-size:16px">{_html_escape(ht.get('uptime_human'))}</div></div>
-<div class="kpi"><div class="kpi-label">Local time</div><div class="kpi-value" style="font-size:15px">{_html_escape(ht.get('current_local'))}</div></div>
-<div class="kpi"><div class="kpi-label">Last boot</div><div class="kpi-value" style="font-size:15px">{_html_escape(ht.get('boot_time_local'))}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('uptime', lang)}</div><div class="kpi-value" style="font-size:16px">{_html_escape(ht.get('uptime_human'))}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('local_time', lang)}</div><div class="kpi-value" style="font-size:15px">{_html_escape(ht.get('current_local'))}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('last_boot', lang)}</div><div class="kpi-value" style="font-size:15px">{_html_escape(ht.get('boot_time_local'))}</div></div>
 </div>
-<div class="section-title">Technical details</div>
+<div class="section-title">{_t('technical_details', lang)}</div>
 <div class="card muted">Boot ID: {_html_escape(ht.get('boot_id'))} &nbsp; Kernel: {_html_escape(host.get('os', {}).get('kernel'))}
  &nbsp; Arch: {_html_escape(host.get('os', {}).get('architecture'))}</div>
 <script>
@@ -628,20 +729,20 @@ poll(); setInterval(poll, 2000);
             block = tf.format_traffic_block(cum.get("cumulative_rx_bytes"), cum.get("cumulative_tx_bytes"))
             rate_str = tf.format_bits_per_second(rate) if isinstance(rate, (int, float)) else None
             body = f"""
-<div class="card"><b>Interface:</b> {_html_escape(net['interface'])}</div>
-<div class="section-title">Persistent Total (since monitoring started)</div>
+<div class="card"><b>{_t('interface', lang)}:</b> {_html_escape(net['interface'])}</div>
+<div class="section-title">{_t('persistent_total', lang)}</div>
 <div class="kpi-grid">
-<div class="kpi"><div class="kpi-label">Download (RX)</div><div class="kpi-value">{block['download']}</div></div>
-<div class="kpi"><div class="kpi-label">Upload (TX)</div><div class="kpi-value">{block['upload']}</div></div>
-<div class="kpi kpi-info"><div class="kpi-label">Combined</div><div class="kpi-value">{block['combined']}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('download', lang)} (RX)</div><div class="kpi-value">{block['download']}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('upload', lang)} (TX)</div><div class="kpi-value">{block['upload']}</div></div>
+<div class="kpi kpi-info"><div class="kpi-label">{_t('combined', lang)}</div><div class="kpi-value">{block['combined']}</div></div>
 </div>
 <div class="card muted">Decimal (SI) bytes. Raw kernel counters are tracked separately and never added into
 this persistent total (that would double-count across counter resets/reboots).</div>
 """
             if rate_str:
                 body += f"""
-<div class="section-title">Current sampler rate</div>
-<div class="kpi-grid"><div class="kpi"><div class="kpi-label">Combined rate</div><div class="kpi-value">{rate_str}</div></div></div>
+<div class="section-title">{_t('current_sampler_rate', lang)}</div>
+<div class="kpi-grid"><div class="kpi"><div class="kpi-label">{_t('combined_rate', lang)}</div><div class="kpi-value">{rate_str}</div></div></div>
 """
         return WebResponse(body=self._render_page("Network Traffic", body, lang, theme, "network"))
 
@@ -662,39 +763,39 @@ this persistent total (that would double-count across counter resets/reboots).</
                                                         title="Daily download/upload")
             range_toggle = "".join(
                 f'<a href="/traffic?range={r}" class="badge {"badge-ok" if r == range_choice else "badge-off"}" '
-                f'style="margin-right:6px;text-decoration:none">{label}</a>'
-                for r, label in (("7d", "Last 7 days"), ("30d", "Last 30 days"))
+                f'style="margin-right:6px;text-decoration:none">{_t(label_key, lang)}</a>'
+                for r, label_key in (("7d", "last_7_days"), ("30d", "last_30_days"))
             )
             bundle = net.get("traffic_analytics", {})
             period_labels = [
-                ("today", "Today"), ("yesterday", "Yesterday"), ("current_week", "This week"),
-                ("last_7_days", "Last 7 days"), ("current_gregorian_month", "This month (Gregorian)"),
-                ("current_jalali_month", "This month (Jalali)"), ("all_time", "All time"),
+                ("today", "today"), ("yesterday", "yesterday"), ("current_week", "this_week"),
+                ("last_7_days", "last_7_days"), ("current_gregorian_month", "this_month_gregorian"),
+                ("current_jalali_month", "this_month_jalali"), ("all_time", "all_time"),
             ]
             badge_class = {"FULL": "badge-ok", "PARTIAL_COVERAGE": "badge-warn"}
-            badge_text = {"FULL": "full coverage", "PARTIAL_COVERAGE": "partial",
-                          "NO_DATA": "no data"}
+            badge_text = {"FULL": _t("full_coverage", lang), "PARTIAL_COVERAGE": _t("partial", lang),
+                          "NO_DATA": _t("no_data", lang)}
             rows = ""
-            for key, label in period_labels:
+            for key, label_key in period_labels:
                 p = bundle.get(key)
                 if not p:
                     continue
                 status = p.get("coverage_status", "")
                 block = tf.format_traffic_block(p.get("rx_bytes"), p.get("tx_bytes"))
-                rows += (f"<tr><td>{_html_escape(label)}</td>"
+                rows += (f"<tr><td>{_html_escape(_t(label_key, lang))}</td>"
                          f"<td class='num'>{block['download']}</td>"
                          f"<td class='num'>{block['upload']}</td>"
                          f"<td class='num'><b>{block['combined']}</b></td>"
                          f"<td><span class='badge {badge_class.get(status, 'badge-off')}'>"
                          f"{badge_text.get(status, status.lower() if status else 'n/a')}</span></td></tr>")
-            body = (f'<div class="card muted">Interface: {_html_escape(net["interface"])}. '
+            body = (f'<div class="card muted">{_t("interface", lang)}: {_html_escape(net["interface"])}. '
                     f'Historical samples are real measured data -- missing or partial periods are shown honestly, '
                     f'never implied as continuous coverage.</div>'
-                    f'<div class="section-title">Daily history &nbsp; {range_toggle}</div>'
+                    f'<div class="section-title">{_t("daily_history", lang)} &nbsp; {range_toggle}</div>'
                     f'<div class="card chart-wrap">{chart_svg}</div>'
-                    f'<div class="section-title">Standard periods</div>'
-                    f'<div class="table-wrap"><table><tr><th>Period</th><th>Download</th><th>Upload</th>'
-                    f'<th>Combined</th><th>Coverage</th></tr>'
+                    f'<div class="section-title">{_t("standard_periods", lang)}</div>'
+                    f'<div class="table-wrap"><table><tr><th>{_t("period", lang)}</th><th>{_t("download", lang)}</th>'
+                    f'<th>{_t("upload", lang)}</th><th>{_t("combined", lang)}</th><th>{_t("coverage", lang)}</th></tr>'
                     f'{rows or "<tr><td colspan=5>No samples yet.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Traffic Analytics", body, lang, theme, "traffic"))
 
@@ -719,7 +820,8 @@ this persistent total (that would double-count across counter resets/reboots).</
             used = r.get("used_gb")
             unlimited = _is_unlimited(quota)
             if unlimited:
-                limit_cell, pct_cell = '<span class="badge badge-info">unlimited</span>', '<span class="muted">n/a</span>'
+                limit_cell = f'<span class="badge badge-info">{_t("unlimited", lang)}</span>'
+                pct_cell = '<span class="muted">n/a</span>'
             else:
                 try:
                     limit_cell = f"{Decimal(str(quota)):.2f} GB"
@@ -739,19 +841,21 @@ this persistent total (that would double-count across counter resets/reboots).</
                 used_cell = f"{Decimal(str(used)):.2f} GB"
             except Exception:
                 used_cell = "unavailable"
+            status_display = _t(status, lang) if status in ("running", "stopped", "suspended") else status
             rows += (f'<tr><td><a href="/vps/{r["vpsid"]}">{r["vpsid"]}</a></td>'
                       f'<td>{_html_escape(r.get("hostname"))}</td>'
                       f'<td>{_html_escape(r.get("ip_primary"))}</td>'
-                      f'<td><span class="badge {status_badge.get(status, "badge-off")}">{_html_escape(status)}</span></td>'
+                      f'<td><span class="badge {status_badge.get(status, "badge-off")}">{_html_escape(status_display)}</span></td>'
                       f'<td class="num">{used_cell}</td>'
                       f'<td class="num">{limit_cell}</td>'
                       f'<td style="min-width:110px">{pct_cell}</td></tr>')
-        body = (f'<div class="card">Fleet: {fleet["total_vps"]} VPS total &nbsp; '
-                f'<span class="badge badge-ok">{fleet.get("running_count", 0)} running</span> &nbsp; '
-                f'<span class="badge badge-off">{fleet.get("stopped_count", 0)} stopped</span> &nbsp; '
-                f'<span class="badge badge-bad">{fleet.get("suspended_count", 0)} suspended</span></div>'
-                f'<div class="table-wrap"><table><tr><th>VPS ID</th><th>Name</th><th>IP</th><th>Status</th>'
-                f'<th>Used</th><th>Limit</th><th>Usage %</th></tr>'
+        body = (f'<div class="card">{_t("fleet", lang)}: {fleet["total_vps"]} VPS total &nbsp; '
+                f'<span class="badge badge-ok">{fleet.get("running_count", 0)} {_t("running", lang)}</span> &nbsp; '
+                f'<span class="badge badge-off">{fleet.get("stopped_count", 0)} {_t("stopped", lang)}</span> &nbsp; '
+                f'<span class="badge badge-bad">{fleet.get("suspended_count", 0)} {_t("suspended", lang)}</span></div>'
+                f'<div class="table-wrap"><table><tr><th>{_t("vps_id", lang)}</th><th>{_t("name", lang)}</th>'
+                f'<th>{_t("ip", lang)}</th><th>{_t("status", lang)}</th>'
+                f'<th>{_t("used", lang)}</th><th>{_t("limit", lang)}</th><th>{_t("usage_pct", lang)}</th></tr>'
                 f'{rows or "<tr><td colspan=7>No inventory synced yet.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("VPS Inventory", body, lang, theme, "inventory"))
 
@@ -780,7 +884,7 @@ this persistent total (that would double-count across counter resets/reboots).</
             except Exception:
                 used_str = "unavailable"
             if unlimited:
-                limit_str, pct_block = "unlimited", '<span class="muted">n/a</span>'
+                limit_str, pct_block = _t("unlimited", lang), '<span class="muted">n/a</span>'
             else:
                 try:
                     limit_str = f"{Decimal(str(quota)):.2f} GB"
@@ -789,13 +893,14 @@ this persistent total (that would double-count across counter resets/reboots).</
                     pct_block = (f'<div class="gauge-label"><span>{pct:.1f}%</span></div>'
                                  f'<div class="gauge {gclass}"><span style="width:{min(pct,100):.1f}%"></span></div>')
                 except Exception:
-                    limit_str, pct_block = "unavailable", '<span class="muted">unavailable</span>'
+                    limit_str, pct_block = "unavailable", f'<span class="muted">{_t("unavailable", lang)}</span>'
+            status_display = _t(status, lang) if status in ("running", "stopped", "suspended") else status
             kpis = f"""
-<div class="kpi"><div class="kpi-label">Status</div><div class="kpi-value">
-<span class="badge {status_badge.get(status, 'badge-off')}">{_html_escape(status)}</span></div></div>
-<div class="kpi"><div class="kpi-label">Used</div><div class="kpi-value">{used_str}</div></div>
-<div class="kpi"><div class="kpi-label">Limit</div><div class="kpi-value">{_html_escape(limit_str)}</div></div>
-<div class="kpi"><div class="kpi-label">Usage</div><div class="kpi-value" style="font-size:16px">{pct_block}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('status', lang)}</div><div class="kpi-value">
+<span class="badge {status_badge.get(status, 'badge-off')}">{_html_escape(status_display)}</span></div></div>
+<div class="kpi"><div class="kpi-label">{_t('used', lang)}</div><div class="kpi-value">{used_str}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('limit', lang)}</div><div class="kpi-value">{_html_escape(limit_str)}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('usage_pct', lang)}</div><div class="kpi-value" style="font-size:16px">{pct_block}</div></div>
 """
             detail_rows = "".join(f"<tr><td>{_html_escape(k)}</td><td>{_html_escape(v)}</td></tr>"
                                    for k, v in record.items())
@@ -823,14 +928,14 @@ this persistent total (that would double-count across counter resets/reboots).</
         auto_renewal = overview.get('auto_renewal_enabled')
         body = f"""
 <div class="kpi-grid">
-<div class="kpi {'kpi-ok' if write_approved else 'kpi-warn'}"><div class="kpi-label">Write approved</div>
+<div class="kpi {'kpi-ok' if write_approved else 'kpi-warn'}"><div class="kpi-label">{_t('write_approved_label', lang)}</div>
 <div class="kpi-value">{write_approved}</div></div>
-<div class="kpi {'kpi-ok' if auto_renewal else ''}"><div class="kpi-label">Auto-renewal</div>
+<div class="kpi {'kpi-ok' if auto_renewal else ''}"><div class="kpi-label">{_t('auto_renewal_label', lang)}</div>
 <div class="kpi-value">{auto_renewal}</div></div>
-<div class="kpi"><div class="kpi-label">Monthly grant</div><div class="kpi-value">{overview.get('monthly_grant_gb')} GB</div></div>
+<div class="kpi"><div class="kpi-label">{_t('monthly_grant_label', lang)}</div><div class="kpi-value">{overview.get('monthly_grant_gb')} GB</div></div>
 </div>
-<div class="section-title">Per-node operations</div>
-<div class="table-wrap"><table><tr><th>Node</th><th>Total ops</th><th>Unresolved</th></tr>{rows}</table></div>
+<div class="section-title">{_t('per_node_operations', lang)}</div>
+<div class="table-wrap"><table><tr><th>{_t('node', lang)}</th><th>{_t('total_ops', lang)}</th><th>{_t('unresolved', lang)}</th></tr>{rows}</table></div>
 """
         return WebResponse(body=self._render_page("Renewal Operations", body, lang, theme, "renewals"))
 
@@ -863,17 +968,17 @@ this persistent total (that would double-count across counter resets/reboots).</
         options = "".join(f'<option value="{m}"{" selected" if m == overview["mode"] else ""}>{m}</option>'
                            for m in emp.VALID_MODES)
         admin_controls = (f'<form method="post">{csrf}<select name="mode">{options}</select>'
-                           f'<button type="submit">Save mode</button></form>'
+                           f'<button type="submit">{_t("save_mode", lang)}</button></form>'
                            if self._require_admin(user) else "")
         grants_marker = overview['emergency_grants_approved']
         body = f"""
 <div class="card">{message}
 <div class="kpi-grid">
-<div class="kpi kpi-info"><div class="kpi-label">Current mode</div><div class="kpi-value" style="font-size:16px">{_html_escape(overview['mode'])}</div></div>
-<div class="kpi"><div class="kpi-label">Grant amount</div><div class="kpi-value">{overview['emergency_grant_amount_gb']} GB</div></div>
-<div class="kpi {'kpi-ok' if grants_marker else ''}"><div class="kpi-label">Grants-approved marker</div>
+<div class="kpi kpi-info"><div class="kpi-label">{_t('current_mode', lang)}</div><div class="kpi-value" style="font-size:16px">{_html_escape(overview['mode'])}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('grant_amount_label', lang)}</div><div class="kpi-value">{overview['emergency_grant_amount_gb']} GB</div></div>
+<div class="kpi {'kpi-ok' if grants_marker else ''}"><div class="kpi-label">{_t('grants_approved_marker', lang)}</div>
 <div class="kpi-value">{grants_marker}</div></div>
-<div class="kpi {'kpi-warn' if overview['proposed_grants'] else 'kpi-ok'}"><div class="kpi-label">Proposed grants</div>
+<div class="kpi {'kpi-warn' if overview['proposed_grants'] else 'kpi-ok'}"><div class="kpi-label">{_t('proposed_grants', lang)}</div>
 <div class="kpi-value">{len(overview['proposed_grants'])}</div></div>
 </div>
 {admin_controls}</div>
@@ -921,7 +1026,8 @@ this persistent total (that would double-count across counter resets/reboots).</
         body = (f'<div class="card muted">{len(pending)} pending review(s). Resolving/acknowledging requires '
                 f'admin role and a valid CSRF token; never a destructive VPS action by itself.</div>'
                 f'{message}<div class="table-wrap"><table>'
-                f'<tr><th>ID</th><th>VPS</th><th>Reason</th><th>Status</th><th></th></tr>'
+                f'<tr><th>{_t("id", lang)}</th><th>{_t("vps", lang)}</th><th>{_t("reason", lang)}</th>'
+                f'<th>{_t("status", lang)}</th><th></th></tr>'
                 f'{rows or "<tr><td colspan=5>No pending reviews.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Manual Review", body, lang, theme, "review"))
 
@@ -938,8 +1044,9 @@ this persistent total (that would double-count across counter resets/reboots).</
                          for g in overview["proposed_grants"])
         n_alerts = len(overview["pending_reviews"]) + len(overview["proposed_grants"])
         body = (f'<div class="kpi-grid"><div class="kpi {"kpi-warn" if n_alerts else "kpi-ok"}">'
-                f'<div class="kpi-label">Active alerts</div><div class="kpi-value">{n_alerts}</div></div></div>'
-                f'<div class="table-wrap"><table><tr><th>Type</th><th>VPS</th><th>Detail</th></tr>'
+                f'<div class="kpi-label">{_t("active_alerts", lang)}</div><div class="kpi-value">{n_alerts}</div></div></div>'
+                f'<div class="table-wrap"><table><tr><th>{_t("type", lang)}</th><th>{_t("vps", lang)}</th>'
+                f'<th>{_t("detail", lang)}</th></tr>'
                 f'{rows or "<tr><td colspan=3>No active alerts.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Alerts", body, lang, theme, "alerts"))
 
@@ -972,17 +1079,17 @@ this persistent total (that would double-count across counter resets/reboots).</
         last_sent = reports_mod.load_last_report_sent_date(self.state_dir)
         settings = tc.load_telegram_settings(self.config_dir)
         csrf = self._csrf_field(token)
-        admin_controls = (f'<form method="post">{csrf}<button type="submit">Send report now</button></form>'
+        admin_controls = (f'<form method="post">{csrf}<button type="submit">{_t("send_report_now", lang)}</button></form>'
                            if self._require_admin(user) else "")
         body = f"""
 <div class="card">{message}
 <div class="kpi-grid">
-<div class="kpi {'kpi-ok' if settings.reports_enabled else ''}"><div class="kpi-label">Scheduled</div>
+<div class="kpi {'kpi-ok' if settings.reports_enabled else ''}"><div class="kpi-label">{_t('scheduled', lang)}</div>
 <div class="kpi-value">{settings.reports_enabled}</div></div>
-<div class="kpi"><div class="kpi-label">Schedule</div>
+<div class="kpi"><div class="kpi-label">{_t('schedule', lang)}</div>
 <div class="kpi-value" style="font-size:16px">{settings.report_hour:02d}:{settings.report_minute:02d}</div>
 <div class="kpi-sub">{_html_escape(settings.report_timezone)}</div></div>
-<div class="kpi"><div class="kpi-label">Last sent</div><div class="kpi-value" style="font-size:16px">{_html_escape(last_sent or 'never')}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('last_sent', lang)}</div><div class="kpi-value" style="font-size:16px">{_html_escape(last_sent or 'never')}</div></div>
 </div>
 {admin_controls}</div>
 """
@@ -994,10 +1101,10 @@ this persistent total (that would double-count across counter resets/reboots).</
         secrets_configured = os.path.exists(tc.default_secrets_path(self.config_dir))
         body = f"""
 <div class="kpi-grid">
-<div class="kpi {'kpi-ok' if settings.enabled else ''}"><div class="kpi-label">Enabled</div><div class="kpi-value">{settings.enabled}</div></div>
-<div class="kpi kpi-info"><div class="kpi-label">Connectivity mode</div><div class="kpi-value" style="font-size:16px">{_html_escape(settings.connectivity_mode)}</div></div>
-<div class="kpi"><div class="kpi-label">Admins / Viewers</div><div class="kpi-value">{len(settings.admin_ids)} / {len(settings.viewer_ids)}</div></div>
-<div class="kpi {'kpi-ok' if secrets_configured else 'kpi-warn'}"><div class="kpi-label">Secrets configured</div><div class="kpi-value">{secrets_configured}</div></div>
+<div class="kpi {'kpi-ok' if settings.enabled else ''}"><div class="kpi-label">{_t('enabled', lang)}</div><div class="kpi-value">{settings.enabled}</div></div>
+<div class="kpi kpi-info"><div class="kpi-label">{_t('connectivity_mode', lang)}</div><div class="kpi-value" style="font-size:16px">{_html_escape(settings.connectivity_mode)}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('admins_viewers', lang)}</div><div class="kpi-value">{len(settings.admin_ids)} / {len(settings.viewer_ids)}</div></div>
+<div class="kpi {'kpi-ok' if secrets_configured else 'kpi-warn'}"><div class="kpi-label">{_t('secrets_configured', lang)}</div><div class="kpi-value">{secrets_configured}</div></div>
 </div>
 <div class="card muted">Edit via the CLI menu's "Configure Telegram bot" screen -- this page is read-only by
 design (credential rotation/entry never happens over the Web UI or in chat). Polling/activation stays gated
@@ -1034,11 +1141,11 @@ until a real, verified connectivity check succeeds through the configured transp
         rows = "".join(f"<tr><td>{_html_escape(a)}</td></tr>" for a in reversed(archives))
         csrf = self._csrf_field(token)
         admin_controls = (f'<form method="post">{csrf}'
-                           f'<button type="submit">Create backup now</button></form>'
+                           f'<button type="submit">{_t("create_backup_now", lang)}</button></form>'
                            if self._require_admin(user) else "")
         body = f"""
 <div class="card">{message}
-<div class="kpi-grid"><div class="kpi"><div class="kpi-label">Archives on disk</div><div class="kpi-value">{len(archives)}</div></div></div>
+<div class="kpi-grid"><div class="kpi"><div class="kpi-label">{_t('archives_on_disk', lang)}</div><div class="kpi-value">{len(archives)}</div></div></div>
 {admin_controls}
 <p class="muted">Archives bundle all known state databases plus non-secret config
 (never credentials, tokens, or password hashes). Encryption and scheduled/retention
@@ -1046,7 +1153,7 @@ backups are available via the CLI: <code>renewal_cli.py backup-full --encrypt --
 (passphrase via the <code>TIXO_BACKUP_PASSPHRASE</code> environment variable, never a CLI
 argument). Restoration always extracts to a staging directory for manual review -- it never
 overwrites live data automatically.</p>
-<div class="table-wrap"><table><tr><th>Archive</th></tr>{rows or '<tr><td class="muted">No backups yet.</td></tr>'}</table></div>
+<div class="table-wrap"><table><tr><th>{_t('archive', lang)}</th></tr>{rows or '<tr><td class="muted">No backups yet.</td></tr>'}</table></div>
 </div>
 """
         return WebResponse(body=self._render_page("Backups", body, lang, theme, "backups"))
@@ -1069,7 +1176,7 @@ overwrites live data automatically.</p>
                     ht_mod.save_calendar_preference(self.config_dir, pref)
                 self._audit(user.username, "settings_changed",
                             detail=f"tz={tz} pref={pref}", remote_addr=remote_addr)
-                message = '<p class="badge badge-ok">Saved.</p>'
+                message = f'<p class="badge badge-ok">{_t("saved", lang)}</p>'
             except ValueError as e:
                 message = f'<p class="badge badge-bad">Rejected: {_html_escape(e)}</p>'
 
@@ -1079,14 +1186,14 @@ overwrites live data automatically.</p>
         options = "".join(f'<option value="{p}"{" selected" if p == current_pref else ""}>{p}</option>'
                            for p in ht_mod.VALID_CALENDAR_PREFERENCES)
         admin_form = (f'<form method="post">{csrf}'
-                      f'<p>Display timezone: <input name="display_tz" value="{_html_escape(current_tz)}"></p>'
-                      f'<p>Calendar preference: <select name="calendar_preference">{options}</select></p>'
-                      f'<button type="submit">Save</button></form>' if self._require_admin(user) else "")
+                      f'<p>{_t("display_timezone", lang)}: <input name="display_tz" value="{_html_escape(current_tz)}"></p>'
+                      f'<p>{_t("calendar_preference", lang)}: <select name="calendar_preference">{options}</select></p>'
+                      f'<button type="submit">{_t("save", lang)}</button></form>' if self._require_admin(user) else "")
         body = f"""
 <div class="card">{message}
 <div class="kpi-grid">
-<div class="kpi"><div class="kpi-label">Display timezone</div><div class="kpi-value" style="font-size:16px">{_html_escape(current_tz)}</div></div>
-<div class="kpi"><div class="kpi-label">Calendar preference</div><div class="kpi-value" style="font-size:16px">{_html_escape(current_pref)}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('display_timezone', lang)}</div><div class="kpi-value" style="font-size:16px">{_html_escape(current_tz)}</div></div>
+<div class="kpi"><div class="kpi-label">{_t('calendar_preference', lang)}</div><div class="kpi-value" style="font-size:16px">{_html_escape(current_pref)}</div></div>
 </div>
 {admin_form}</div>
 """
@@ -1149,10 +1256,10 @@ overwrites live data automatically.</p>
                        f'<input name="password" type="password" placeholder="password">'
                        f'<select name="role"><option value="viewer">viewer</option>'
                        f'<option value="admin">admin</option></select>'
-                       f'<button type="submit">Create</button></form>' if is_admin else "")
+                       f'<button type="submit">{_t("create", lang)}</button></form>' if is_admin else "")
         body = (f'<div class="card">{message}'
-                f'<div class="table-wrap"><table><tr><th>User</th><th>Role</th><th>Disabled</th>'
-                f'<th></th></tr>{rows}</table></div>{create_form}</div>')
+                f'<div class="table-wrap"><table><tr><th>{_t("user", lang)}</th><th>{_t("role", lang)}</th>'
+                f'<th>{_t("disabled", lang)}</th><th></th></tr>{rows}</table></div>{create_form}</div>')
         return WebResponse(body=self._render_page("User Management", body, lang, theme, "users"))
 
     def _page_audit(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
@@ -1168,7 +1275,8 @@ overwrites live data automatically.</p>
                         for e in events)
         body = (f'<div class="card muted">Most recent {len(events)} event(s) (newest first). Every mutating '
                 f'admin action on this panel is recorded here.</div>'
-                f'<div class="table-wrap"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Detail</th></tr>'
+                f'<div class="table-wrap"><table><tr><th>{_t("time", lang)}</th><th>{_t("actor", lang)}</th>'
+                f'<th>{_t("action", lang)}</th><th>{_t("detail", lang)}</th></tr>'
                 f'{rows or "<tr><td colspan=4>No events recorded yet.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Audit Logs", body, lang, theme, "audit"))
 
@@ -1188,12 +1296,13 @@ overwrites live data automatically.</p>
                       f'<td><span class="badge {badge}">{health}</span></td></tr>')
         summary = f"""
 <div class="kpi-grid">
-<div class="kpi kpi-info"><div class="kpi-label">Timers tracked</div><div class="kpi-value">{len(timers)}</div></div>
-<div class="kpi kpi-ok"><div class="kpi-label">Active</div><div class="kpi-value">{n_active}</div></div>
-<div class="kpi {'kpi-bad' if n_failed else 'kpi-ok'}"><div class="kpi-label">Failed</div><div class="kpi-value">{n_failed}</div></div>
+<div class="kpi kpi-info"><div class="kpi-label">{_t('timers_tracked', lang)}</div><div class="kpi-value">{len(timers)}</div></div>
+<div class="kpi kpi-ok"><div class="kpi-label">{_t('active', lang)}</div><div class="kpi-value">{n_active}</div></div>
+<div class="kpi {'kpi-bad' if n_failed else 'kpi-ok'}"><div class="kpi-label">{_t('failed', lang)}</div><div class="kpi-value">{n_failed}</div></div>
 </div>
 """
-        body = summary + f'<div class="table-wrap"><table><tr><th>Timer</th><th>Health</th></tr>{rows}</table></div>'
+        body = summary + (f'<div class="table-wrap"><table><tr><th>{_t("timer", lang)}</th>'
+                           f'<th>{_t("health", lang)}</th></tr>{rows}</table></div>')
         return WebResponse(body=self._render_page("Service Health", body, lang, theme, "health"))
 
 

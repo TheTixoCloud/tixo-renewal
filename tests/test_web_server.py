@@ -588,3 +588,66 @@ def test_cmd_web_run_blocked_on_bad_tls_cert(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "BLOCKED" in out
+
+
+# ---------- v1.9.0: localization (Persian/English, RTL/LTR, dark/light) -----------------------
+
+ALL_ROUTES = ["/", "/host", "/network", "/traffic", "/inventory", "/renewals", "/emergency",
+              "/review", "/alerts", "/reports", "/telegram", "/backups", "/settings", "/users",
+              "/audit", "/health"]
+
+
+def test_t_falls_back_to_english_for_unknown_language():
+    assert ws._t("total_vps", "xx") == ws._t("total_vps", "en")
+
+
+def test_t_falls_back_to_key_for_unknown_key():
+    assert ws._t("totally_made_up_key_xyz", "en") == "totally_made_up_key_xyz"
+
+
+@pytest.mark.parametrize("lang,theme", [("en", "dark"), ("en", "light"), ("fa", "dark"), ("fa", "light")])
+def test_all_pages_render_successfully_in_every_lang_theme_combination(tmp_path, lang, theme):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    cookies, _ = _login(app)
+    cookies[ws.LANG_COOKIE_NAME] = lang
+    cookies[ws.THEME_COOKIE_NAME] = theme
+    for path in ALL_ROUTES:
+        r = app.handle_request("GET", path, {}, cookies, b"", "127.0.0.1")
+        assert r.status == 200, f"{path} failed for lang={lang} theme={theme}"
+        body = r.body.decode()
+        assert f'data-theme="{theme}"' in body
+        if lang == "fa":
+            assert 'dir="rtl"' in body
+            assert 'lang="fa"' in body
+        else:
+            assert 'dir="ltr"' in body
+
+
+def test_persian_overview_heading_is_translated(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    cookies, _ = _login(app)
+    cookies[ws.LANG_COOKIE_NAME] = "fa"
+    r = app.handle_request("GET", "/", {}, cookies, b"", "127.0.0.1")
+    body = r.body.decode()
+    assert "<h1>بررسی کلی</h1>" in body
+    assert "Overview" not in body.split("<title>")[0]  # heading itself, not just the <title> tag
+
+
+def test_english_overview_heading_unchanged(tmp_path):
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    cookies, _ = _login(app)
+    r = app.handle_request("GET", "/", {}, cookies, b"", "127.0.0.1")
+    body = r.body.decode()
+    assert "<h1>Overview</h1>" in body
+
+
+def test_vps_detail_page_keeps_dynamic_title_even_in_persian(tmp_path):
+    """A dynamic title ("VPS 42") has no catalog entry and must never be replaced by the
+    'inventory' nav label ("VPS Inventory"/ "فهرست VPS")."""
+    app, config_dir, state_dir = _app_with_admin(tmp_path)
+    cookies, _ = _login(app)
+    cookies[ws.LANG_COOKIE_NAME] = "fa"
+    r = app.handle_request("GET", "/vps/42", {}, cookies, b"", "127.0.0.1")
+    body = r.body.decode()
+    assert "<h1>VPS 42</h1>" in body
+    assert "فهرست VPS" not in body.split("<main>")[1].split("</h1>")[0]
