@@ -918,3 +918,53 @@ New doc: `RELEASE_NOTES_v1.8.0.md` (supersedes the RC notes, kept for history).
 a publish action** -- no git tag was created or pushed, no GitHub Release was created.
 Publishing the release and deploying to `ir1.tixocloud.com` each remain gated behind a
 separate, explicit operator approval (see the Final Approval Report for this session).
+
+## v1.9.0 — TixoCloud Control Center UI/UX overhaul
+
+- **`traffic_format.py`** extracted as the single shared Download/Upload/Combined
+  formatting layer for both the CLI and Web Control Center -- decimal (SI) GB/TB for
+  totals, bits/sec for rates, the pre-existing no-misleading-rounding fix, and a
+  `combine()` helper that reports "unavailable" rather than ever treating a missing RX/TX
+  side as zero. `menu.py`'s private formatting functions became aliases; zero behavioral
+  change (confirmed by the full pre-existing CLI suite passing unchanged).
+- **Web Control Center**: new design system (richer KPI/gauge/badge/table components,
+  still pure CSS) applied to all 17 pages. Overview became a real KPI dashboard; every
+  other page replaced raw-dict/plain-card rendering with the new components. Fixed a real
+  bug found during manual rendering verification: the Inventory table read a nonexistent
+  `ip` field instead of `ip_primary`, which would have shown "None" for every VPS's IP in
+  production.
+- **`charts.py`**: pure-stdlib inline SVG daily bar charts (RX/TX, legend, native tooltip
+  text), built on a new `traffic_analytics.daily_series()` -- buckets real hostnet samples
+  into local-calendar days, marks zero/discontinuity-affected days visibly dimmer, never
+  fabricates missing coverage. Wired into Overview (7-day) and Traffic Analytics (7d/30d
+  toggle via `?range=`).
+- **CLI option 4 (network interfaces)** rebuilt as a looping submenu: Main (default) /
+  All / Physical only / Bridges only / Virtual only / Search / Back. Main uses
+  `default_shown_interfaces()` -- real classification, not a hardcoded name -- which is
+  why it naturally resolves to just the real physical NIC + bridge instead of 60+ per-VM
+  virtual interfaces. `_format_interface_line()` extracted so this screen and
+  `render_host_info()`'s NETWORK section share one rendering implementation.
+- **CLI option 5 (VPS inventory table)**: wide/medium tiers now use the exact required
+  column order (`VPS ID | Name | IP | Status | Used | Limit | Usage %`), Used and Limit as
+  separate GB-formatted columns. Fixed a duplicate-percentage-text bug in the usage column
+  caught by a new test before it shipped.
+- **Localization**: new `web_server.UI` string catalog + `_t(key, lang)`, covering page
+  headings (derived automatically from the nav label catalog), section titles, KPI labels,
+  table headers, and status/coverage badges across all 17 pages. Verified for every
+  (en/fa) x (dark/light) combination across all 17 routes.
+- **Stable version bump**: `renewal_cli.VERSION` 1.8.0 -> **1.9.0**. `deploy/bootstrap.sh`'s
+  default pinned tag updated to match.
+
+**Full suite: 1270 passing, 0 failed, 0 skipped.** Release package rebuilt from this final
+source (`deploy/tixo-renewal-package.tar.gz` + `deploy/SHA256SUMS`), contains both new
+modules (`traffic_format.py`, `charts.py`).
+
+New doc: `RELEASE_NOTES_v1.9.0.md`.
+
+**This version bump, rebuild, and local packaging are development/packaging actions, NOT
+a publish action** -- no git tag was created or pushed, no GitHub Release was created, and
+nothing was deployed to `ir1.tixocloud.com`. A disposable, localhost-only preview (real
+`web-run` codepath, synthetic 60-VPS/30-day data, bound to 127.0.0.1) was run on the dev
+host only, for visual inspection. Publishing the release and deploying to production each
+remain gated behind a separate, explicit operator approval. Telegram connectivity and
+HTTPS/public exposure were both deliberately left untouched this round.
