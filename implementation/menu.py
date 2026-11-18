@@ -564,6 +564,30 @@ def _section(style, title) -> str:
     return f"{style.BOLD}{style.ACCENT}{title}{style.RESET}"
 
 
+def default_shown_interfaces(interfaces: list[dict]) -> list[dict]:
+    """The MAIN/default interface view (v1.9.0): hides known-virtual (per-VM) interfaces AND
+    interfaces that are neither virtual nor carry any usable information (state/IP/counters
+    all unavailable). On a Virtualizor host with dozens of per-VM virtual interfaces, this is
+    what naturally narrows the list down to just the genuinely important physical NIC(s) and
+    real bridge(s) (e.g. ens1f1 + viifbr0) -- driven entirely by actual interface
+    classification/configuration (hostinfo.is_virtual_interface / is_uninformative), never by
+    a hardcoded interface name, so this stays correct if interface names differ on another
+    host. Shared by render_host_info's NETWORK section and the option-4 interfaces explorer
+    (action_system_info_advanced) so the two screens can never disagree on what "Main" means."""
+    return [i for i in interfaces if not i.get("is_virtual") and not i.get("is_uninformative")]
+
+
+def _format_interface_line(iface: dict, style: Style, tag: str = "") -> str:
+    """One interface's display line -- single source of truth shared by render_host_info's
+    NETWORK section and the option-4 interfaces explorer, so RX/TX formatting and
+    unavailable-handling can never drift between the two screens."""
+    rx, tx = iface.get("rx_bytes"), iface.get("tx_bytes")
+    rx_str = f"Download (RX) {_format_bytes_human(rx)}" if isinstance(rx, int) else "Download (RX) unavailable"
+    tx_str = f"Upload (TX) {_format_bytes_human(tx)}" if isinstance(tx, int) else "Upload (TX) unavailable"
+    tag_str = f" {style.GRAY}[{tag}]{style.RESET}" if tag else ""
+    return f"  {iface['name']}: {iface['state']}, {iface['ipv4']} ({rx_str}, {tx_str}){tag_str}"
+
+
 def render_host_info(info: dict, style: Style, show_virtual_interfaces: bool = False,
                       category_filter: str = None, search_term: str = None) -> str:
     """Grouped into OS / CPU / Memory+swap / Storage / Network / Timezone -- each its own
@@ -616,7 +640,7 @@ def render_host_info(info: dict, style: Style, show_virtual_interfaces: bool = F
     # virtual nor carry any usable information (state/IP/counters all unavailable) -- an
     # unfamiliar-but-genuinely-informative interface is NEVER hidden just because its name
     # looks unusual, only because it has nothing to show.
-    default_shown = [i for i in all_ifaces if not i.get("is_virtual") and not i.get("is_uninformative")]
+    default_shown = default_shown_interfaces(all_ifaces)
     hidden_count = len(all_ifaces) - len(default_shown)
     lines.append(_section(style, "NETWORK"))
     shown = all_ifaces if show_virtual_interfaces else default_shown
@@ -629,13 +653,11 @@ def render_host_info(info: dict, style: Style, show_virtual_interfaces: bool = F
     if not shown:
         lines.append(f"  {style.GRAY}(no interfaces to show){style.RESET}")
     for iface in shown:
-        category = hostinfo.classify_interface_category(iface["name"])
-        tag = f" {style.GRAY}[{category}]{style.RESET}" if show_virtual_interfaces else (
-            f" {style.GRAY}[virtual]{style.RESET}" if iface.get("is_virtual") else "")
-        rx, tx = iface.get("rx_bytes"), iface.get("tx_bytes")
-        rx_str = f"Download (RX) {_format_bytes_human(rx)}" if isinstance(rx, int) else "Download (RX) unavailable"
-        tx_str = f"Upload (TX) {_format_bytes_human(tx)}" if isinstance(tx, int) else "Upload (TX) unavailable"
-        lines.append(f"  {iface['name']}: {iface['state']}, {iface['ipv4']} ({rx_str}, {tx_str}){tag}")
+        if show_virtual_interfaces:
+            tag = hostinfo.classify_interface_category(iface["name"])
+        else:
+            tag = "virtual" if iface.get("is_virtual") else ""
+        lines.append(_format_interface_line(iface, style, tag=tag))
     if not show_virtual_interfaces and hidden_count:
         lines.append(f"  {style.GRAY}... {hidden_count} interface(s) hidden (virtual or "
                      f"uninformative) -- see 'Show all network interfaces (advanced)'{style.RESET}")
@@ -812,13 +834,26 @@ def _vps_usage_fraction(record: dict):
     return is_unlimited, pct
 
 
+def _format_gb_display(value) -> str:
+    """'X.XX GB', or 'unavailable' for missing/unparseable values -- never a bare raw
+    number with no unit (matching this project's never-show-a-bare-number traffic-unit
+    discipline, see traffic_format.py for the Web side of the same rule)."""
+    try:
+        return f"{Decimal(str(value)):.2f} GB"
+    except Exception:
+        return "unavailable"
+
+
 def render_vps_table(records: list[dict], style: Style) -> str:
-    """Adapts to the terminal width across three tiers (wide >=100 cols: ID/Hostname/IP/
-    State/Quota/Used/Usage bar; medium 70-99: ID/Hostname/State/Used-over-Quota/%; narrow
-    <70: ID/Hostname/Usage%% only) -- never overflows horizontally, never changes the
-    underlying quota/used data (full values remain in render_vps_detail). Long hostnames
-    are truncated with a single ellipsis character, display-width-aware so CJK/wide
-    characters don't silently break column alignment."""
+    """Adapts to the terminal width across three tiers -- wide (>=100 cols): the full
+    VPS ID / Name / IP / Status / Used / Limit / Usage %% column set from the spec, in that
+    exact order; medium (70-99): VPS ID / Name / Status / Used / Limit / Usage %%, IP
+    intelligently dropped first since it's the least decision-relevant column at a glance;
+    narrow (<70): VPS ID / Name / Usage %% only. Never overflows horizontally, never changes
+    the underlying quota/used data (full values remain in render_vps_detail). Long names are
+    truncated with a single ellipsis character, display-width-aware so CJK/wide characters
+    don't silently break column alignment. Progress bars stay compact (<=8 cells) -- this is
+    a dense inventory table, not a dashboard widget."""
     if not records:
         return f"  {style.GRAY}(no VPS records -- run an inventory sync first){style.RESET}"
     try:
@@ -837,54 +872,60 @@ def render_vps_table(records: list[dict], style: Style) -> str:
     lines = []
 
     if tier == "wide":
-        host_w, ip_w = 22, 15
-        header = (f"  {_pad_display('ID', 7, '>')}  {_pad_display('Hostname', host_w)}  "
-                  f"{_pad_display('IP', ip_w)}  {_pad_display('State', 10)}  "
-                  f"{_pad_display('Quota', 9, '>')}  {_pad_display('Used', 9, '>')}  Usage")
+        name_w, ip_w, used_w, limit_w = 20, 15, 10, 10
+        header = (f"  {_pad_display('VPS ID', 7, '>')}  {_pad_display('Name', name_w)}  "
+                  f"{_pad_display('IP', ip_w)}  {_pad_display('Status', 10)}  "
+                  f"{_pad_display('Used', used_w, '>')}  {_pad_display('Limit', limit_w, '>')}  Usage %")
         lines.append(style.BOLD + style.ACCENT + header + style.RESET)
         for r in records:
             is_unlimited, pct = _vps_usage_fraction(r)
-            usage_display = "UNLIMITED" if is_unlimited else render_progress_bar(
-                float(pct) if pct is not None else None, width=10, style=style)
+            if is_unlimited:
+                usage_display = "UNLIMITED"
+            elif pct is None:
+                usage_display = "?"
+            else:
+                usage_display = render_progress_bar(float(pct), width=8, style=style)
             runtime_status = r.get("runtime_status", "unavailable")
             color = _status_color(runtime_status, style)
             ip = _truncate_display(str(r.get("ip_primary", "unavailable")), ip_w)
-            hostname = _truncate_display(str(r.get("hostname")), host_w)
+            name = _truncate_display(str(r.get("hostname")), name_w)
+            limit_display = "UNLIMITED" if is_unlimited else _format_gb_display(r.get("quota_gb"))
             lines.append(
-                f"  {_pad_display(str(r['vpsid']), 7, '>')}  {_pad_display(hostname, host_w)}  "
+                f"  {_pad_display(str(r['vpsid']), 7, '>')}  {_pad_display(name, name_w)}  "
                 f"{_pad_display(ip, ip_w)}  "
                 f"{color}{_pad_display(_truncate_display(str(runtime_status), 10), 10)}{style.RESET}  "
-                f"{_pad_display(str(r.get('quota_gb')), 9, '>')}  "
-                f"{_pad_display(str(r.get('used_gb')), 9, '>')}  {usage_display}")
+                f"{_pad_display(_format_gb_display(r.get('used_gb')), used_w, '>')}  "
+                f"{_pad_display(limit_display, limit_w, '>')}  {usage_display}")
 
     elif tier == "medium":
-        host_w = 16
-        header = (f"  {_pad_display('ID', 6, '>')}  {_pad_display('Hostname', host_w)}  "
-                  f"{_pad_display('State', 9)}  {_pad_display('Used/Quota', 14, '>')}  %")
+        name_w, used_w, limit_w = 16, 10, 10
+        header = (f"  {_pad_display('VPS ID', 6, '>')}  {_pad_display('Name', name_w)}  "
+                  f"{_pad_display('Status', 9)}  {_pad_display('Used', used_w, '>')}  "
+                  f"{_pad_display('Limit', limit_w, '>')}  Usage %")
         lines.append(style.BOLD + style.ACCENT + header + style.RESET)
         for r in records:
             is_unlimited, pct = _vps_usage_fraction(r)
-            quota, used = r.get("quota_gb"), r.get("used_gb")
-            used_quota = "UNLIMITED" if is_unlimited else f"{used}/{quota}"
+            limit_display = "UNLIMITED" if is_unlimited else _format_gb_display(r.get("quota_gb"))
             pct_display = "--" if is_unlimited else (f"{float(pct):.0f}%" if pct is not None else "?")
             runtime_status = r.get("runtime_status", "unavailable")
             color = _status_color(runtime_status, style)
-            hostname = _truncate_display(str(r.get("hostname")), host_w)
+            name = _truncate_display(str(r.get("hostname")), name_w)
             lines.append(
-                f"  {_pad_display(str(r['vpsid']), 6, '>')}  {_pad_display(hostname, host_w)}  "
+                f"  {_pad_display(str(r['vpsid']), 6, '>')}  {_pad_display(name, name_w)}  "
                 f"{color}{_pad_display(_truncate_display(str(runtime_status), 9), 9)}{style.RESET}  "
-                f"{_pad_display(used_quota, 14, '>')}  {pct_display}")
+                f"{_pad_display(_format_gb_display(r.get('used_gb')), used_w, '>')}  "
+                f"{_pad_display(limit_display, limit_w, '>')}  {pct_display}")
 
     else:  # narrow
-        host_w = 12
-        header = f"  {_pad_display('ID', 5, '>')}  {_pad_display('Hostname', host_w)}  Usage"
+        name_w = 12
+        header = f"  {_pad_display('VPS ID', 5, '>')}  {_pad_display('Name', name_w)}  Usage %"
         lines.append(style.BOLD + style.ACCENT + header + style.RESET)
         for r in records:
             is_unlimited, pct = _vps_usage_fraction(r)
             usage_display = "UNLIM" if is_unlimited else (f"{float(pct):.0f}%" if pct is not None else "?")
-            hostname = _truncate_display(str(r.get("hostname")), host_w)
+            name = _truncate_display(str(r.get("hostname")), name_w)
             lines.append(f"  {_pad_display(str(r['vpsid']), 5, '>')}  "
-                         f"{_pad_display(hostname, host_w)}  {usage_display}")
+                         f"{_pad_display(name, name_w)}  {usage_display}")
 
     return "\n".join(lines)
 
@@ -1388,19 +1429,81 @@ def action_system_info(style: Style, show_virtual_interfaces: bool = False,
     print(render_virtualizor_info(collect_virtualizor_info(), style))
 
 
+def _render_interface_section(interfaces: list[dict], style: Style, tag_mode: str,
+                               heading: str) -> str:
+    """Renders one labeled list of interfaces for the option-4 explorer -- `tag_mode` is
+    'category' (show each interface's physical/bridge/virtual classification) or '' (no
+    per-row tag, used for the Main view where every row shown is already known-important)."""
+    lines = [f"{style.BOLD}{style.ACCENT}{heading}{style.RESET}"]
+    if not interfaces:
+        lines.append(f"  {style.GRAY}(no interfaces to show){style.RESET}")
+    for iface in interfaces:
+        tag = hostinfo.classify_interface_category(iface["name"]) if tag_mode == "category" else ""
+        lines.append(_format_interface_line(iface, style, tag=tag))
+    return "\n".join(lines)
+
+
 def action_system_info_advanced(style: Style):
-    """Full interface list by default; the operator can narrow it by category
-    (physical/bridge/virtual/all) and/or a name search, or press Enter twice for the
-    unfiltered advanced view. This NEVER changes which interface the hostnet sampler
-    actually reads (see hostnet_sync.py) -- display filtering only."""
-    print(f"{style.BOLD}{style.ACCENT}=== Advanced: all network interfaces (including "
-          f"virtual) ==={style.RESET}\n")
-    category_raw = input(
-        "Filter by category [all/physical/bridge/virtual, Enter = all]: ").strip().lower()
-    category_filter = category_raw if category_raw in ("physical", "bridge", "virtual") else None
-    search_term = input("Search interface names (Enter = no filter): ").strip() or None
-    action_system_info(style, show_virtual_interfaces=True, category_filter=category_filter,
-                        search_term=search_term)
+    """Network Interfaces explorer (v1.9.0) -- a looping submenu with explicit, visibly
+    distinct choices: Main (default) / All / Physical only / Bridges only / Virtual only /
+    Search / Back. Pressing Enter at the prompt is exactly equivalent to choosing Main.
+
+    Main NEVER dumps the full interface list -- on a Virtualizor host with dozens of per-VM
+    virtual interfaces, Main shows only the genuinely important ones (see
+    default_shown_interfaces(): real physical NICs + real bridges, e.g. ens1f1 + viifbr0 in
+    production), using actual interface classification/configuration rather than a hardcoded
+    name. All/Physical/Bridges/Virtual/Search are explicit, one extra keystroke away -- never
+    shown by default. This NEVER changes which interface the hostnet sampler actually reads
+    (see hostnet_sync.py) -- display filtering only, and never alters the interfaces
+    themselves."""
+    all_ifaces = hostinfo.collect_host_info()["network_interfaces"]
+    while True:
+        clear_screen()
+        print(f"{style.BOLD}{style.ACCENT}=== Network Interfaces ==={style.RESET}\n")
+        print(f"  {style.ACCENT}1{style.RESET}. Main interfaces (default){style.GRAY} -- "
+              f"physical + bridges, never per-VM virtual{style.RESET}")
+        print(f"  {style.ACCENT}2{style.RESET}. All interfaces")
+        print(f"  {style.ACCENT}3{style.RESET}. Physical only")
+        print(f"  {style.ACCENT}4{style.RESET}. Bridges only")
+        print(f"  {style.ACCENT}5{style.RESET}. Virtual only")
+        print(f"  {style.ACCENT}6{style.RESET}. Search by name")
+        print(f"  {style.ACCENT}7{style.RESET}. Back")
+        choice = input(f"\n{style.GRAY}Choose [Enter = Main]: {style.RESET}").strip().lower()
+
+        if choice in ("", "1", "main"):
+            shown = default_shown_interfaces(all_ifaces)
+            section = _render_interface_section(shown, style, tag_mode="",
+                                                 heading=f"MAIN ({len(shown)} of {len(all_ifaces)} total)")
+        elif choice in ("2", "all"):
+            section = _render_interface_section(all_ifaces, style, tag_mode="category",
+                                                 heading=f"ALL ({len(all_ifaces)} total)")
+        elif choice in ("3", "physical"):
+            shown = hostinfo.filter_interfaces(all_ifaces, category="physical")
+            section = _render_interface_section(shown, style, tag_mode="",
+                                                 heading=f"PHYSICAL ({len(shown)} of {len(all_ifaces)})")
+        elif choice in ("4", "bridges", "bridge"):
+            shown = hostinfo.filter_interfaces(all_ifaces, category="bridge")
+            section = _render_interface_section(shown, style, tag_mode="",
+                                                 heading=f"BRIDGES ({len(shown)} of {len(all_ifaces)})")
+        elif choice in ("5", "virtual"):
+            shown = hostinfo.filter_interfaces(all_ifaces, category="virtual")
+            section = _render_interface_section(shown, style, tag_mode="",
+                                                 heading=f"VIRTUAL ({len(shown)} of {len(all_ifaces)})")
+        elif choice in ("6", "search"):
+            search_term = input("Search interface names: ").strip() or None
+            shown = hostinfo.filter_interfaces(all_ifaces, search=search_term)
+            section = _render_interface_section(
+                shown, style, tag_mode="category",
+                heading=f"SEARCH '{search_term}' ({len(shown)} of {len(all_ifaces)})")
+        elif choice in ("7", "b", "back", "q"):
+            return
+        else:
+            input(f"{style.RED}Invalid choice. Press Enter to continue.{style.RESET}")
+            continue
+
+        print()
+        print(section)
+        input(f"\n{style.GRAY}Press Enter to return to this menu.{style.RESET}")
 
 
 def _inventory_db_path() -> str:

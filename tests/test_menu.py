@@ -749,14 +749,15 @@ def _vps_record(**overrides):
     return base
 
 
-def test_render_vps_table_medium_tier_hides_ip_shows_used_over_quota(monkeypatch):
+def test_render_vps_table_medium_tier_hides_ip_shows_used_and_limit_columns(monkeypatch):
     import shutil
     monkeypatch.setattr(shutil, "get_terminal_size",
                          lambda fallback=None: os.terminal_size((80, 24)))
     records = [_vps_record(used_gb="10", quota_gb="100")]
     out = menu.render_vps_table(records, menu.Style(enabled=False))
     assert "web1" in out
-    assert "10/100" in out
+    assert "10.00 GB" in out  # Used
+    assert "100.00 GB" in out  # Limit
     assert "203.0.113.5" not in out
 
 
@@ -781,7 +782,8 @@ def test_render_vps_table_medium_tier_marks_unlimited_distinct_from_zero_usage()
         zero_usage = _vps_record(vpsid=2, hostname="idle-vps", quota_gb="100", used_gb="0")
         out = menu.render_vps_table([unlimited, zero_usage], menu.Style(enabled=False))
         assert "UNLIMITED" in out
-        assert "0/100" in out  # zero usage shown as a real 0, never confused with unlimited
+        assert "0.00 GB" in out  # zero usage shown as a real 0, never confused with unlimited
+        assert "100.00 GB" in out  # idle-vps's limit
     finally:
         shutil.get_terminal_size = orig
 
@@ -933,3 +935,148 @@ def test_menu_items_includes_telegram_bot_config():
 def test_menu_items_includes_relay_worker_config():
     labels = [label for label, _ in menu.MENU_ITEMS]
     assert "Configure Relay Worker (optional, run on a SEPARATE host)" in labels
+
+
+# ---------- CLI option 4: Network Interfaces explorer (v1.9.0) --------------------------------
+
+def _fake_interfaces():
+    ifaces = [
+        {"name": "ens1f1", "state": "up", "ipv4": "87.107.168.129", "ipv6": "unavailable",
+         "is_virtual": False, "is_uninformative": False, "rx_bytes": 1_000_000_000, "tx_bytes": 500_000_000},
+        {"name": "viifbr0", "state": "up", "ipv4": "10.0.0.1", "ipv6": "unavailable",
+         "is_virtual": False, "is_uninformative": False, "rx_bytes": 2_000_000_000, "tx_bytes": 1_000_000_000},
+        {"name": "lo", "state": "up", "ipv4": "127.0.0.1", "ipv6": "unavailable",
+         "is_virtual": False, "is_uninformative": True, "rx_bytes": 0, "tx_bytes": 0},
+    ]
+    for i in range(60):
+        ifaces.append({"name": f"viifv{i}", "state": "up", "ipv4": "unavailable", "ipv6": "unavailable",
+                        "is_virtual": True, "is_uninformative": False, "rx_bytes": 123, "tx_bytes": 456})
+    return ifaces
+
+
+def _run_interfaces_menu(monkeypatch, capsys, inputs):
+    monkeypatch.setattr(menu.hostinfo, "collect_host_info",
+                         lambda: {"network_interfaces": _fake_interfaces()})
+    monkeypatch.setattr(menu, "clear_screen", lambda: None)
+    it = iter(inputs)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(it))
+    menu.action_system_info_advanced(menu.Style(enabled=False))
+    return capsys.readouterr().out
+
+
+def test_default_shown_interfaces_excludes_virtual_and_uninformative():
+    shown = menu.default_shown_interfaces(_fake_interfaces())
+    names = {i["name"] for i in shown}
+    assert names == {"ens1f1", "viifbr0"}
+
+
+def test_option4_enter_defaults_to_main_shows_only_physical_and_bridge(monkeypatch, capsys):
+    out = _run_interfaces_menu(monkeypatch, capsys, ["", "", "7"])
+    assert "ens1f1" in out
+    assert "viifbr0" in out
+    assert "viifv0" not in out, "Main must never dump the 60+ per-VM virtual interfaces"
+
+
+def test_option4_all_shows_every_interface(monkeypatch, capsys):
+    out = _run_interfaces_menu(monkeypatch, capsys, ["2", "", "7"])
+    assert "viifv0" in out and "viifv59" in out and "ens1f1" in out
+
+
+def test_option4_physical_only(monkeypatch, capsys):
+    out = _run_interfaces_menu(monkeypatch, capsys, ["3", "", "7"])
+    assert "ens1f1" in out
+    assert "viifbr0" not in out
+    assert "viifv0" not in out
+
+
+def test_option4_bridges_only(monkeypatch, capsys):
+    out = _run_interfaces_menu(monkeypatch, capsys, ["4", "", "7"])
+    assert "viifbr0" in out
+    assert "ens1f1" not in out
+
+
+def test_option4_virtual_only(monkeypatch, capsys):
+    out = _run_interfaces_menu(monkeypatch, capsys, ["5", "", "7"])
+    assert "viifv0" in out
+    assert "ens1f1" not in out
+    assert "viifbr0" not in out
+
+
+def test_option4_search_by_name(monkeypatch, capsys):
+    out = _run_interfaces_menu(monkeypatch, capsys, ["6", "viifv3", "", "7"])
+    assert "viifv3" in out
+
+
+def test_option4_back_exits_without_error(monkeypatch, capsys):
+    out = _run_interfaces_menu(monkeypatch, capsys, ["7"])
+    assert "Network Interfaces" in out
+
+
+def test_option4_invalid_choice_reprompts_instead_of_crashing(monkeypatch, capsys):
+    """An invalid choice must re-show the submenu (not crash, not silently fall through to
+    any specific view) -- confirmed here by the submenu header appearing twice in the
+    transcript (once for the invalid attempt, once after re-looping)."""
+    out = _run_interfaces_menu(monkeypatch, capsys, ["99", "", "7"])
+    assert out.count("=== Network Interfaces ===") == 2
+
+
+def test_option4_never_mutates_interface_list(monkeypatch, capsys):
+    """Display filtering only -- action_system_info_advanced must never alter the underlying
+    interface data it was given."""
+    ifaces = _fake_interfaces()
+    snapshot = [dict(i) for i in ifaces]
+    monkeypatch.setattr(menu.hostinfo, "collect_host_info", lambda: {"network_interfaces": ifaces})
+    monkeypatch.setattr(menu, "clear_screen", lambda: None)
+    it = iter(["2", "", "3", "", "5", "", "7"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(it))
+    menu.action_system_info_advanced(menu.Style(enabled=False))
+    assert ifaces == snapshot
+
+
+# ---------- CLI option 5: exact column order (v1.9.0) ------------------------------------------
+
+def test_render_vps_table_wide_tier_header_matches_exact_spec_column_order(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "get_terminal_size",
+                         lambda fallback=None: os.terminal_size((120, 24)))
+    records = [_vps_record()]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    header_line = out.splitlines()[0]
+    # exact required order: VPS ID | Name | IP | Status | Used | Limit | Usage %
+    for col in ("VPS ID", "Name", "IP", "Status", "Used", "Limit", "Usage %"):
+        assert col in header_line
+    assert header_line.index("VPS ID") < header_line.index("Name") < header_line.index("IP")
+    assert header_line.index("IP") < header_line.index("Status") < header_line.index("Used")
+    assert header_line.index("Used") < header_line.index("Limit") < header_line.index("Usage %")
+
+
+def test_render_vps_table_wide_tier_shows_used_before_limit_in_data_row(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "get_terminal_size",
+                         lambda fallback=None: os.terminal_size((120, 24)))
+    records = [_vps_record(used_gb="10", quota_gb="100")]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    data_line = out.splitlines()[1]
+    assert data_line.index("10.00 GB") < data_line.index("100.00 GB")
+
+
+def test_render_vps_table_wide_tier_unlimited_shows_textual_limit_not_bytes(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "get_terminal_size",
+                         lambda fallback=None: os.terminal_size((120, 24)))
+    records = [_vps_record(quota_gb="0", used_gb="500")]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    assert "UNLIMITED" in out
+    assert "500.00 GB" in out  # actual usage still shown, never hidden just because unlimited
+
+
+def test_render_vps_table_progress_bar_stays_compact(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "get_terminal_size",
+                         lambda fallback=None: os.terminal_size((120, 24)))
+    records = [_vps_record(used_gb="50", quota_gb="100")]
+    out = menu.render_vps_table(records, menu.Style(enabled=False))
+    bar = menu.render_progress_bar(50.0, width=8, style=menu.Style(enabled=False))
+    assert bar in out
+    assert out.count("50.0%") == 1  # never duplicated -- the bar's own embedded percent is the only one
+    assert menu._display_width(bar) <= 20  # "[########] 100.0%" worst case -- compact, not an oversized widget
