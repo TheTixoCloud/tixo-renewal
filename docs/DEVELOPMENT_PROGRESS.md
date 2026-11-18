@@ -871,3 +871,50 @@ in this environment.** Every locally-verifiable gate passes (tests, security rev
 reproducible packaging, rollback, config preservation). The remaining gates --
 real cross-host relay/agent validation and real certificate issuance -- require
 infrastructure this single-host development environment does not have.
+
+---
+
+## Final completion pass: three-mode backup delivery, UI polish, stable v1.8.0
+
+Closed the remaining genuine gaps identified for final release:
+
+- **Encrypted Telegram backup delivery now works over all three connectivity modes**
+  (previously DIRECT-only; SOCKS5/RELAY raised `NotImplementedError`). DIRECT and SOCKS5
+  share one real streaming multipart-upload implementation
+  (`_stream_send_document_over_socket` in `telegram_transport.py`) -- the file is read in
+  bounded 64KB chunks, never loaded into memory at once; SOCKS5's full real protocol path
+  (CONNECT handshake -> TLS handshake -> streamed upload) is now actually exercised
+  against a real local SOCKS5+TLS test server, closing a pre-existing untested-happy-path
+  gap. RELAY mode gained a real document-delivery path through a new, independently-
+  capped `relay_worker.py` `/submit-document` endpoint (base64 envelope, never the
+  passphrase or any secret, replay-protected exactly like `/submit`).
+  `backup.send_backup_to_telegram()` gained bounded per-admin retries (never retrying a
+  permanent `NotImplementedError`) and a dedupe marker so re-running delivery for the same
+  archive never re-sends to an admin who already received it.
+- **Network interface display**: added `hostinfo.classify_interface_category()`
+  (physical/bridge/virtual) and `filter_interfaces()` (category + name search) on top of
+  the existing compact/advanced split -- the advanced menu screen now prompts for an
+  optional filter. Confirmed never affects `hostnet_sync.py`'s own interface selection.
+- **VPS inventory table**: `render_vps_table()` now adapts across three terminal-width
+  tiers (wide/medium/narrow) instead of two, with display-width-aware ellipsis truncation
+  (East Asian wide characters counted as two columns) and an always-visible distinction
+  between unlimited-quota and genuinely-zero-usage VPS.
+- **Security review fixes carried from the prior QA pass, re-verified**: `Secure` session
+  cookie under TLS, bounded request bodies on every HTTP server.
+- **Stable version bump**: `renewal_cli.VERSION` 1.7.3 -> **1.8.0** (not an RC label --
+  the actual stable version this release represents). `deploy/bootstrap.sh`'s default
+  pinned tag updated to match; `deploy/install.sh` now prints the installed version; the
+  Web Control Center gained a version footer (previously had none).
+
+**Full suite: 1221 passing, 0 failed, 0 skipped.** Release package rebuilt from this
+final source, reproducible (byte-identical across two builds), verified to contain no
+secrets/credentials/databases.
+
+**SHA256 (stable v1.8.0 package): `def4207414cea11c64f979af7691554244206c786d671c99f636ebdc0e63fefc`**
+
+New doc: `RELEASE_NOTES_v1.8.0.md` (supersedes the RC notes, kept for history).
+
+**This version bump, rebuild, and local packaging are development/packaging actions, NOT
+a publish action** -- no git tag was created or pushed, no GitHub Release was created.
+Publishing the release and deploying to `ir1.tixocloud.com` each remain gated behind a
+separate, explicit operator approval (see the Final Approval Report for this session).
