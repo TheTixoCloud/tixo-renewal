@@ -21,6 +21,7 @@ import sqlite3
 import subprocess
 import tarfile
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -255,20 +256,49 @@ class BackupDeliverySecurityError(Exception):
     pass
 
 
+def _load_delivery_markers(marker_path: str) -> dict:
+    if not os.path.exists(marker_path):
+        return {}
+    try:
+        return json.loads(Path(marker_path).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_delivery_markers(marker_path: str, markers: dict) -> None:
+    tmp = marker_path + ".tmp"
+    Path(tmp).write_text(json.dumps(markers))
+    os.replace(tmp, marker_path)
+
+
 def send_backup_to_telegram(transport, admin_ids: list, archive_path: str,
                              require_encrypted: bool = True,
-                             max_size_bytes: int = 50 * 1024 * 1024) -> dict:
+                             max_size_bytes: int = 50 * 1024 * 1024,
+                             max_retries: int = 2, retry_delay_seconds: float = 2.0,
+                             dedupe_marker_path: str = None, sleep_fn=None) -> dict:
     """Delivers a backup archive to every admin via the given Telegram transport's
-    `send_document`. SECURITY REQUIREMENTS, enforced here rather than left to the caller:
+    `send_document`. Works identically across DIRECT, SOCKS5, and RELAY connectivity modes
+    -- each transport implements real, mode-specific delivery (see telegram_transport.py);
+    this function never knows or cares which mode it's calling into.
+
+    SECURITY REQUIREMENTS, enforced here rather than left to the caller:
       - `archive_path` MUST end in `.gpg` (i.e. already encrypted by encrypt_backup_file())
         unless `require_encrypted=False` is explicitly passed -- never sends a plaintext
-        database/config bundle to Telegram by default.
-      - size is checked against `max_size_bytes` BEFORE any upload attempt.
-      - a transport that does not support `send_document` (SOCKS5/RELAY -- see
-        telegram_transport.py's documented limitations) raises a clear
+        database/config bundle to Telegram by default, over ANY transport.
+      - size is checked against `max_size_bytes` BEFORE any upload attempt (each transport
+        additionally enforces its own mode-appropriate cap -- see RELAY's smaller limit).
+      - a transport that does not support `send_document` at all raises a clear
         BackupDeliverySecurityError rather than silently failing per-recipient.
-    Returns {admin_id: {"ok": bool, "error": str|None}} -- one delivery attempt per admin,
-    a failure for one admin never blocks delivery to the others."""
+
+    RELIABILITY: each admin gets up to `max_retries` additional attempts (bounded, with a
+    short delay between them -- `sleep_fn` is injectable for tests so this never actually
+    sleeps in the suite) before being recorded as failed. A `dedupe_marker_path` JSON
+    sidecar (defaults to `<archive_path>.delivered.json`) records which admin IDs already
+    received this exact archive successfully, so re-running delivery for the same archive
+    (e.g. after a scheduled-run retry) never re-sends to someone who already got it.
+
+    Returns {admin_id: {"ok": bool, "error": str|None, "skipped_duplicate": bool}} -- one
+    outcome per admin; a failure for one admin never blocks delivery to the others."""
     if require_encrypted and not archive_path.endswith(".gpg"):
         raise BackupDeliverySecurityError(
             f"{archive_path} is not an encrypted (.gpg) archive -- refusing to send a "
@@ -285,14 +315,37 @@ def send_backup_to_telegram(transport, admin_ids: list, archive_path: str,
         raise BackupDeliverySecurityError(
             f"{type(transport).__name__} does not support sending documents")
 
+    sleep_fn = sleep_fn or time.sleep
+    marker_path = dedupe_marker_path or (archive_path + ".delivered.json")
+    already_delivered = _load_delivery_markers(marker_path)
+
     results = {}
     for admin_id in admin_ids:
-        try:
-            transport.send_document(admin_id, archive_path,
-                                      caption=f"Backup: {os.path.basename(archive_path)}")
-            results[admin_id] = {"ok": True, "error": None}
-        except NotImplementedError as e:
-            results[admin_id] = {"ok": False, "error": str(e)}
-        except Exception as e:  # noqa: BLE001 -- one admin's delivery failure must never
-            results[admin_id] = {"ok": False, "error": str(e)}  # block the others
+        admin_key = str(admin_id)
+        if already_delivered.get(admin_key):
+            results[admin_id] = {"ok": True, "error": None, "skipped_duplicate": True}
+            continue
+
+        last_error = None
+        delivered = False
+        for attempt in range(max_retries + 1):
+            try:
+                transport.send_document(admin_id, archive_path,
+                                          caption=f"Backup: {os.path.basename(archive_path)}")
+                delivered = True
+                break
+            except NotImplementedError as e:
+                last_error = str(e)
+                break  # never worth retrying an unsupported-mode error
+            except Exception as e:  # noqa: BLE001 -- one admin's failure must never block others
+                last_error = str(e)
+                if attempt < max_retries:
+                    sleep_fn(retry_delay_seconds)
+
+        results[admin_id] = {"ok": delivered, "error": None if delivered else last_error,
+                              "skipped_duplicate": False}
+        if delivered:
+            already_delivered[admin_key] = True
+
+    _save_delivery_markers(marker_path, already_delivered)
     return results

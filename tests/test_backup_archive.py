@@ -337,7 +337,8 @@ def test_send_backup_to_telegram_one_failure_does_not_block_others(tmp_path):
     encrypted = tmp_path / "backup.tar.gz.gpg"
     encrypted.write_bytes(b"data")
     transport = _FakeTransportWithDocument(fail_for={2})
-    result = backup.send_backup_to_telegram(transport, [1, 2, 3], str(encrypted))
+    result = backup.send_backup_to_telegram(transport, [1, 2, 3], str(encrypted),
+                                               max_retries=0, sleep_fn=lambda s: None)
     assert result[1]["ok"] is True
     assert result[2]["ok"] is False
     assert result[3]["ok"] is True
@@ -349,6 +350,97 @@ def test_send_backup_to_telegram_allows_plaintext_when_explicitly_overridden(tmp
     transport = _FakeTransportWithDocument()
     result = backup.send_backup_to_telegram(transport, [1], str(plain), require_encrypted=False)
     assert result[1]["ok"] is True
+
+
+# ---------- bounded retries + duplicate-delivery avoidance ---------------------------------------
+
+class _FlakyTransport:
+    """Fails a configurable number of times per admin before succeeding -- simulates a
+    transient network/proxy/relay failure that a bounded retry should recover from."""
+    def __init__(self, fail_count_by_admin: dict):
+        self.fail_count_by_admin = dict(fail_count_by_admin)
+        self.attempts = {}
+
+    def send_document(self, chat_id, file_path, caption=None):
+        self.attempts[chat_id] = self.attempts.get(chat_id, 0) + 1
+        remaining = self.fail_count_by_admin.get(chat_id, 0)
+        if remaining > 0:
+            self.fail_count_by_admin[chat_id] = remaining - 1
+            raise Exception(f"transient failure for {chat_id}")
+
+
+def test_send_backup_to_telegram_retries_transient_failure_until_success(tmp_path):
+    encrypted = tmp_path / "backup.tar.gz.gpg"
+    encrypted.write_bytes(b"data")
+    transport = _FlakyTransport({1: 2})  # fails twice, succeeds on the 3rd attempt
+    sleeps = []
+    result = backup.send_backup_to_telegram(transport, [1], str(encrypted),
+                                               max_retries=2, sleep_fn=sleeps.append)
+    assert result[1]["ok"] is True
+    assert transport.attempts[1] == 3
+    assert len(sleeps) == 2  # one sleep between each of the two failed attempts
+
+
+def test_send_backup_to_telegram_gives_up_after_max_retries(tmp_path):
+    encrypted = tmp_path / "backup.tar.gz.gpg"
+    encrypted.write_bytes(b"data")
+    transport = _FlakyTransport({1: 10})  # always fails
+    result = backup.send_backup_to_telegram(transport, [1], str(encrypted),
+                                               max_retries=2, sleep_fn=lambda s: None)
+    assert result[1]["ok"] is False
+    assert transport.attempts[1] == 3  # initial attempt + 2 retries, never more
+
+
+def test_send_backup_to_telegram_never_retries_unsupported_mode_error(tmp_path):
+    """NotImplementedError (e.g. an unsupported transport mode) is never transient --
+    retrying it would just waste time before failing the same way again."""
+    encrypted = tmp_path / "backup.tar.gz.gpg"
+    encrypted.write_bytes(b"data")
+
+    class _AlwaysNotImplemented:
+        def __init__(self):
+            self.attempts = 0
+        def send_document(self, chat_id, file_path, caption=None):
+            self.attempts += 1
+            raise NotImplementedError("mode not supported")
+
+    transport = _AlwaysNotImplemented()
+    result = backup.send_backup_to_telegram(transport, [1], str(encrypted),
+                                               max_retries=2, sleep_fn=lambda s: None)
+    assert result[1]["ok"] is False
+    assert transport.attempts == 1
+
+
+def test_send_backup_to_telegram_skips_already_delivered_admin_on_retry(tmp_path):
+    """Re-running delivery for the SAME archive must never re-send to an admin who already
+    received it successfully -- the dedupe marker persists across calls."""
+    encrypted = tmp_path / "backup.tar.gz.gpg"
+    encrypted.write_bytes(b"data")
+    transport = _FakeTransportWithDocument()
+
+    first = backup.send_backup_to_telegram(transport, [1, 2], str(encrypted))
+    assert all(r["ok"] for r in first.values())
+    assert len(transport.sent) == 2
+
+    second = backup.send_backup_to_telegram(transport, [1, 2, 3], str(encrypted))
+    assert second[1]["skipped_duplicate"] is True
+    assert second[2]["skipped_duplicate"] is True
+    assert second[3]["skipped_duplicate"] is False
+    # Only admin 3 (never successfully delivered before) triggers a new send.
+    assert len(transport.sent) == 3
+
+
+def test_send_backup_to_telegram_dedupe_marker_does_not_affect_other_archives(tmp_path):
+    encrypted_a = tmp_path / "a.tar.gz.gpg"
+    encrypted_a.write_bytes(b"data-a")
+    encrypted_b = tmp_path / "b.tar.gz.gpg"
+    encrypted_b.write_bytes(b"data-b")
+    transport = _FakeTransportWithDocument()
+
+    backup.send_backup_to_telegram(transport, [1], str(encrypted_a))
+    result_b = backup.send_backup_to_telegram(transport, [1], str(encrypted_b))
+    assert result_b[1]["skipped_duplicate"] is False
+    assert result_b[1]["ok"] is True
 
 
 # ---------- renewal_cli `backup-scheduled-run` command ------------------------------------------

@@ -58,29 +58,74 @@ def test_direct_transport_raises_on_invalid_json_response():
         transport.call("getMe", http_post=lambda u, d, t: "not json")
 
 
-# ---------- DirectTransport.send_document (backup delivery) ----------------------------------
+# ---------- DirectTransport.send_document (backup delivery): streamed over a fake socket -----
 
-def test_send_document_uploads_multipart_with_file_bytes(tmp_path):
+class _FakeDocumentSocket:
+    """Records every byte sent (so the test can parse the real multipart request the
+    streaming code produced) and returns a canned HTTP response on recv()."""
+
+    def __init__(self, response: bytes = None):
+        self.sent = bytearray()
+        self._response = response or (
+            b"HTTP/1.1 200 OK\r\nContent-Length: 36\r\n\r\n"
+            b'{"ok": true, "result": {"message_id": 1}}')
+        self._response_sent = False
+
+    def sendall(self, data: bytes):
+        self.sent.extend(data)
+
+    def recv(self, n: int) -> bytes:
+        if self._response_sent:
+            return b""
+        self._response_sent = True
+        return self._response
+
+    def close(self):
+        pass
+
+
+def test_send_document_streams_multipart_over_socket(tmp_path):
     file_path = str(tmp_path / "archive.tar.gz")
     with open(file_path, "wb") as f:
         f.write(b"fake archive bytes")
 
-    captured = {}
-    def fake_post(url, data, timeout, content_type):
-        captured["url"] = url
-        captured["data"] = data
-        captured["content_type"] = content_type
-        return '{"ok": true, "result": {"message_id": 1}}'
-
+    fake_socket = _FakeDocumentSocket()
     transport = tt.DirectTransport(bot_token="123:ABC")
     result = transport.send_document(chat_id=42, file_path=file_path, caption="backup",
-                                        http_post=fake_post)
+                                        socket_factory=lambda: fake_socket)
     assert result == {"ok": True, "result": {"message_id": 1}}
-    assert captured["url"] == "https://api.telegram.org/bot123:ABC/sendDocument"
-    assert "multipart/form-data" in captured["content_type"]
-    assert b"fake archive bytes" in captured["data"]
-    assert b'name="chat_id"' in captured["data"]
-    assert b'name="caption"' in captured["data"]
+    sent = bytes(fake_socket.sent)
+    assert b"POST /bot123:ABC/sendDocument HTTP/1.1" in sent
+    assert b"multipart/form-data; boundary=" in sent
+    assert b"fake archive bytes" in sent
+    assert b'name="chat_id"' in sent
+    assert b'name="caption"' in sent
+    # Content-Length must exactly match what was actually sent after the header block.
+    header_end = sent.index(b"\r\n\r\n") + 4
+    import re
+    cl = int(re.search(rb"Content-Length: (\d+)", sent).group(1))
+    assert len(sent) - header_end == cl
+
+
+def test_send_document_never_buffers_whole_file_via_small_chunks(tmp_path):
+    """Forces a tiny chunk size so the streaming loop runs many iterations -- confirms the
+    file is read incrementally (os.path.getsize for the cap check is the only whole-file
+    stat; the content itself is never loaded in one piece)."""
+    file_path = str(tmp_path / "archive.tar.gz")
+    payload = b"0123456789" * 50  # 500 bytes, several chunks at chunk_size=64
+    with open(file_path, "wb") as f:
+        f.write(payload)
+
+    fake_socket = _FakeDocumentSocket()
+    import telegram_transport as tt_mod
+    monkeypatch_chunk = tt_mod.DEFAULT_DOCUMENT_CHUNK_BYTES
+    try:
+        tt_mod.DEFAULT_DOCUMENT_CHUNK_BYTES = 64
+        transport = tt.DirectTransport(bot_token="t")
+        transport.send_document(chat_id=1, file_path=file_path, socket_factory=lambda: fake_socket)
+    finally:
+        tt_mod.DEFAULT_DOCUMENT_CHUNK_BYTES = monkeypatch_chunk
+    assert payload in bytes(fake_socket.sent)
 
 
 def test_send_document_refuses_oversized_file(tmp_path):
@@ -92,30 +137,152 @@ def test_send_document_refuses_oversized_file(tmp_path):
         transport.send_document(chat_id=1, file_path=file_path, max_size_bytes=500)
 
 
-def test_send_document_redacts_token_on_network_failure(tmp_path):
+def test_send_document_redacts_token_on_connection_failure(tmp_path):
     file_path = str(tmp_path / "f.tar.gz")
     with open(file_path, "wb") as f:
         f.write(b"data")
-    def failing_post(url, data, timeout, content_type):
-        raise OSError(f"connection failed to {url}")
+    def failing_socket_factory():
+        raise OSError("connection failed to SECRETTOKEN123-flavored-host")
     transport = tt.DirectTransport(bot_token="SECRETTOKEN123")
     with pytest.raises(tt.TelegramTransportError) as exc_info:
-        transport.send_document(chat_id=1, file_path=file_path, http_post=failing_post)
+        transport.send_document(chat_id=1, file_path=file_path,
+                                   socket_factory=failing_socket_factory)
     assert "SECRETTOKEN123" not in str(exc_info.value)
 
 
-def test_socks5_transport_send_document_not_implemented():
-    proxy = tt.Socks5ProxyConfig(host="x", port=1080)
-    transport = tt.Socks5Transport(bot_token="t", proxy=proxy)
-    with pytest.raises(NotImplementedError, match="SOCKS5"):
-        transport.send_document(chat_id=1, file_path="/tmp/whatever")
+# ---------- Socks5Transport.send_document: real SOCKS5 handshake + real TLS ------------------
+
+def test_socks5_transport_send_document_real_protocol_round_trip(tmp_path):
+    """Drives the FULL real path: a real SOCKS5 CONNECT handshake against the existing fake
+    SOCKS5 server, then a real TLS handshake (self-signed test cert, verification disabled
+    exactly like test_web_server.py's TLS tests) carrying a real streamed multipart
+    sendDocument request -- not mocked at the protocol level."""
+    import ssl as ssl_mod
+    import subprocess
+
+    cert_path = str(tmp_path / "cert.pem")
+    key_path = str(tmp_path / "key.pem")
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", key_path,
+         "-out", cert_path, "-days", "1", "-nodes", "-subj", "/CN=test"],
+        check=True, capture_output=True)
+
+    file_path = str(tmp_path / "backup.tar.gz.gpg")
+    with open(file_path, "wb") as f:
+        f.write(b"encrypted backup bytes")
+
+    server = _FakeSocks5TlsServer(cert_path, key_path)
+    server.start()
+
+    def insecure_ctx():
+        ctx = ssl_mod.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl_mod.CERT_NONE
+        return ctx
+
+    proxy = tt.Socks5ProxyConfig(host="127.0.0.1", port=server.port)
+    transport = tt.Socks5Transport(bot_token="123:ABC", proxy=proxy,
+                                     ssl_context_factory=insecure_ctx)
+    result = transport.send_document(chat_id=99, file_path=file_path, caption="nightly backup")
+    server.join(timeout=5)
+
+    assert result == {"ok": True, "result": {"message_id": 7}}
+    assert server.last_target == ("api.telegram.org", 443)
+    assert b"encrypted backup bytes" in server.received_request
+    assert b'name="chat_id"' in server.received_request
+    assert b'name="caption"' in server.received_request
 
 
-def test_relay_client_transport_send_document_not_implemented():
+def test_socks5_transport_send_document_redacts_token_on_proxy_failure():
+    proxy = tt.Socks5ProxyConfig(host="127.0.0.1", port=1, timeout_seconds=1)
+    transport = tt.Socks5Transport(bot_token="SECRETTOKEN123", proxy=proxy)
+    with pytest.raises(tt.TelegramTransportError) as exc_info:
+        transport.send_document(chat_id=1, file_path="/nonexistent/doesnt-matter")
+    assert "SECRETTOKEN123" not in str(exc_info.value)
+
+
+# ---------- RelayClientTransport.send_document: real base64 envelope construction -------------
+
+def test_relay_send_document_builds_signed_base64_envelope(tmp_path):
+    file_path = str(tmp_path / "backup.tar.gz.gpg")
+    with open(file_path, "wb") as f:
+        f.write(b"encrypted backup bytes")
+
+    captured = {}
+    def fake_post(url, data, timeout):
+        captured["url"] = url
+        captured["data"] = data
+        import json as _json
+        envelope = _json.loads(data)
+        payload = envelope["payload"]
+        result_payload = {"ok": True, "result": {"message_id": 5}}
+        signed = tt.sign_relay_request("shared-secret", result_payload)
+        return _json.dumps(signed)
+
+    transport = tt.RelayClientTransport(bot_token="t", shared_secret="shared-secret",
+                                          relay_host="relay.example", relay_port=8765)
+    result = transport.send_document(chat_id=42, file_path=file_path, caption="backup",
+                                        http_post=fake_post)
+    assert result == {"message_id": 5}
+    assert captured["url"] == "https://relay.example:8765/submit-document"
+
+    import json as _json, base64
+    envelope = _json.loads(captured["data"])
+    verification = tt.verify_relay_request("shared-secret", envelope, set())
+    assert verification["valid"]
+    payload = verification["payload"]
+    assert payload["method"] == "sendDocument"
+    assert payload["params"]["chat_id"] == 42
+    assert payload["params"]["caption"] == "backup"
+    assert base64.b64decode(payload["file_b64"]) == b"encrypted backup bytes"
+
+
+def test_relay_send_document_never_includes_passphrase_or_secret(tmp_path):
+    """The envelope must carry ONLY the archive bytes -- never the bot token, the relay
+    shared secret, or anything else -- confirmed by scanning the full signed envelope."""
+    file_path = str(tmp_path / "backup.tar.gz.gpg")
+    with open(file_path, "wb") as f:
+        f.write(b"encrypted backup bytes")
+
+    captured = {}
+    def fake_post(url, data, timeout):
+        captured["data"] = data
+        signed = tt.sign_relay_request("shared-secret", {"ok": True, "result": {}})
+        import json as _json
+        return _json.dumps(signed)
+
+    transport = tt.RelayClientTransport(bot_token="SECRET-BOT-TOKEN",
+                                          shared_secret="shared-secret",
+                                          relay_host="relay.example", relay_port=8765)
+    transport.send_document(chat_id=1, file_path=file_path, http_post=fake_post)
+    assert b"SECRET-BOT-TOKEN" not in captured["data"]
+    assert b"shared-secret" not in captured["data"]
+
+
+def test_relay_send_document_refuses_oversized_file(tmp_path):
+    file_path = str(tmp_path / "huge.tar.gz.gpg")
+    with open(file_path, "wb") as f:
+        f.write(b"x" * 2000)
     transport = tt.RelayClientTransport(bot_token="t", shared_secret="s",
                                           relay_host="relay.example", relay_port=8765)
-    with pytest.raises(NotImplementedError, match="RELAY"):
-        transport.send_document(chat_id=1, file_path="/tmp/whatever")
+    with pytest.raises(tt.TelegramTransportError, match="exceeds max_size_bytes"):
+        transport.send_document(chat_id=1, file_path=file_path, max_size_bytes=1000)
+
+
+def test_relay_send_document_rejects_tampered_response(tmp_path):
+    file_path = str(tmp_path / "backup.tar.gz.gpg")
+    with open(file_path, "wb") as f:
+        f.write(b"data")
+
+    def fake_post(url, data, timeout):
+        tampered = tt.sign_relay_request("WRONG-secret", {"ok": True, "result": {}})
+        import json as _json
+        return _json.dumps(tampered)
+
+    transport = tt.RelayClientTransport(bot_token="t", shared_secret="shared-secret",
+                                          relay_host="relay.example", relay_port=8765)
+    with pytest.raises(tt.TelegramTransportError, match="failed verification"):
+        transport.send_document(chat_id=1, file_path=file_path, http_post=fake_post)
 
 
 # ---------- SOCKS5 transport: real handshake against a real local test server ----------------
@@ -237,6 +404,77 @@ def test_socks5_connect_ip_literal_target_uses_ipv4_address_type():
     sock.close()
     server.join(timeout=2)
     assert server.last_target == ("203.0.113.5", 443)
+
+
+class _FakeSocks5TlsServer(threading.Thread):
+    """Extends the real SOCKS5 handshake above with a real TLS server layered on top of
+    the tunneled connection (self-signed test cert) -- lets a test drive
+    Socks5Transport.send_document() through its ENTIRE real path (SOCKS5 CONNECT -> TLS
+    handshake -> streamed multipart HTTP request), not just the pre-TLS handshake bytes."""
+
+    def __init__(self, cert_path: str, key_path: str):
+        super().__init__(daemon=True)
+        self.cert_path = cert_path
+        self.key_path = key_path
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_sock.bind(("127.0.0.1", 0))
+        self.server_sock.listen(1)
+        self.port = self.server_sock.getsockname()[1]
+        self.last_target = None
+        self.received_request = b""
+
+    def run(self):
+        conn, _ = self.server_sock.accept()
+        try:
+            self._handle(conn)
+        finally:
+            self.server_sock.close()
+
+    def _handle(self, conn):
+        import ssl as ssl_mod
+
+        greeting = conn.recv(2)
+        nmethods = greeting[1]
+        conn.recv(nmethods) if nmethods else b""
+        conn.sendall(bytes([0x05, 0x00]))
+
+        request = conn.recv(4)
+        atyp = request[3]
+        if atyp == 0x03:
+            length = conn.recv(1)[0]
+            host = conn.recv(length).decode()
+        elif atyp == 0x01:
+            host = socket.inet_ntoa(conn.recv(4))
+        port = struct.unpack(">H", conn.recv(2))[0]
+        self.last_target = (host, port)
+        conn.sendall(bytes([0x05, 0x00, 0x00, 0x01]) + socket.inet_aton("127.0.0.1") +
+                     struct.pack(">H", 0))
+
+        ctx = ssl_mod.SSLContext(ssl_mod.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=self.cert_path, keyfile=self.key_path)
+        tls_conn = ctx.wrap_socket(conn, server_side=True)
+        try:
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                buf += tls_conn.recv(65536)
+            header_end = buf.index(b"\r\n\r\n") + 4
+            headers = buf[:header_end].decode("utf-8", "replace")
+            content_length = 0
+            for line in headers.split("\r\n"):
+                if line.lower().startswith("content-length:"):
+                    content_length = int(line.split(":", 1)[1].strip())
+            body = buf[header_end:]
+            while len(body) < content_length:
+                body += tls_conn.recv(65536)
+            self.received_request = buf[:header_end] + body
+
+            response = (b'{"ok": true, "result": {"message_id": 7}}')
+            tls_conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(response)).encode() +
+                b"\r\n\r\n" + response)
+        finally:
+            tls_conn.close()
 
 
 def test_socks5_transport_test_connectivity_reports_failure_cleanly():

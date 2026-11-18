@@ -12,6 +12,14 @@ Telegram Bot API call directly, signs the result with the SAME shared secret, an
 synchronously in the HTTP response -- no second poll-for-result round trip needed, and the
 relay worker never initiates a connection back to the Iran host.
 
+A SEPARATE endpoint, `/submit-document`, handles encrypted backup-archive delivery: the
+envelope's payload carries a base64-encoded file (never a plaintext passphrase or any other
+secret) plus sendDocument params; this worker decodes it to a temporary file, calls the real
+Telegram sendDocument API, and deletes the temp file immediately after. `/submit-document`
+has its OWN, larger request-body cap (see MAX_DOCUMENT_REQUEST_BODY_BYTES) -- kept entirely
+separate from `/submit`'s small-envelope cap so raising one can never accidentally weaken
+the other.
+
 SECRETS: the relay worker's own bot_token/shared_secret live in its own config_dir on its
 own machine (see telegram_config.RelayWorkerSecrets) -- it never shares a filesystem or any
 other secret with the Iran-side host.
@@ -51,13 +59,15 @@ class RelayWorkerApp:
     """Pure, socket-free core. One instance per running worker process."""
 
     def __init__(self, bot_token: str, shared_secret: str, nonce_db_path: str,
-                 max_envelope_age_seconds: float = 300, telegram_call=None):
+                 max_envelope_age_seconds: float = 300, telegram_call=None,
+                 telegram_send_document=None):
         self.bot_token = bot_token
         self.shared_secret = shared_secret
         self.nonce_db_path = nonce_db_path
         self.max_envelope_age_seconds = max_envelope_age_seconds
-        # Injectable for tests -- defaults to a real DirectTransport call against Telegram.
+        # Both injectable for tests -- default to real DirectTransport calls against Telegram.
         self._telegram_call = telegram_call
+        self._telegram_send_document = telegram_send_document
 
     def _call_telegram(self, method: str, params: dict) -> dict:
         if self._telegram_call is not None:
@@ -65,16 +75,21 @@ class RelayWorkerApp:
         import telegram_transport as tt
         return tt.DirectTransport(bot_token=self.bot_token).call(method, params)
 
-    def handle_request(self, method: str, path: str, body: bytes) -> tuple[int, bytes]:
+    def _send_telegram_document(self, chat_id, file_path: str, caption: str = None) -> dict:
+        if self._telegram_send_document is not None:
+            return self._telegram_send_document(chat_id, file_path, caption)
         import telegram_transport as tt
+        return tt.DirectTransport(bot_token=self.bot_token).send_document(
+            chat_id, file_path, caption=caption)
 
-        if method != "POST" or path != "/submit":
-            return 404, b'{"error":"not found"}'
-
+    def _verify_envelope(self, body: bytes):
+        """Shared by both endpoints: parses + verifies a signed envelope. Returns
+        (error_response_or_None, payload_or_None)."""
+        import telegram_transport as tt
         try:
             envelope = json.loads(body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            return 400, b'{"error":"malformed JSON body"}'
+            return (400, b'{"error":"malformed JSON body"}'), None
 
         conn = open_seen_nonces_db(self.nonce_db_path)
         try:
@@ -82,12 +97,25 @@ class RelayWorkerApp:
             verification = tt.verify_relay_request(
                 self.shared_secret, envelope, seen, max_age_seconds=self.max_envelope_age_seconds)
             if not verification["valid"]:
-                return 403, json.dumps({"error": verification["reason"]}).encode("utf-8")
+                return (403, json.dumps({"error": verification["reason"]}).encode("utf-8")), None
             _record_nonce(conn, envelope["nonce"])
         finally:
             conn.close()
+        return None, verification["payload"]
 
-        payload = verification["payload"]
+    def handle_request(self, method: str, path: str, body: bytes) -> tuple[int, bytes]:
+        import telegram_transport as tt
+
+        if method != "POST" or path not in ("/submit", "/submit-document"):
+            return 404, b'{"error":"not found"}'
+
+        error, payload = self._verify_envelope(body)
+        if error is not None:
+            return error
+
+        if path == "/submit-document":
+            return self._handle_document(payload)
+
         tg_method = payload.get("method")
         tg_params = payload.get("params") or {}
         if not tg_method:
@@ -102,8 +130,50 @@ class RelayWorkerApp:
         signed_result = tt.sign_relay_request(self.shared_secret, result_payload)
         return 200, json.dumps(signed_result).encode("utf-8")
 
+    def _handle_document(self, payload: dict) -> tuple[int, bytes]:
+        import base64
+        import tempfile
+        import telegram_transport as tt
 
-MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024  # envelopes are small signed JSON, never this large
+        file_b64 = payload.get("file_b64")
+        params = payload.get("params") or {}
+        if not file_b64:
+            result_payload = {"ok": False, "error": "payload missing file_b64"}
+        else:
+            try:
+                file_bytes = base64.b64decode(file_b64, validate=True)
+            except Exception as e:
+                result_payload = {"ok": False, "error": f"invalid base64 in payload: {e}"}
+            else:
+                if len(file_bytes) > MAX_DOCUMENT_PLAINTEXT_BYTES:
+                    result_payload = {
+                        "ok": False,
+                        "error": f"decoded document is {len(file_bytes)} bytes, exceeds "
+                                 f"MAX_DOCUMENT_PLAINTEXT_BYTES={MAX_DOCUMENT_PLAINTEXT_BYTES}"}
+                else:
+                    suffix = "-" + os.path.basename(params.get("filename") or "relay-document")
+                    tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+                    try:
+                        with os.fdopen(tmp_fd, "wb") as f:
+                            f.write(file_bytes)
+                        tg_result = self._send_telegram_document(
+                            params.get("chat_id"), tmp_path, caption=params.get("caption"))
+                        result_payload = {"ok": True, "result": tg_result}
+                    except tt.TelegramTransportError as e:
+                        result_payload = {"ok": False, "error": str(e)}
+                    finally:
+                        os.remove(tmp_path)
+
+        signed_result = tt.sign_relay_request(self.shared_secret, result_payload)
+        return 200, json.dumps(signed_result).encode("utf-8")
+
+
+MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024  # /submit envelopes are small signed JSON, never this large
+# /submit-document only: base64 of up to MAX_DOCUMENT_PLAINTEXT_BYTES plaintext (~33%
+# overhead) plus JSON/signature overhead. Kept entirely separate from MAX_REQUEST_BODY_BYTES
+# above so raising this one can never accidentally weaken the small-envelope cap.
+MAX_DOCUMENT_PLAINTEXT_BYTES = 15 * 1024 * 1024
+MAX_DOCUMENT_REQUEST_BODY_BYTES = 22 * 1024 * 1024
 
 
 def _build_handler_class(app: RelayWorkerApp):
@@ -111,7 +181,9 @@ def _build_handler_class(app: RelayWorkerApp):
         def _dispatch(self, method):
             try:
                 length = int(self.headers.get("Content-Length", 0))
-                if length > MAX_REQUEST_BODY_BYTES:
+                cap = (MAX_DOCUMENT_REQUEST_BODY_BYTES if self.path == "/submit-document"
+                       else MAX_REQUEST_BODY_BYTES)
+                if length > cap:
                     self.send_response(413)
                     self.send_header("Content-Length", "0")
                     self.end_headers()

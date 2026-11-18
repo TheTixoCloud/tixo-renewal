@@ -38,6 +38,10 @@ from typing import Callable, Optional
 TELEGRAM_API_HOST = "api.telegram.org"
 DEFAULT_TIMEOUT_SECONDS = 15
 DEFAULT_SOCKS5_TIMEOUT_SECONDS = 10
+# Deliberately lower than Telegram's own 50MB bot-upload limit -- RELAY mode base64-encodes
+# the file through a signed JSON envelope (~33% overhead), and relay_worker.py enforces its
+# own matching cap on the resulting HTTP request body size.
+RELAY_DOCUMENT_MAX_PLAINTEXT_BYTES = 15 * 1024 * 1024
 
 
 class TelegramTransportError(Exception):
@@ -55,13 +59,20 @@ def _redact_token(text: str, token: str) -> str:
     return text
 
 
-def _encode_multipart(fields: dict, file_field: str, filename: str, file_bytes: bytes) -> tuple:
-    """Builds a multipart/form-data body by hand (stdlib has no multipart encoder) --
-    deliberately simple and auditable, same philosophy as the from-scratch SOCKS5 handshake
-    below. Returns (content_type_header_value, body_bytes)."""
+DEFAULT_DOCUMENT_CHUNK_BYTES = 64 * 1024
+
+
+def _multipart_preamble_and_epilogue(fields: dict, file_field: str, filename: str) -> tuple:
+    """Builds the TEXT parts of a multipart/form-data body by hand (stdlib has no multipart
+    encoder) -- deliberately simple and auditable, same philosophy as the from-scratch
+    SOCKS5 handshake below. Returns (content_type_header_value, preamble_bytes,
+    epilogue_bytes); the caller streams the file's own bytes between them, so the whole
+    file is never held in memory at once."""
     boundary = "----tixo-" + os.urandom(16).hex()
     parts = []
     for name, value in fields.items():
+        if value is None:
+            continue
         parts.append(
             f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n"
             f"{value}\r\n".encode("utf-8"))
@@ -69,9 +80,57 @@ def _encode_multipart(fields: dict, file_field: str, filename: str, file_bytes: 
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; "
         f"filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
         .encode("utf-8"))
-    parts.append(file_bytes)
-    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
-    return f"multipart/form-data; boundary={boundary}", b"".join(parts)
+    preamble = b"".join(parts)
+    epilogue = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    return f"multipart/form-data; boundary={boundary}", preamble, epilogue
+
+
+def _stream_send_document_over_socket(sock, host: str, bot_token: str, chat_id, file_path: str,
+                                        caption: str, max_size_bytes: int,
+                                        chunk_size: int = DEFAULT_DOCUMENT_CHUNK_BYTES) -> dict:
+    """Streams a real sendDocument multipart/form-data request directly onto an
+    already-connected (and, for a real deployment, already TLS-wrapped) socket -- reads the
+    file from disk in bounded chunks rather than loading it into memory at once. Shared by
+    DirectTransport and Socks5Transport so both connectivity modes behave IDENTICALLY once
+    a socket is established; only how that socket got connected (straight to Telegram, or
+    through a SOCKS5 CONNECT tunnel first) differs between them."""
+    size = os.path.getsize(file_path)
+    if size > max_size_bytes:
+        raise TelegramTransportError(
+            f"file is {size} bytes, exceeds max_size_bytes={max_size_bytes} -- refusing "
+            f"to attempt upload rather than silently truncating it")
+
+    fields = {"chat_id": str(chat_id), "caption": caption}
+    content_type, preamble, epilogue = _multipart_preamble_and_epilogue(
+        fields, "document", os.path.basename(file_path))
+    content_length = len(preamble) + size + len(epilogue)
+
+    request_line = (
+        f"POST /bot{bot_token}/sendDocument HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"Content-Length: {content_length}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("utf-8")
+
+    sock.sendall(request_line)
+    sock.sendall(preamble)
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            sock.sendall(chunk)
+    sock.sendall(epilogue)
+
+    chunks = []
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    response = b"".join(chunks)
+    return _parse_raw_http_json_response(response, bot_token)
 
 
 # ---------- Direct transport -------------------------------------------------------------------
@@ -83,40 +142,34 @@ class DirectTransport:
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
 
     def send_document(self, chat_id, file_path: str, caption: str = None,
-                       max_size_bytes: int = 50 * 1024 * 1024, http_post=None) -> dict:
-        """Uploads a file via Telegram's sendDocument (multipart/form-data) -- used for
-        backup archive delivery. Refuses (raises, never silently truncates or skips the
-        size check) anything over `max_size_bytes` (Telegram's own real limit for bot
-        uploads is 50MB) BEFORE reading the whole file into memory."""
-        size = os.path.getsize(file_path)
-        if size > max_size_bytes:
-            raise TelegramTransportError(
-                f"file is {size} bytes, exceeds max_size_bytes={max_size_bytes} -- refusing "
-                f"to attempt upload rather than silently truncating it")
-        with open(file_path, "rb") as f:
-            file_bytes = f.read()
-
-        fields = {"chat_id": str(chat_id)}
-        if caption:
-            fields["caption"] = caption
-        content_type, body = _encode_multipart(fields, "document",
-                                                 os.path.basename(file_path), file_bytes)
-
-        url = f"https://{TELEGRAM_API_HOST}/bot{self.bot_token}/sendDocument"
-        if http_post is None:
-            def http_post(url, data, timeout, content_type):
-                req = urllib.request.Request(url, data=data, method="POST",
-                                               headers={"Content-Type": content_type})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    return resp.read().decode()
+                       max_size_bytes: int = 50 * 1024 * 1024, socket_factory=None) -> dict:
+        """Uploads a file via a real, streamed sendDocument request (multipart/form-data,
+        hand-built, never loading the whole file into memory) -- used for backup archive
+        delivery. Refuses (raises, never silently truncates or skips the size check)
+        anything over `max_size_bytes` (Telegram's own real limit for bot uploads is 50MB)
+        BEFORE opening the file. `socket_factory` is injectable for tests (same DI
+        convention as Socks5Transport's `connect_fn`) -- real usage always connects a
+        genuine TLS socket straight to Telegram."""
+        if socket_factory is None:
+            def socket_factory():
+                raw = socket.create_connection((TELEGRAM_API_HOST, 443),
+                                                 timeout=self.timeout_seconds)
+                ctx = ssl.create_default_context()
+                return ctx.wrap_socket(raw, server_hostname=TELEGRAM_API_HOST)
         try:
-            raw = http_post(url, body, self.timeout_seconds, content_type)
+            sock = socket_factory()
         except Exception as e:
             raise TelegramTransportError(_redact_token(str(e), self.bot_token)) from None
         try:
-            return json.loads(raw)
-        except (ValueError, TypeError):
-            raise TelegramTransportError("Telegram API response was not valid JSON") from None
+            return _stream_send_document_over_socket(
+                sock, TELEGRAM_API_HOST, self.bot_token, chat_id, file_path, caption,
+                max_size_bytes)
+        except TelegramTransportError:
+            raise
+        except Exception as e:
+            raise TelegramTransportError(_redact_token(str(e), self.bot_token)) from None
+        finally:
+            sock.close()
 
     def call(self, method: str, params: dict = None, http_post=None) -> dict:
         """Calls https://api.telegram.org/bot<TOKEN>/<method>. `http_post` is injectable
@@ -247,6 +300,10 @@ class Socks5Transport:
     bot_token: str
     proxy: Socks5ProxyConfig
     connect_fn: Callable = field(default=socks5_connect)
+    # Injectable so tests can point TLS verification at a local self-signed test server
+    # (same pattern web_server.py's tests already use) -- real usage always defaults to a
+    # genuine, fully-verifying default context.
+    ssl_context_factory: Callable = field(default=ssl.create_default_context)
 
     def call(self, method: str, params: dict = None) -> dict:
         body = json.dumps(params or {}).encode("utf-8")
@@ -259,7 +316,7 @@ class Socks5Transport:
         except Exception as e:
             raise TelegramTransportError(_redact_token(str(e), self.bot_token)) from None
         try:
-            ctx = ssl.create_default_context()
+            ctx = self.ssl_context_factory()
             tls_sock = ctx.wrap_socket(raw_sock, server_hostname=TELEGRAM_API_HOST)
             try:
                 request_line = (
@@ -296,15 +353,31 @@ class Socks5Transport:
 
     def send_document(self, chat_id, file_path: str, caption: str = None,
                        max_size_bytes: int = 50 * 1024 * 1024) -> dict:
-        """HONEST LIMITATION: multipart file upload over a from-scratch SOCKS5-tunneled raw
-        HTTP/1.1 request (see `call()` above) is not implemented -- building a correct,
-        auditable multipart body over that raw socket path was judged not worth the added
-        risk surface for this feature. Raises rather than silently falling back to an
-        insecure/wrong behavior; callers (e.g. backup.py's Telegram delivery) must check the
-        connectivity mode and report this as unsupported for SOCKS5."""
-        raise NotImplementedError(
-            "sending a document is not supported over SOCKS5 mode -- use DIRECT mode for "
-            "backup delivery, or deliver the backup archive manually")
+        """Uploads a file via a real sendDocument request, tunneled through the configured
+        SOCKS5 proxy -- the same CONNECT handshake `call()` uses, with the multipart body
+        streamed over the resulting TLS-wrapped socket (see
+        `_stream_send_document_over_socket`) rather than built in memory first."""
+        try:
+            raw_sock = self.connect_fn(
+                self.proxy.host, self.proxy.port, TELEGRAM_API_HOST, 443,
+                username=self.proxy.username, password=self.proxy.password,
+                timeout=self.proxy.timeout_seconds,
+            )
+        except Exception as e:
+            raise TelegramTransportError(_redact_token(str(e), self.bot_token)) from None
+        try:
+            ctx = self.ssl_context_factory()
+            tls_sock = ctx.wrap_socket(raw_sock, server_hostname=TELEGRAM_API_HOST)
+            try:
+                return _stream_send_document_over_socket(
+                    tls_sock, TELEGRAM_API_HOST, self.bot_token, chat_id, file_path, caption,
+                    max_size_bytes)
+            finally:
+                tls_sock.close()
+        except TelegramTransportError:
+            raise
+        except Exception as e:
+            raise TelegramTransportError(_redact_token(str(e), self.bot_token)) from None
 
 
 def _parse_raw_http_json_response(response: bytes, bot_token: str) -> dict:
@@ -444,11 +517,60 @@ class RelayClientTransport:
             return {"ok": False, "detail": str(e)}
 
     def send_document(self, chat_id, file_path: str, caption: str = None,
-                       max_size_bytes: int = 50 * 1024 * 1024) -> dict:
-        """HONEST LIMITATION: the relay protocol's envelope carries a JSON payload that gets
-        HMAC-signed as a canonical JSON string -- it is not designed to carry an arbitrary
-        binary file, and extending it to do so (e.g. base64-embedding the file in the signed
-        payload) was judged out of scope here. Raises rather than silently mis-delivering."""
-        raise NotImplementedError(
-            "sending a document is not supported over RELAY mode -- use DIRECT mode for "
-            "backup delivery, or deliver the backup archive manually")
+                       max_size_bytes: int = RELAY_DOCUMENT_MAX_PLAINTEXT_BYTES,
+                       http_post=None) -> dict:
+        """Uploads a file through the relay worker's dedicated `/submit-document` endpoint:
+        base64-encodes the file into a signed envelope (HMAC-authenticated, replay-
+        protected, exactly like `call()`) and asks the relay worker to execute the real
+        sendDocument call on its own side. `max_size_bytes` defaults to a cap LOWER than
+        Telegram's own 50MB bot-upload limit, since base64 adds ~33% size overhead through
+        the signed JSON envelope -- see relay_worker.py's matching, independently-enforced
+        request-body cap for this endpoint. Never sends the backup's encryption passphrase
+        (or any other secret) -- only the already-encrypted archive's bytes."""
+        import base64
+
+        size = os.path.getsize(file_path)
+        if size > max_size_bytes:
+            raise TelegramTransportError(
+                f"file is {size} bytes, exceeds max_size_bytes={max_size_bytes} for RELAY "
+                f"document delivery (lower than Telegram's own 50MB limit -- base64 "
+                f"encoding through the signed relay envelope adds ~33% overhead) -- refusing")
+        with open(file_path, "rb") as f:
+            file_b64 = base64.b64encode(f.read()).decode("ascii")
+
+        payload = {
+            "method": "sendDocument",
+            "params": {"chat_id": chat_id, "caption": caption,
+                       "filename": os.path.basename(file_path)},
+            "file_b64": file_b64,
+        }
+        envelope = sign_relay_request(self.shared_secret, payload)
+        body = json.dumps(envelope).encode("utf-8")
+        scheme = "https" if self.use_tls else "http"
+        url = f"{scheme}://{self.relay_host}:{self.relay_port}/submit-document"
+
+        if http_post is None:
+            def http_post(url, data, timeout):
+                req = urllib.request.Request(url, data=data, method="POST",
+                                               headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    return resp.read().decode()
+        try:
+            raw = http_post(url, body, self.timeout_seconds)
+        except Exception as e:
+            raise TelegramTransportError(_redact_token(str(e), self.bot_token)) from None
+
+        try:
+            signed_result = json.loads(raw)
+        except (ValueError, TypeError):
+            raise TelegramTransportError("relay worker response was not valid JSON") from None
+
+        verification = verify_relay_request(self.shared_secret, signed_result, set())
+        if not verification["valid"]:
+            raise TelegramTransportError(
+                f"relay worker response failed verification: {verification['reason']}")
+        result_payload = verification["payload"]
+        if not result_payload.get("ok"):
+            raise TelegramTransportError(
+                f"relay worker reported a document-delivery failure: {result_payload.get('error')}")
+        return result_payload["result"]

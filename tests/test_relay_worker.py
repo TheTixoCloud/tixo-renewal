@@ -269,3 +269,178 @@ def test_real_server_rejects_oversized_request_body(tmp_path):
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+# ---------- /submit-document (real document relay delivery) ------------------------------------
+
+def test_submit_document_decodes_and_delivers(tmp_path):
+    import base64
+
+    delivered = {}
+    def fake_send_document(chat_id, file_path, caption=None):
+        with open(file_path, "rb") as f:
+            delivered["bytes"] = f.read()
+        delivered["chat_id"] = chat_id
+        delivered["caption"] = caption
+        delivered["file_path_existed_during_call"] = True
+        return {"ok": True, "result": {"message_id": 9}}
+
+    app = rw.RelayWorkerApp(BOT_TOKEN, SHARED_SECRET, str(tmp_path / "nonces.sqlite3"),
+                             telegram_send_document=fake_send_document)
+    file_b64 = base64.b64encode(b"encrypted backup bytes").decode("ascii")
+    payload = {"method": "sendDocument",
+               "params": {"chat_id": 42, "caption": "nightly", "filename": "backup.tar.gz.gpg"},
+               "file_b64": file_b64}
+    envelope = tt.sign_relay_request(SHARED_SECRET, payload)
+    status, body = app.handle_request("POST", "/submit-document", json.dumps(envelope).encode())
+
+    assert status == 200
+    signed_result = json.loads(body)
+    verification = tt.verify_relay_request(SHARED_SECRET, signed_result, set())
+    assert verification["valid"]
+    assert verification["payload"]["ok"] is True
+    assert delivered["bytes"] == b"encrypted backup bytes"
+    assert delivered["chat_id"] == 42
+    assert delivered["caption"] == "nightly"
+
+
+def test_submit_document_removes_temp_file_after_delivery(tmp_path):
+    captured_path = {}
+    def fake_send_document(chat_id, file_path, caption=None):
+        captured_path["path"] = file_path
+        assert os.path.exists(file_path)
+        return {"ok": True}
+
+    app = rw.RelayWorkerApp(BOT_TOKEN, SHARED_SECRET, str(tmp_path / "nonces.sqlite3"),
+                             telegram_send_document=fake_send_document)
+    import base64
+    payload = {"method": "sendDocument", "params": {"chat_id": 1},
+               "file_b64": base64.b64encode(b"data").decode()}
+    envelope = tt.sign_relay_request(SHARED_SECRET, payload)
+    app.handle_request("POST", "/submit-document", json.dumps(envelope).encode())
+    assert not os.path.exists(captured_path["path"])
+
+
+def test_submit_document_rejects_invalid_base64(tmp_path):
+    app = rw.RelayWorkerApp(BOT_TOKEN, SHARED_SECRET, str(tmp_path / "nonces.sqlite3"))
+    payload = {"method": "sendDocument", "params": {"chat_id": 1}, "file_b64": "not-valid-b64!!"}
+    envelope = tt.sign_relay_request(SHARED_SECRET, payload)
+    status, body = app.handle_request("POST", "/submit-document", json.dumps(envelope).encode())
+    assert status == 200
+    signed_result = json.loads(body)
+    verification = tt.verify_relay_request(SHARED_SECRET, signed_result, set())
+    assert verification["payload"]["ok"] is False
+
+
+def test_submit_document_rejects_decoded_size_over_server_side_cap(tmp_path):
+    import base64
+    app = rw.RelayWorkerApp(BOT_TOKEN, SHARED_SECRET, str(tmp_path / "nonces.sqlite3"))
+    big = base64.b64encode(b"x" * (rw.MAX_DOCUMENT_PLAINTEXT_BYTES + 1)).decode()
+    payload = {"method": "sendDocument", "params": {"chat_id": 1}, "file_b64": big}
+    envelope = tt.sign_relay_request(SHARED_SECRET, payload)
+    status, body = app.handle_request("POST", "/submit-document", json.dumps(envelope).encode())
+    assert status == 200
+    signed_result = json.loads(body)
+    verification = tt.verify_relay_request(SHARED_SECRET, signed_result, set())
+    assert verification["payload"]["ok"] is False
+    assert "exceeds" in verification["payload"]["error"]
+
+
+def test_submit_document_bad_signature_rejected(tmp_path):
+    app = rw.RelayWorkerApp(BOT_TOKEN, SHARED_SECRET, str(tmp_path / "nonces.sqlite3"))
+    payload = {"method": "sendDocument", "params": {"chat_id": 1}, "file_b64": "AAAA"}
+    envelope = tt.sign_relay_request("WRONG-secret", payload)
+    status, _ = app.handle_request("POST", "/submit-document", json.dumps(envelope).encode())
+    assert status == 403
+
+
+def test_submit_document_replay_rejected(tmp_path):
+    app = rw.RelayWorkerApp(BOT_TOKEN, SHARED_SECRET, str(tmp_path / "nonces.sqlite3"),
+                             telegram_send_document=lambda *a, **k: {"ok": True})
+    import base64
+    payload = {"method": "sendDocument", "params": {"chat_id": 1},
+               "file_b64": base64.b64encode(b"data").decode()}
+    envelope = tt.sign_relay_request(SHARED_SECRET, payload)
+    body = json.dumps(envelope).encode()
+    status1, _ = app.handle_request("POST", "/submit-document", body)
+    assert status1 == 200
+    status2, resp2 = app.handle_request("POST", "/submit-document", body)
+    assert status2 == 403
+    assert "replay" in json.loads(resp2)["error"]
+
+
+def test_submit_document_telegram_failure_surfaces_as_signed_failure(tmp_path):
+    def failing_send(chat_id, file_path, caption=None):
+        raise tt.TelegramTransportError("simulated upload failure")
+
+    app = rw.RelayWorkerApp(BOT_TOKEN, SHARED_SECRET, str(tmp_path / "nonces.sqlite3"),
+                             telegram_send_document=failing_send)
+    import base64
+    payload = {"method": "sendDocument", "params": {"chat_id": 1},
+               "file_b64": base64.b64encode(b"data").decode()}
+    envelope = tt.sign_relay_request(SHARED_SECRET, payload)
+    status, body = app.handle_request("POST", "/submit-document", json.dumps(envelope).encode())
+    assert status == 200
+    signed_result = json.loads(body)
+    verification = tt.verify_relay_request(SHARED_SECRET, signed_result, set())
+    assert verification["payload"]["ok"] is False
+    assert "simulated upload failure" in verification["payload"]["error"]
+
+
+def test_real_server_rejects_oversized_document_request_body(tmp_path):
+    import http.client
+
+    nonce_db = str(tmp_path / "nonces.sqlite3")
+    server, thread = rw.run_server_in_thread(BOT_TOKEN, SHARED_SECRET, nonce_db,
+                                               "127.0.0.1", 0)
+    try:
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        oversized_body = "x" * (rw.MAX_DOCUMENT_REQUEST_BODY_BYTES + 1)
+        conn.putrequest("POST", "/submit-document")
+        conn.putheader("Content-Length", str(len(oversized_body)))
+        conn.endheaders()
+        conn.send(oversized_body[:1024].encode())
+        resp = conn.getresponse()
+        assert resp.status == 413
+        conn.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_real_server_end_to_end_document_delivery_over_real_socket(tmp_path, monkeypatch):
+    """Simulated second host (mission's explicit allowance) -- a real HTTP server, a real
+    socket, a real RelayClientTransport.send_document() call, with only the ultimate
+    Telegram API call itself monkeypatched (no real Telegram server reachable here)."""
+    import base64
+
+    def fake_telegram_send_document(chat_id, file_path, caption=None):
+        with open(file_path, "rb") as f:
+            content = f.read()
+        return {"ok": True, "result": {"message_id": 11, "echoed_len": len(content)}}
+
+    nonce_db = str(tmp_path / "nonces.sqlite3")
+    server, thread = rw.run_server_in_thread(BOT_TOKEN, SHARED_SECRET, nonce_db,
+                                               "127.0.0.1", 0)
+    try:
+        import telegram_transport as tt_mod
+        monkeypatch.setattr(tt_mod.DirectTransport, "send_document",
+                             lambda self, chat_id, file_path, caption=None, **kw:
+                                 fake_telegram_send_document(chat_id, file_path, caption))
+
+        file_path = str(tmp_path / "backup.tar.gz.gpg")
+        with open(file_path, "wb") as f:
+            f.write(b"encrypted backup content")
+
+        actual_port = server.server_address[1]
+        client = tt.RelayClientTransport(bot_token=BOT_TOKEN, shared_secret=SHARED_SECRET,
+                                           relay_host="127.0.0.1", relay_port=actual_port,
+                                           use_tls=False)
+        result = client.send_document(chat_id=55, file_path=file_path, caption="test")
+        assert result == {"ok": True,
+                           "result": {"message_id": 11,
+                                      "echoed_len": len(b"encrypted backup content")}}
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
