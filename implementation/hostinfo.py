@@ -284,6 +284,23 @@ def _read_interface_counter(iface_dir: Path, stat_name: str):
         return UNAVAILABLE
 
 
+def _is_uninformative(state, ipv4, rx_bytes, tx_bytes, is_virtual: bool) -> bool:
+    """True if this interface has nothing useful to show the default view -- not virtual,
+    down or state-unreadable, no IPv4, and no real traffic counters. "down" is a real,
+    readable operstate value (NOT the same as UNAVAILABLE, i.e. state-unreadable) -- an
+    unused physical NIC bay reports state="down" with zero counters and no IP, and v1.9.0
+    production validation on ir1 found that case was NOT being hidden (it only matched
+    state == UNAVAILABLE, never "down"), so six genuinely-unused ports were cluttering the
+    CLI's "Main" default interface view alongside the one NIC actually carrying traffic."""
+    if is_virtual:
+        return False
+    if state not in (UNAVAILABLE, "down"):
+        return False
+    if ipv4:
+        return False
+    return rx_bytes in (UNAVAILABLE, 0) and tx_bytes in (UNAVAILABLE, 0)
+
+
 def get_network_interfaces() -> list[dict]:
     """Enumerates interfaces via /sys/class/net (always present on Linux) and resolves each
     interface's IPv4 address via a local ioctl -- no subprocess, no `ip`/`ifconfig` dependency.
@@ -313,8 +330,7 @@ def get_network_interfaces() -> list[dict]:
         rx_bytes = _read_interface_counter(iface_dir, "rx_bytes")
         tx_bytes = _read_interface_counter(iface_dir, "tx_bytes")
         is_virtual = is_virtual_interface(name)
-        is_uninformative = (not is_virtual and state == UNAVAILABLE and
-                            (not ipv4) and rx_bytes == UNAVAILABLE)
+        is_uninformative = _is_uninformative(state, ipv4, rx_bytes, tx_bytes, is_virtual)
         interfaces.append({"name": name, "state": state,
                             "ipv4": ipv4 if ipv4 else UNAVAILABLE, "ipv6": UNSUPPORTED,
                             "is_virtual": is_virtual, "is_uninformative": is_uninformative,

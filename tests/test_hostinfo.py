@@ -178,3 +178,37 @@ def test_uninformative_flag_true_only_when_truly_uninformative_and_not_virtual()
     assert classify("eth9", hostinfo.UNAVAILABLE, None, hostinfo.UNAVAILABLE) is True
     assert classify("viifv1", hostinfo.UNAVAILABLE, None, hostinfo.UNAVAILABLE) is False
     assert classify("eth0", "up", "10.0.0.1", 12345) is False
+
+
+# ---------- v1.9.1: _is_uninformative() -- real production bug found during v1.9.0 upgrade ----
+
+def test_is_uninformative_true_for_down_unused_physical_port():
+    """Regression test: ir1 production validation found 4 unused physical NIC bays
+    (eno1-4, all state='down', zero counters, no IP) were NOT being classified as
+    uninformative, because the old check only matched state == UNAVAILABLE (state
+    unreadable), never the real, readable value "down"."""
+    assert hostinfo._is_uninformative("down", None, 0, 0, False) is True
+
+
+def test_is_uninformative_false_for_up_interface_with_real_traffic():
+    assert hostinfo._is_uninformative("up", None, 248963369375193,
+                                       253692770900704, False) is False
+
+
+def test_is_uninformative_false_for_down_interface_that_still_has_an_ip():
+    # A down interface with a statically-assigned IP is still worth showing.
+    assert hostinfo._is_uninformative("down", "10.0.0.5", 0, 0, False) is False
+
+
+def test_is_uninformative_false_for_down_interface_with_nonzero_counters():
+    # Historical traffic (even if currently down) is still informative.
+    assert hostinfo._is_uninformative("down", None, 500, 0, False) is False
+
+
+def test_is_uninformative_false_for_virtual_interface_regardless_of_state():
+    # Virtual interfaces are handled by is_virtual, never by is_uninformative.
+    assert hostinfo._is_uninformative("down", None, 0, 0, True) is False
+
+
+def test_is_uninformative_true_for_truly_unreadable_state():
+    assert hostinfo._is_uninformative(hostinfo.UNAVAILABLE, None, 0, 0, False) is True
