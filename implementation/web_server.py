@@ -757,6 +757,8 @@ this persistent total (that would double-count across counter resets/reboots).</
 
     def _page_vps_detail(self, user, vpsid_raw, lang, theme) -> WebResponse:
         import control_center_api as api
+        import traffic_format as tf
+        from decimal import Decimal
         try:
             vpsid = int(vpsid_raw)
         except ValueError:
@@ -764,11 +766,44 @@ this persistent total (that would double-count across counter resets/reboots).</
         overview = api.get_vps_inventory_overview(self.state_dir)
         record = next((r for r in overview["records"] if r["vpsid"] == vpsid), None)
         if record is None:
-            body = '<div class="card">No such VPS in the current inventory snapshot.</div>'
+            body = '<div class="empty-state">No such VPS in the current inventory snapshot.</div>'
         else:
-            rows = "".join(f"<tr><td>{_html_escape(k)}</td><td>{_html_escape(v)}</td></tr>"
-                            for k, v in record.items())
-            body = f'<div class="card"><table>{rows}</table></div>'
+            status = record.get("runtime_status") or "unknown"
+            status_badge = {"running": "badge-ok", "stopped": "badge-off", "suspended": "badge-bad"}
+            quota, used = record.get("quota_gb"), record.get("used_gb")
+            try:
+                unlimited = Decimal(str(quota)) <= 0
+            except Exception:
+                unlimited = False
+            try:
+                used_str = f"{Decimal(str(used)):.2f} GB"
+            except Exception:
+                used_str = "unavailable"
+            if unlimited:
+                limit_str, pct_block = "unlimited", '<span class="muted">n/a</span>'
+            else:
+                try:
+                    limit_str = f"{Decimal(str(quota)):.2f} GB"
+                    pct = float(Decimal(str(used)) / Decimal(str(quota)) * 100)
+                    gclass = "g-bad" if pct >= 90 else "g-warn" if pct >= 75 else "g-ok"
+                    pct_block = (f'<div class="gauge-label"><span>{pct:.1f}%</span></div>'
+                                 f'<div class="gauge {gclass}"><span style="width:{min(pct,100):.1f}%"></span></div>')
+                except Exception:
+                    limit_str, pct_block = "unavailable", '<span class="muted">unavailable</span>'
+            kpis = f"""
+<div class="kpi"><div class="kpi-label">Status</div><div class="kpi-value">
+<span class="badge {status_badge.get(status, 'badge-off')}">{_html_escape(status)}</span></div></div>
+<div class="kpi"><div class="kpi-label">Used</div><div class="kpi-value">{used_str}</div></div>
+<div class="kpi"><div class="kpi-label">Limit</div><div class="kpi-value">{_html_escape(limit_str)}</div></div>
+<div class="kpi"><div class="kpi-label">Usage</div><div class="kpi-value" style="font-size:16px">{pct_block}</div></div>
+"""
+            detail_rows = "".join(f"<tr><td>{_html_escape(k)}</td><td>{_html_escape(v)}</td></tr>"
+                                   for k, v in record.items())
+            body = (f'<div class="card"><b>VPS {vpsid}</b> &nbsp; {_html_escape(record.get("hostname"))} '
+                    f'&nbsp; <span class="muted">{_html_escape(record.get("ip_primary"))}</span></div>'
+                    f'<div class="kpi-grid">{kpis}</div>'
+                    f'<div class="section-title">All fields (read-only snapshot -- no mutating actions here)</div>'
+                    f'<div class="table-wrap"><table>{detail_rows}</table></div>')
         return WebResponse(body=self._render_page(f"VPS {vpsid_raw}", body, lang, theme, "inventory"))
 
     def _page_renewals(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
@@ -777,15 +812,25 @@ this persistent total (that would double-count across counter resets/reboots).</
         rows = ""
         for node_id, info in overview.get("per_node", {}).items():
             if not info.get("initialized"):
-                rows += f"<tr><td>{_html_escape(node_id)}</td><td colspan=2>not initialized</td></tr>"
+                rows += (f"<tr><td>{_html_escape(node_id)}</td>"
+                         f'<td colspan=2><span class="badge badge-off">not initialized</span></td></tr>')
                 continue
-            rows += (f"<tr><td>{_html_escape(node_id)}</td><td>{info['operations_total']}</td>"
-                      f"<td>{info['operations_unresolved']}</td></tr>")
+            unresolved = info["operations_unresolved"]
+            rows += (f"<tr><td>{_html_escape(node_id)}</td><td class='num'>{info['operations_total']}</td>"
+                      f"<td class='num'><span class=\"badge {'badge-warn' if unresolved else 'badge-ok'}\">"
+                      f"{unresolved}</span></td></tr>")
+        write_approved = overview.get('write_approved')
+        auto_renewal = overview.get('auto_renewal_enabled')
         body = f"""
-<div class="card"><b>Write approved:</b> {overview.get('write_approved')}
- &nbsp; <b>Auto-renewal:</b> {overview.get('auto_renewal_enabled')}
- &nbsp; <b>Monthly grant:</b> {overview.get('monthly_grant_gb')} GB</div>
-<div class="card"><table><tr><th>Node</th><th>Total ops</th><th>Unresolved</th></tr>{rows}</table></div>
+<div class="kpi-grid">
+<div class="kpi {'kpi-ok' if write_approved else 'kpi-warn'}"><div class="kpi-label">Write approved</div>
+<div class="kpi-value">{write_approved}</div></div>
+<div class="kpi {'kpi-ok' if auto_renewal else ''}"><div class="kpi-label">Auto-renewal</div>
+<div class="kpi-value">{auto_renewal}</div></div>
+<div class="kpi"><div class="kpi-label">Monthly grant</div><div class="kpi-value">{overview.get('monthly_grant_gb')} GB</div></div>
+</div>
+<div class="section-title">Per-node operations</div>
+<div class="table-wrap"><table><tr><th>Node</th><th>Total ops</th><th>Unresolved</th></tr>{rows}</table></div>
 """
         return WebResponse(body=self._render_page("Renewal Operations", body, lang, theme, "renewals"))
 
@@ -809,9 +854,9 @@ this persistent total (that would double-count across counter resets/reboots).</
                     emp.save_policy_settings(self.config_dir, new_settings)
                     self._audit(user.username, "emergency_policy_mode_changed", detail=new_mode,
                                 remote_addr=remote_addr)
-                    message = "<p>Saved.</p>"
+                    message = '<p class="badge badge-ok">Saved.</p>'
                 except ValueError as e:
-                    message = f"<p>Rejected: {_html_escape(e)}</p>"
+                    message = f'<p class="badge badge-bad">Rejected: {_html_escape(e)}</p>'
 
         overview = api.get_emergency_policy_overview(self.config_dir, self.state_dir)
         csrf = self._csrf_field(token)
@@ -820,12 +865,18 @@ this persistent total (that would double-count across counter resets/reboots).</
         admin_controls = (f'<form method="post">{csrf}<select name="mode">{options}</select>'
                            f'<button type="submit">Save mode</button></form>'
                            if self._require_admin(user) else "")
+        grants_marker = overview['emergency_grants_approved']
         body = f"""
-<div class="card">{message}<b>Current mode:</b> {_html_escape(overview['mode'])}<br>
-Emergency grant amount: {overview['emergency_grant_amount_gb']} GB<br>
-Grants-approved marker present: {overview['emergency_grants_approved']}<br>
+<div class="card">{message}
+<div class="kpi-grid">
+<div class="kpi kpi-info"><div class="kpi-label">Current mode</div><div class="kpi-value" style="font-size:16px">{_html_escape(overview['mode'])}</div></div>
+<div class="kpi"><div class="kpi-label">Grant amount</div><div class="kpi-value">{overview['emergency_grant_amount_gb']} GB</div></div>
+<div class="kpi {'kpi-ok' if grants_marker else ''}"><div class="kpi-label">Grants-approved marker</div>
+<div class="kpi-value">{grants_marker}</div></div>
+<div class="kpi {'kpi-warn' if overview['proposed_grants'] else 'kpi-ok'}"><div class="kpi-label">Proposed grants</div>
+<div class="kpi-value">{len(overview['proposed_grants'])}</div></div>
+</div>
 {admin_controls}</div>
-<div class="card"><b>Proposed grants:</b> {len(overview['proposed_grants'])}</div>
 """
         return WebResponse(body=self._render_page("Emergency Bandwidth", body, lang, theme, "emergency"))
 
@@ -845,12 +896,12 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
                     emp.resolve_review(conn, int(review_id), form.get("notes", ""))
                     self._audit(user.username, "manual_review_resolved", detail=review_id,
                                 remote_addr=remote_addr)
-                    message = "<p>Resolved.</p>"
+                    message = '<p class="badge badge-ok">Resolved.</p>'
                 elif review_id and action == "acknowledge":
                     emp.acknowledge_review(conn, int(review_id), acknowledged_by=user.username)
                     self._audit(user.username, "manual_review_acknowledged", detail=review_id,
                                 remote_addr=remote_addr)
-                    message = "<p>Acknowledged.</p>"
+                    message = '<p class="badge badge-ok">Acknowledged.</p>'
             pending = emp.list_pending_reviews(conn)
         finally:
             conn.close()
@@ -863,10 +914,13 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
                         f'<input name="notes" placeholder="notes">'
                         f'<button name="action" value="resolve">Resolve</button></form>'
                         if is_admin else "")
-            rows += (f'<tr><td>{item["id"]}</td><td>{item["vpsid"]}</td>'
-                      f'<td>{_html_escape(item["reason"])}</td><td>{_html_escape(item["status"])}</td>'
+            rows += (f'<tr><td>{item["id"]}</td><td><a href="/vps/{item["vpsid"]}">{item["vpsid"]}</a></td>'
+                      f'<td>{_html_escape(item["reason"])}</td>'
+                      f'<td><span class="badge badge-warn">{_html_escape(item["status"])}</span></td>'
                       f'<td>{controls}</td></tr>')
-        body = (f'<div class="card">{message}<table>'
+        body = (f'<div class="card muted">{len(pending)} pending review(s). Resolving/acknowledging requires '
+                f'admin role and a valid CSRF token; never a destructive VPS action by itself.</div>'
+                f'{message}<div class="table-wrap"><table>'
                 f'<tr><th>ID</th><th>VPS</th><th>Reason</th><th>Status</th><th></th></tr>'
                 f'{rows or "<tr><td colspan=5>No pending reviews.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Manual Review", body, lang, theme, "review"))
@@ -874,11 +928,18 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
     def _page_alerts(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import control_center_api as api
         overview = api.get_emergency_policy_overview(self.config_dir, self.state_dir)
-        rows = "".join(f'<tr><td>review</td><td>{r["vpsid"]}</td><td>{_html_escape(r["reason"])}</td></tr>'
+        rows = "".join(f'<tr><td><span class="badge badge-warn">review</span></td>'
+                        f'<td><a href="/vps/{r["vpsid"]}">{r["vpsid"]}</a></td>'
+                        f'<td>{_html_escape(r["reason"])}</td></tr>'
                         for r in overview["pending_reviews"])
-        rows += "".join(f'<tr><td>grant</td><td>{g["vpsid"]}</td><td>+{g["amount_gb"]} GB proposed</td></tr>'
+        rows += "".join(f'<tr><td><span class="badge badge-info">grant</span></td>'
+                         f'<td><a href="/vps/{g["vpsid"]}">{g["vpsid"]}</a></td>'
+                         f'<td>+{g["amount_gb"]} GB proposed</td></tr>'
                          for g in overview["proposed_grants"])
-        body = (f'<div class="card"><table><tr><th>Type</th><th>VPS</th><th>Detail</th></tr>'
+        n_alerts = len(overview["pending_reviews"]) + len(overview["proposed_grants"])
+        body = (f'<div class="kpi-grid"><div class="kpi {"kpi-warn" if n_alerts else "kpi-ok"}">'
+                f'<div class="kpi-label">Active alerts</div><div class="kpi-value">{n_alerts}</div></div></div>'
+                f'<div class="table-wrap"><table><tr><th>Type</th><th>VPS</th><th>Detail</th></tr>'
                 f'{rows or "<tr><td colspan=3>No active alerts.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Alerts", body, lang, theme, "alerts"))
 
@@ -893,7 +954,7 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
                 return self._forbidden("Invalid CSRF token.")
             settings = tc.load_telegram_settings(self.config_dir)
             if not settings.enabled or not settings.admin_ids:
-                message = "<p>Telegram bot is not enabled/configured with admins.</p>"
+                message = '<p class="badge badge-warn">Telegram bot is not enabled/configured with admins.</p>'
             else:
                 try:
                     import telegram_bot as tbot
@@ -905,18 +966,25 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
                     self._audit(user.username, "report_sent_manually",
                                 detail=json.dumps({k: v["ok"] for k, v in delivery.items()}),
                                 remote_addr=remote_addr)
-                    message = f"<p>Delivery: {delivery}</p>"
+                    message = f'<p class="badge badge-ok">Delivery: {_html_escape(delivery)}</p>'
                 except Exception as e:
-                    message = f"<p>Failed: {_html_escape(e)}</p>"
+                    message = f'<p class="badge badge-bad">Failed: {_html_escape(e)}</p>'
         last_sent = reports_mod.load_last_report_sent_date(self.state_dir)
         settings = tc.load_telegram_settings(self.config_dir)
         csrf = self._csrf_field(token)
         admin_controls = (f'<form method="post">{csrf}<button type="submit">Send report now</button></form>'
                            if self._require_admin(user) else "")
         body = f"""
-<div class="card">{message}<b>Scheduled:</b> {settings.reports_enabled}<br>
-<b>Schedule:</b> {settings.report_hour:02d}:{settings.report_minute:02d} {_html_escape(settings.report_timezone)}<br>
-<b>Last sent:</b> {_html_escape(last_sent or 'never')}<br>{admin_controls}</div>
+<div class="card">{message}
+<div class="kpi-grid">
+<div class="kpi {'kpi-ok' if settings.reports_enabled else ''}"><div class="kpi-label">Scheduled</div>
+<div class="kpi-value">{settings.reports_enabled}</div></div>
+<div class="kpi"><div class="kpi-label">Schedule</div>
+<div class="kpi-value" style="font-size:16px">{settings.report_hour:02d}:{settings.report_minute:02d}</div>
+<div class="kpi-sub">{_html_escape(settings.report_timezone)}</div></div>
+<div class="kpi"><div class="kpi-label">Last sent</div><div class="kpi-value" style="font-size:16px">{_html_escape(last_sent or 'never')}</div></div>
+</div>
+{admin_controls}</div>
 """
         return WebResponse(body=self._render_page("Reports", body, lang, theme, "reports"))
 
@@ -925,11 +993,15 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
         settings = tc.load_telegram_settings(self.config_dir)
         secrets_configured = os.path.exists(tc.default_secrets_path(self.config_dir))
         body = f"""
-<div class="card"><b>Enabled:</b> {settings.enabled}<br>
-<b>Connectivity mode:</b> {_html_escape(settings.connectivity_mode)}<br>
-<b>Admins:</b> {len(settings.admin_ids)} &nbsp; <b>Viewers:</b> {len(settings.viewer_ids)}<br>
-<b>Secrets configured:</b> {secrets_configured}<br>
-<span class="muted">Edit via the CLI menu's "Configure Telegram bot" screen.</span></div>
+<div class="kpi-grid">
+<div class="kpi {'kpi-ok' if settings.enabled else ''}"><div class="kpi-label">Enabled</div><div class="kpi-value">{settings.enabled}</div></div>
+<div class="kpi kpi-info"><div class="kpi-label">Connectivity mode</div><div class="kpi-value" style="font-size:16px">{_html_escape(settings.connectivity_mode)}</div></div>
+<div class="kpi"><div class="kpi-label">Admins / Viewers</div><div class="kpi-value">{len(settings.admin_ids)} / {len(settings.viewer_ids)}</div></div>
+<div class="kpi {'kpi-ok' if secrets_configured else 'kpi-warn'}"><div class="kpi-label">Secrets configured</div><div class="kpi-value">{secrets_configured}</div></div>
+</div>
+<div class="card muted">Edit via the CLI menu's "Configure Telegram bot" screen -- this page is read-only by
+design (credential rotation/entry never happens over the Web UI or in chat). Polling/activation stays gated
+until a real, verified connectivity check succeeds through the configured transport.</div>
 """
         return WebResponse(body=self._render_page("Telegram Settings", body, lang, theme, "telegram"))
 
@@ -953,10 +1025,10 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
                             detail=f"archive={os.path.basename(archive)} "
                                    f"integrity_ok={verification['ok']}",
                             remote_addr=remote_addr)
-                message = (f'<p>Created: {_html_escape(os.path.basename(archive))} '
+                message = (f'<p class="badge badge-ok">Created: {_html_escape(os.path.basename(archive))} '
                            f'(integrity: {"ok" if verification["ok"] else verification})</p>')
             except Exception as e:
-                message = f"<p>Backup failed: {_html_escape(str(e))}</p>"
+                message = f'<p class="badge badge-bad">Backup failed: {_html_escape(str(e))}</p>'
 
         archives = backup_mod.list_backup_archives(backup_root)
         rows = "".join(f"<tr><td>{_html_escape(a)}</td></tr>" for a in reversed(archives))
@@ -965,14 +1037,16 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
                            f'<button type="submit">Create backup now</button></form>'
                            if self._require_admin(user) else "")
         body = f"""
-<div class="card">{message}{admin_controls}
+<div class="card">{message}
+<div class="kpi-grid"><div class="kpi"><div class="kpi-label">Archives on disk</div><div class="kpi-value">{len(archives)}</div></div></div>
+{admin_controls}
 <p class="muted">Archives bundle all known state databases plus non-secret config
 (never credentials, tokens, or password hashes). Encryption and scheduled/retention
 backups are available via the CLI: <code>renewal_cli.py backup-full --encrypt --keep N</code>
 (passphrase via the <code>TIXO_BACKUP_PASSPHRASE</code> environment variable, never a CLI
 argument). Restoration always extracts to a staging directory for manual review -- it never
 overwrites live data automatically.</p>
-<table><tr><th>Archive</th></tr>{rows or '<tr><td class="muted">No backups yet.</td></tr>'}</table>
+<div class="table-wrap"><table><tr><th>Archive</th></tr>{rows or '<tr><td class="muted">No backups yet.</td></tr>'}</table></div>
 </div>
 """
         return WebResponse(body=self._render_page("Backups", body, lang, theme, "backups"))
@@ -995,9 +1069,9 @@ overwrites live data automatically.</p>
                     ht_mod.save_calendar_preference(self.config_dir, pref)
                 self._audit(user.username, "settings_changed",
                             detail=f"tz={tz} pref={pref}", remote_addr=remote_addr)
-                message = "<p>Saved.</p>"
+                message = '<p class="badge badge-ok">Saved.</p>'
             except ValueError as e:
-                message = f"<p>Rejected: {_html_escape(e)}</p>"
+                message = f'<p class="badge badge-bad">Rejected: {_html_escape(e)}</p>'
 
         current_tz = menu_mod.load_display_tz(self.config_dir)
         current_pref = ht_mod.load_calendar_preference(self.config_dir)
@@ -1008,7 +1082,14 @@ overwrites live data automatically.</p>
                       f'<p>Display timezone: <input name="display_tz" value="{_html_escape(current_tz)}"></p>'
                       f'<p>Calendar preference: <select name="calendar_preference">{options}</select></p>'
                       f'<button type="submit">Save</button></form>' if self._require_admin(user) else "")
-        body = f'<div class="card">{message}{admin_form}</div>'
+        body = f"""
+<div class="card">{message}
+<div class="kpi-grid">
+<div class="kpi"><div class="kpi-label">Display timezone</div><div class="kpi-value" style="font-size:16px">{_html_escape(current_tz)}</div></div>
+<div class="kpi"><div class="kpi-label">Calendar preference</div><div class="kpi-value" style="font-size:16px">{_html_escape(current_pref)}</div></div>
+</div>
+{admin_form}</div>
+"""
         return WebResponse(body=self._render_page("System Settings", body, lang, theme, "settings"))
 
     def _page_users(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
@@ -1026,24 +1107,24 @@ overwrites live data automatically.</p>
                                     form.get("password", ""), role=form.get("role", wa.ROLE_VIEWER))
                     self._audit(user.username, "user_created", detail=form.get("username"),
                                 remote_addr=remote_addr)
-                    message = "<p>User created.</p>"
+                    message = '<p class="badge badge-ok">User created.</p>'
                 elif action == "disable":
                     wa.set_user_disabled(self.config_dir, form.get("username", ""), True)
                     self._audit(user.username, "user_disabled", detail=form.get("username"),
                                 remote_addr=remote_addr)
-                    message = "<p>User disabled.</p>"
+                    message = '<p class="badge badge-ok">User disabled.</p>'
                 elif action == "enable":
                     wa.set_user_disabled(self.config_dir, form.get("username", ""), False)
                     self._audit(user.username, "user_enabled", detail=form.get("username"),
                                 remote_addr=remote_addr)
-                    message = "<p>User enabled.</p>"
+                    message = '<p class="badge badge-ok">User enabled.</p>'
                 elif action == "delete":
                     wa.delete_user(self.config_dir, form.get("username", ""))
                     self._audit(user.username, "user_deleted", detail=form.get("username"),
                                 remote_addr=remote_addr)
-                    message = "<p>User deleted.</p>"
+                    message = '<p class="badge badge-ok">User deleted.</p>'
             except ValueError as e:
-                message = f"<p>Rejected: {_html_escape(e)}</p>"
+                message = f'<p class="badge badge-bad">Rejected: {_html_escape(e)}</p>'
 
         users = wa.list_users(self.config_dir)
         csrf = self._csrf_field(token)
@@ -1055,20 +1136,23 @@ overwrites live data automatically.</p>
                 toggle_action = "enable" if u.disabled else "disable"
                 controls = (f'<form method="post" style="display:inline">{csrf}'
                             f'<input type="hidden" name="username" value="{_html_escape(u.username)}">'
-                            f'<button name="form_action" value="{toggle_action}">{toggle_action}</button></form>'
+                            f'<button name="form_action" value="{toggle_action}" class="secondary">{toggle_action}</button></form> '
                             f'<form method="post" style="display:inline">{csrf}'
                             f'<input type="hidden" name="username" value="{_html_escape(u.username)}">'
                             f'<button name="form_action" value="delete">delete</button></form>')
-            rows += (f'<tr><td>{_html_escape(u.username)}</td><td>{_html_escape(u.role)}</td>'
-                      f'<td>{u.disabled}</td><td>{controls}</td></tr>')
+            rows += (f'<tr><td>{_html_escape(u.username)}</td>'
+                      f'<td><span class="badge {"badge-info" if u.role == "admin" else "badge-off"}">{_html_escape(u.role)}</span></td>'
+                      f'<td><span class="badge {"badge-bad" if u.disabled else "badge-ok"}">{u.disabled}</span></td>'
+                      f'<td>{controls}</td></tr>')
         create_form = (f'<form method="post">{csrf}<input type="hidden" name="form_action" value="create">'
                        f'<input name="username" placeholder="username">'
                        f'<input name="password" type="password" placeholder="password">'
                        f'<select name="role"><option value="viewer">viewer</option>'
                        f'<option value="admin">admin</option></select>'
                        f'<button type="submit">Create</button></form>' if is_admin else "")
-        body = (f'<div class="card">{message}<table><tr><th>User</th><th>Role</th><th>Disabled</th>'
-                f'<th></th></tr>{rows}</table>{create_form}</div>')
+        body = (f'<div class="card">{message}'
+                f'<div class="table-wrap"><table><tr><th>User</th><th>Role</th><th>Disabled</th>'
+                f'<th></th></tr>{rows}</table></div>{create_form}</div>')
         return WebResponse(body=self._render_page("User Management", body, lang, theme, "users"))
 
     def _page_audit(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
@@ -1078,10 +1162,13 @@ overwrites live data automatically.</p>
             events = audit_log.list_recent_events(conn, limit=100)
         finally:
             conn.close()
-        rows = "".join(f'<tr><td>{_html_escape(e["occurred_at"])}</td><td>{_html_escape(e["actor"])}</td>'
-                        f'<td>{_html_escape(e["action"])}</td><td>{_html_escape(e["detail"])}</td></tr>'
+        rows = "".join(f'<tr><td class="muted">{_html_escape(e["occurred_at"])}</td><td>{_html_escape(e["actor"])}</td>'
+                        f'<td><span class="badge badge-off">{_html_escape(e["action"])}</span></td>'
+                        f'<td>{_html_escape(e["detail"])}</td></tr>'
                         for e in events)
-        body = (f'<div class="card"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Detail</th></tr>'
+        body = (f'<div class="card muted">Most recent {len(events)} event(s) (newest first). Every mutating '
+                f'admin action on this panel is recorded here.</div>'
+                f'<div class="table-wrap"><table><tr><th>Time</th><th>Actor</th><th>Action</th><th>Detail</th></tr>'
                 f'{rows or "<tr><td colspan=4>No events recorded yet.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Audit Logs", body, lang, theme, "audit"))
 
@@ -1089,12 +1176,24 @@ overwrites live data automatically.</p>
         import menu as menu_mod
         timers = menu_mod.collect_timer_status()
         rows = ""
+        n_active = n_failed = 0
         for unit, info in timers.items():
             health = menu_mod.classify_timer_health(info.get("active", ""), info.get("enabled", ""))
-            badge = "badge-ok" if health == "ACTIVE" else ("badge-warn" if health == "FAILED" else "badge-off")
+            badge = "badge-ok" if health == "ACTIVE" else ("badge-bad" if health == "FAILED" else "badge-off")
+            if health == "ACTIVE":
+                n_active += 1
+            elif health == "FAILED":
+                n_failed += 1
             rows += (f'<tr><td>{_html_escape(unit)}</td>'
                       f'<td><span class="badge {badge}">{health}</span></td></tr>')
-        body = f'<div class="card"><table><tr><th>Timer</th><th>Health</th></tr>{rows}</table></div>'
+        summary = f"""
+<div class="kpi-grid">
+<div class="kpi kpi-info"><div class="kpi-label">Timers tracked</div><div class="kpi-value">{len(timers)}</div></div>
+<div class="kpi kpi-ok"><div class="kpi-label">Active</div><div class="kpi-value">{n_active}</div></div>
+<div class="kpi {'kpi-bad' if n_failed else 'kpi-ok'}"><div class="kpi-label">Failed</div><div class="kpi-value">{n_failed}</div></div>
+</div>
+"""
+        body = summary + f'<div class="table-wrap"><table><tr><th>Timer</th><th>Health</th></tr>{rows}</table></div>'
         return WebResponse(body=self._render_page("Service Health", body, lang, theme, "health"))
 
 
