@@ -330,3 +330,129 @@ def test_bootstrap_default_tag_matches_current_version():
         f"bootstrap.sh defaults to v{m.group(1)} but renewal_cli.VERSION is "
         f"{renewal_cli.VERSION} -- bump bootstrap.sh's default TAG to match"
     )
+
+
+# ---------- v1.10.1: install.sh itself as a real subprocess (not just renewal_cli.py install) --
+
+def test_install_sh_fresh_install_succeeds_end_to_end(tmp_path):
+    """Regression test for a real bug found on a second production hypervisor (ir2): running
+    the actual `install.sh` SCRIPT (not `renewal_cli.py install` directly, which every other
+    test in this file exercises) crashed with `ModuleNotFoundError: No module named
+    'renewal_cli'` right after the Virtualizor detection message, because its one-line
+    `PYTHONPATH="$INSTALL_DIR/lib" python3 -c 'import renewal_cli'` version-check never
+    included `$INSTALL_DIR/bin`, where renewal_cli.py actually lives. The code copy itself
+    still succeeded (a genuinely PARTIAL install: application files present, but systemd
+    unit templates never generated and the global `tixo-renewal` wrapper never (re)created)
+    -- this is exactly why the CLI could still be launched afterward (by invoking the script
+    file directly, which doesn't hit this code path) even though the installer itself had
+    failed. No existing test caught this because every other install-focused test here calls
+    `renewal_cli.py install` as a subprocess directly, bypassing install.sh entirely. This
+    test runs install.sh itself, end to end, exactly like a real operator/ir2 would."""
+    result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                             capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    with tarfile.open(pkg) as tf:
+        tf.extractall(staging, filter="data")
+
+    install_dir = tmp_path / "opt-tixo-renewal"
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+    r = subprocess.run(["bash", "install.sh"], cwd=str(staging), capture_output=True,
+                        text=True, timeout=30, env=env)
+    assert r.returncode == 0, (
+        f"install.sh failed (exit {r.returncode}) -- this is exactly the ir2 symptom if it "
+        f"mentions ModuleNotFoundError:\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "Traceback" not in r.stdout and "Traceback" not in r.stderr
+    assert "== Install complete ==" in r.stdout
+
+    # Code copied.
+    assert (install_dir / "bin" / "renewal_cli.py").exists()
+    assert (install_dir / "lib" / "menu.py").exists()
+    # Static assets copied (the OTHER gap found in the same install.sh bug hunt).
+    assert (install_dir / "lib" / "static" / "live-bandwidth.js").exists()
+    assert (install_dir / "lib" / "static" / "tixocloud.png").exists()
+    # Systemd unit templates generated (install.sh crashed BEFORE reaching this step --
+    # their absence is the clearest signal of a "partial install").
+    assert (install_dir / "systemd" / "virt-renewal-monitor.service").exists()
+    assert (install_dir / "systemd" / "virt-renewal-web.service").exists()
+    # Config written.
+    assert (install_dir / "renewal-config" / "policy.json").exists()
+    assert (install_dir / "renewal-config" / "nodes.json").exists()
+
+
+def test_install_sh_second_run_recovers_and_stays_idempotent(tmp_path):
+    """Regression/recovery test: re-running install.sh against an install directory left in
+    whatever state the FIRST run produced (e.g. the real ir2 case -- code copied, systemd
+    templates missing because the first run crashed) must complete cleanly on the second
+    attempt and never overwrite the operator's existing policy/node config. This is the
+    documented recovery path for a partial install (`install.sh` is explicitly idempotent --
+    safe to re-run)."""
+    result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                             capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    with tarfile.open(pkg) as tf:
+        tf.extractall(staging, filter="data")
+
+    install_dir = tmp_path / "opt-tixo-renewal"
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+
+    r1 = subprocess.run(["bash", "install.sh"], cwd=str(staging), capture_output=True,
+                         text=True, timeout=30, env=env)
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+
+    # Simulate an operator having edited policy after the first install (must survive).
+    policy_path = install_dir / "renewal-config" / "policy.json"
+    original_policy = policy_path.read_text()
+    edited_policy = original_policy.replace('"auto_renewal_enabled": false',
+                                             '"auto_renewal_enabled": false  // operator note')
+    policy_path.write_text(edited_policy if edited_policy != original_policy else original_policy)
+
+    # Simulate the exact partial-install state: remove the systemd templates and the global
+    # wrapper, as if the first run had crashed before reaching those steps (the real ir2 case).
+    import shutil as _shutil
+    _shutil.rmtree(install_dir / "systemd")
+    (install_dir / "systemd").mkdir()
+
+    r2 = subprocess.run(["bash", "install.sh"], cwd=str(staging), capture_output=True,
+                         text=True, timeout=30, env=env)
+    assert r2.returncode == 0, (
+        f"second (recovery) install.sh run failed:\nSTDOUT:\n{r2.stdout}\nSTDERR:\n{r2.stderr}"
+    )
+    assert "Traceback" not in r2.stdout and "Traceback" not in r2.stderr
+
+    # Recovered: systemd templates regenerated.
+    assert (install_dir / "systemd" / "virt-renewal-monitor.service").exists()
+    # Preserved: the operator's edited policy was never overwritten.
+    assert policy_path.read_text() == (edited_policy if edited_policy != original_policy
+                                        else original_policy)
+
+
+def test_readme_install_command_matches_current_version():
+    """Regression test: the top-level README.md's one-command install was found pinned to
+    v1.1.0 -- nine releases stale -- while deploy/bootstrap.sh's own default tag had stayed
+    correctly updated on every release (it has its own drift test above). No equivalent
+    check existed for README.md, so this exact staleness went unnoticed through every
+    subsequent release until a user reported being pointed at ancient install instructions."""
+    impl_dir = os.path.join(os.path.dirname(__file__), "..", "implementation")
+    sys.path.insert(0, impl_dir)
+    import renewal_cli
+
+    readme_path = os.path.join(os.path.dirname(__file__), "..", "README.md")
+    readme_text = open(readme_path).read()
+    import re
+    m = re.search(r"tixo-renewal/v([0-9.]+)/deploy/bootstrap\.sh", readme_text)
+    assert m, "could not find README.md's pinned bootstrap.sh install URL"
+    assert m.group(1) == renewal_cli.VERSION, (
+        f"README.md's one-command install is pinned to v{m.group(1)} but "
+        f"renewal_cli.VERSION is {renewal_cli.VERSION} -- update README.md's install command"
+    )
