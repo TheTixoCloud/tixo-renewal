@@ -1,8 +1,12 @@
 # TixoCloud Control Center — Future Development Handover
 
-**Status at handover: v1.10.0 in production (ir1.tixocloud.com), + one in-place SOCKS5 fix
-not yet in a tagged release. Web Control Center and Telegram bot both live and verified
-working. See `docs/DEVELOPMENT_PROGRESS.md` for the full chronological history and
+**Status at handover: v1.10.0 in production on ir1 (web/Telegram live and verified
+working); v1.10.1 is the latest tagged GitHub release (installer + README fixes — see
+`docs/RELEASE_NOTES_v1.10.1.md`), not yet deployed to ir1 or ir2. ir2's first install is
+still pending — it previously failed with the exact bug v1.10.1 fixes. Production (ir1)
+code now matches the v1.10.1 release source for every file except `renewal_cli.VERSION`
+itself (ir1 still reports v1.10.0 — the application code is otherwise current). See
+`docs/DEVELOPMENT_PROGRESS.md` for the full chronological history and
 `docs/KNOWN_LIMITATIONS.md` for honest outstanding issues.**
 
 ## 1. What TixoCloud currently does
@@ -77,14 +81,23 @@ gh release create vX.Y.Z deploy/tixo-renewal-package.tar.gz deploy/SHA256SUMS \
 
 ## 7. Deploying safely
 
+**Fresh host, one-command install** (current pinned tag — verify this still matches
+`renewal_cli.VERSION` before trusting it; `test_bootstrap_default_tag_matches_current_version`
+and `test_readme_install_command_matches_current_version` both guard against this drifting
+again, but check anyway):
+```bash
+curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.1/deploy/bootstrap.sh | sudo bash
+```
+
 Full procedure in `docs/DEPLOYMENT.md`. Short version for an **existing** install:
 1. `scp` the built tarball + its sha256 to the target host; verify the checksum matches.
 2. Extract to a staging directory; verify the staged `renewal_cli.VERSION`.
 3. **Take a fresh backup first** (see §8) — `install.sh`/`install-upgrade` also takes their
    own automatic backup, but don't rely on that alone for anything you can't afford to lose.
-4. Run `install.sh` from the staging directory (see `docs/KNOWN_LIMITATIONS.md` §1 for a
-   currently-open rough edge in this exact step) — copies new code, then runs the idempotent
-   config/schema step. Never overwrites existing `policy.json`/`nodes.json`/secrets.
+4. Run `install.sh` from the staging directory — as of v1.10.1 this completes cleanly
+   end-to-end (the `ModuleNotFoundError` partial-install bug from v1.10.0 and earlier is
+   fixed; see `docs/KNOWN_LIMITATIONS.md` §1). Never overwrites existing
+   `policy.json`/`nodes.json`/secrets.
 5. Run `install-health-check`; confirm it reports `{"ok": true}`.
 6. If a Web/Telegram service was running, restart ONLY that service
    (`systemctl restart virt-renewal-web.service` / `...-telegram-bot.service`) — the five
