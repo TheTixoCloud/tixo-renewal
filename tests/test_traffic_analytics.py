@@ -275,3 +275,36 @@ def test_all_periods_bundle_returns_every_expected_label(tmp_path):
     assert set(bundle.keys()) == expected_labels
     for label, result in bundle.items():
         assert result["label"] == label
+
+
+# ---------- daily_series (v1.9.0, chart data) ----------------------------------------------
+
+def test_daily_series_returns_requested_number_of_days(tmp_path):
+    conn = _db(tmp_path)
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=timezone.utc)
+    series = ta.daily_series(conn, "eth0", 5, tz_name="UTC", now=now)
+    assert len(series) == 5
+    assert series[-1]["date"] == "2026-03-10"
+    assert series[0]["date"] == "2026-03-06"
+
+
+def test_daily_series_sums_deltas_per_local_day(tmp_path):
+    conn = _db(tmp_path)
+    _sample(conn, "eth0", 0, 0, "2026-03-09T00:00:00+00:00")
+    _sample(conn, "eth0", 1_000_000_000, 500_000_000, "2026-03-09T12:00:00+00:00")
+    _sample(conn, "eth0", 2_000_000_000, 1_000_000_000, "2026-03-10T01:00:00+00:00")
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=timezone.utc)
+    series = ta.daily_series(conn, "eth0", 2, tz_name="UTC", now=now)
+    day9, day10 = series
+    assert day9["date"] == "2026-03-09"
+    assert day9["rx_bytes"] == 1_000_000_000
+    assert day10["date"] == "2026-03-10"
+    assert day10["rx_bytes"] == 1_000_000_000
+
+
+def test_daily_series_marks_zero_sample_day_as_partial(tmp_path):
+    conn = _db(tmp_path)
+    _sample(conn, "eth0", 0, 0, "2026-03-05T00:00:00+00:00")
+    now = datetime(2026, 3, 10, 12, 0, tzinfo=timezone.utc)
+    series = ta.daily_series(conn, "eth0", 3, tz_name="UTC", now=now)
+    assert all(d["partial"] for d in series if d["sample_count"] == 0)

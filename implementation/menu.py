@@ -511,70 +511,18 @@ def render_progress_bar(percent, width: int = 20, style: Style = None) -> str:
     return f"[{bar}] {pct:.1f}%"
 
 
-def _format_bytes_human(num_bytes) -> str:
-    """Decimal (SI) units -- GB/TB mean 10^9/10^12 bytes here, matching how storage/traffic
-    is conventionally marketed and billed, NOT the binary GiB/TiB (2^30/2^40) a kernel
-    sometimes reports. Documented explicitly since the two differ by ~7% at this scale."""
-    try:
-        n = float(num_bytes)
-    except (TypeError, ValueError):
-        return "unavailable"
-    for unit, divisor in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
-        if n >= divisor:
-            return f"{n / divisor:.2f} {unit}"
-    return f"{n:.0f} B"
+# v1.9.0: the actual formatting logic now lives in traffic_format.py, the ONE module both
+# the CLI and the Web Control Center import -- these names stay as aliases (never removed)
+# so every existing call site and test in this file keeps working unchanged.
+import traffic_format as _tf
 
-
-_BIT_RATE_UNITS = (("Tbps", 1e12), ("Gbps", 1e9), ("Mbps", 1e6), ("Kbps", 1e3))
-_BYTE_RATE_UNITS = (("TB/s", 1e12), ("GB/s", 1e9), ("MB/s", 1e6), ("KB/s", 1e3))
-
-
-def _scale_rate_human(value: float, units: tuple, base_unit: str) -> str:
-    """Shared decimal (1000-based) SI auto-scaling for a non-negative rate, used by both the
-    bit-based and byte-based formatters below so they can never disagree on scaling logic.
-    `units` must be ordered LARGEST divisor first.
-
-    NO MISLEADING ROUNDING (v1.7.3): rounding `value/divisor` to 2 decimals can push it to
-    exactly the next tier's threshold (e.g. 999999 B/s -> 999.999 KB/s -> rounds to "1000.00
-    KB/s", which is wrong -- it should display as "1.00 MB/s"). Detected by checking whether
-    the ROUNDED value would read >= 1000 and, if so, re-rendering against the next larger
-    unit instead."""
-    for idx, (unit, divisor) in enumerate(units):
-        if value < divisor:
-            continue
-        scaled = value / divisor
-        if round(scaled, 2) >= 1000 and idx > 0:
-            bigger_unit, bigger_divisor = units[idx - 1]
-            return f"{value / bigger_divisor:.2f} {bigger_unit}"
-        return f"{scaled:.2f} {unit}"
-    return f"{value:.0f} {base_unit}"
-
-
-def _format_bits_per_sec_human(bytes_per_sec) -> str:
-    try:
-        bps = float(bytes_per_sec) * 8
-    except (TypeError, ValueError):
-        return "unavailable"
-    return _scale_rate_human(bps, _BIT_RATE_UNITS, "bps")
-
-
-def _format_bytes_per_sec_human(bytes_per_sec) -> str:
-    """B/s -> KB/s -> MB/s -> GB/s -> TB/s, auto-scaled (decimal/SI, matching
-    _format_bytes_human) -- used for the live hostnet screen's byte-based reading."""
-    try:
-        n = float(bytes_per_sec)
-    except (TypeError, ValueError):
-        return "unavailable"
-    return _scale_rate_human(n, _BYTE_RATE_UNITS, "B/s")
-
-
-def _format_dual_speed_human(bytes_per_sec) -> tuple:
-    """Returns (bit_based_str, byte_based_str) for the SAME underlying bytes_per_sec reading
-    (v1.7.3): bit-based is the networking-industry convention (ISP/NIC line rates), byte-
-    based is the transfer/accounting convention (file sizes, quota consumption). Always
-    derived from one measurement via the fixed 1 byte = 8 bits relationship -- the two
-    strings can never describe different events or disagree about what happened."""
-    return _format_bits_per_sec_human(bytes_per_sec), _format_bytes_per_sec_human(bytes_per_sec)
+_format_bytes_human = _tf.format_bytes
+_BIT_RATE_UNITS = _tf._BIT_RATE_UNITS
+_BYTE_RATE_UNITS = _tf._BYTE_RATE_UNITS
+_scale_rate_human = _tf._scale_rate_human
+_format_bits_per_sec_human = _tf.format_bits_per_second
+_format_bytes_per_sec_human = _tf.format_bytes_per_second
+_format_dual_speed_human = _tf.format_dual_rate
 
 
 def _format_uptime_human(seconds) -> str:

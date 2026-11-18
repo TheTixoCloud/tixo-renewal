@@ -66,36 +66,132 @@ NAV_PATHS = {
     "health": "/health",
 }
 
+# v1.9.0 design system -- a genuine visual overhaul (modern SaaS-panel look: refined
+# palette, elevation/shadows, consistent spacing scale, KPI/metric cards, progress gauges,
+# sticky-header dense tables, smooth transitions) while remaining PURE CSS: zero external
+# fonts, zero icon packs, zero CDN, zero added CPU/RAM/network cost on the hypervisor. The
+# only visual "icons" are inline Unicode glyphs already in any system font.
 CSS = """
-:root[data-theme="dark"] { --bg:#0f1115; --fg:#e6e6e6; --card:#1a1d24; --accent:#e03131;
-  --border:#2a2d35; --muted:#9aa0a6; }
-:root[data-theme="light"] { --bg:#f7f7f8; --fg:#1a1a1a; --card:#ffffff; --accent:#c92a2a;
-  --border:#dcdde0; --muted:#5a5f66; }
+:root[data-theme="dark"] {
+  --bg:#0b0d12; --bg-elevated:#12151c; --card:#161a22; --card-hover:#1b2029;
+  --accent:#ef4444; --accent-soft:#ef44441a; --accent-strong:#dc2626;
+  --border:#232834; --muted:#8b93a1; --fg:#e8eaed;
+  --ok:#22c55e; --ok-soft:#22c55e1a; --warn:#f59e0b; --warn-soft:#f59e0b1a;
+  --bad:#ef4444; --bad-soft:#ef44441a; --info:#3b82f6; --info-soft:#3b82f61a;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.25);
+}
+:root[data-theme="light"] {
+  --bg:#f4f5f7; --bg-elevated:#ffffff; --card:#ffffff; --card-hover:#f8f9fb;
+  --accent:#dc2626; --accent-soft:#dc26261a; --accent-strong:#b91c1c;
+  --border:#e3e6ea; --muted:#667085; --fg:#111418;
+  --ok:#16a34a; --ok-soft:#16a34a1a; --warn:#d97706; --warn-soft:#d977061a;
+  --bad:#dc2626; --bad-soft:#dc26261a; --info:#2563eb; --info-soft:#2563eb1a;
+  --shadow: 0 1px 2px rgba(16,24,40,.06), 0 4px 16px rgba(16,24,40,.06);
+}
 * { box-sizing: border-box; }
-body { background:var(--bg); color:var(--fg); font-family: -apple-system, Segoe UI, Roboto, sans-serif;
-  margin:0; display:flex; min-height:100vh; }
+html, body { margin:0; }
+body { background:var(--bg); color:var(--fg); margin:0; display:flex; min-height:100vh;
+  font-family: "Segoe UI", -apple-system, "Vazirmatn", Tahoma, Roboto, sans-serif;
+  font-size:14px; line-height:1.5; -webkit-font-smoothing:antialiased; }
 [dir="rtl"] body { direction: rtl; }
-nav { width:220px; background:var(--card); border-right:1px solid var(--border); padding:16px; flex-shrink:0; }
+a { color: inherit; }
+
+/* ---------- sidebar ---------- */
+nav { width:236px; background:var(--bg-elevated); border-right:1px solid var(--border);
+  padding:20px 14px; flex-shrink:0; position:sticky; top:0; height:100vh; overflow-y:auto; }
 [dir="rtl"] nav { border-right:none; border-left:1px solid var(--border); }
-nav a { display:block; color:var(--fg); text-decoration:none; padding:8px 10px; border-radius:6px; margin-bottom:2px; font-size:14px; }
-nav a:hover, nav a.active { background:var(--accent); color:white; }
-main { flex:1; padding:24px; max-width:1000px; }
-h1 { color:var(--accent); font-size:20px; }
-.card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:16px; margin-bottom:16px; }
-table { width:100%; border-collapse: collapse; font-size:13px; }
-th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
+nav h1 { font-size:17px; font-weight:700; letter-spacing:.2px; margin:4px 10px 18px;
+  color:var(--accent); display:flex; align-items:center; gap:8px; }
+nav a { display:flex; align-items:center; gap:10px; color:var(--muted); text-decoration:none;
+  padding:9px 12px; border-radius:8px; margin-bottom:2px; font-size:13.5px; font-weight:500;
+  transition: background .12s ease, color .12s ease; }
+nav a:hover { background:var(--card-hover); color:var(--fg); }
+nav a.active { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+nav form { margin:16px 4px 0; padding-top:14px; border-top:1px solid var(--border); }
+nav button { width:100%; }
+
+/* ---------- main content ---------- */
+main { flex:1; padding:28px 32px; max-width:1180px; width:100%; margin:0 auto; }
+main > h1 { font-size:22px; font-weight:700; margin:0 0 20px; letter-spacing:-.2px; }
+footer.muted { padding:20px 32px; font-size:11.5px; }
+
+/* ---------- cards ---------- */
+.card { background:var(--card); border:1px solid var(--border); border-radius:12px;
+  padding:18px 20px; margin-bottom:18px; box-shadow:var(--shadow); }
+.card h2, .card h3 { margin-top:0; font-size:14px; font-weight:600; color:var(--muted);
+  text-transform:uppercase; letter-spacing:.4px; }
+.card-row { display:flex; flex-wrap:wrap; gap:16px; margin-bottom:18px; }
+.card-row .card { flex:1 1 220px; margin-bottom:0; }
+
+/* ---------- KPI / metric cards ---------- */
+.kpi-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr));
+  gap:14px; margin-bottom:18px; }
+.kpi { background:var(--card); border:1px solid var(--border); border-radius:12px;
+  padding:16px 18px; box-shadow:var(--shadow); }
+.kpi .kpi-label { color:var(--muted); font-size:12px; font-weight:600; text-transform:uppercase;
+  letter-spacing:.4px; margin-bottom:6px; }
+.kpi .kpi-value { font-size:24px; font-weight:700; letter-spacing:-.3px; }
+.kpi .kpi-sub { color:var(--muted); font-size:12px; margin-top:4px; }
+.kpi.kpi-ok .kpi-value { color:var(--ok); } .kpi.kpi-warn .kpi-value { color:var(--warn); }
+.kpi.kpi-bad .kpi-value { color:var(--bad); } .kpi.kpi-info .kpi-value { color:var(--info); }
+
+/* ---------- gauges / progress ---------- */
+.gauge { height:8px; border-radius:6px; background:var(--border); overflow:hidden; margin-top:8px; }
+.gauge > span { display:block; height:100%; border-radius:6px; transition:width .3s ease; }
+.gauge.g-ok > span { background:var(--ok); } .gauge.g-warn > span { background:var(--warn); }
+.gauge.g-bad > span { background:var(--bad); }
+.gauge-label { display:flex; justify-content:space-between; font-size:12px; color:var(--muted); margin-top:4px; }
+
+/* ---------- tables ---------- */
+table { width:100%; border-collapse:collapse; font-size:13px; }
+thead th { position:sticky; top:0; background:var(--card); text-align:left; padding:10px 10px;
+  border-bottom:2px solid var(--border); color:var(--muted); font-weight:600; font-size:11.5px;
+  text-transform:uppercase; letter-spacing:.3px; }
+tbody td { padding:9px 10px; border-bottom:1px solid var(--border); }
+tbody tr:hover { background:var(--card-hover); }
 [dir="rtl"] th, [dir="rtl"] td { text-align:right; }
-.muted { color:var(--muted); font-size:12px; }
-.badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; }
-.badge-ok { background:#2b8a3e; color:white; }
-.badge-warn { background:#e8590c; color:white; }
-.badge-off { background:var(--muted); color:white; }
-input, select, button { padding:6px 10px; border-radius:6px; border:1px solid var(--border);
-  background:var(--bg); color:var(--fg); }
-button { background:var(--accent); color:white; cursor:pointer; border:none; }
+.num { text-align:right; font-variant-numeric:tabular-nums; }
+[dir="rtl"] .num { text-align:left; }
+.table-wrap { overflow-x:auto; }
+
+/* ---------- misc ---------- */
+.muted { color:var(--muted); font-size:12.5px; }
+.badge { display:inline-flex; align-items:center; gap:4px; padding:3px 10px; border-radius:20px;
+  font-size:11.5px; font-weight:600; letter-spacing:.2px; }
+.badge-ok { background:var(--ok-soft); color:var(--ok); }
+.badge-warn { background:var(--warn-soft); color:var(--warn); }
+.badge-bad { background:var(--bad-soft); color:var(--bad); }
+.badge-off { background:var(--border); color:var(--muted); }
+.badge-info { background:var(--info-soft); color:var(--info); }
+input, select, button { padding:8px 12px; border-radius:8px; border:1px solid var(--border);
+  background:var(--bg-elevated); color:var(--fg); font-size:13px; font-family:inherit; }
+button { background:var(--accent); color:#fff; cursor:pointer; border:none; font-weight:600;
+  transition:background .12s ease, opacity .12s ease; }
+button:hover { background:var(--accent-strong); }
+button:active { opacity:.85; }
+button.secondary { background:var(--card-hover); color:var(--fg); border:1px solid var(--border); }
+button.secondary:hover { background:var(--border); }
 form { margin-bottom:8px; }
-.topbar { display:flex; justify-content:flex-end; gap:8px; padding:8px 16px; }
-@media (max-width: 700px) { body { flex-direction:column; } nav { width:100%; } }
+.topbar { display:flex; justify-content:flex-end; align-items:center; gap:10px; padding:12px 32px;
+  border-bottom:1px solid var(--border); background:var(--bg-elevated); }
+.section-title { font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.5px;
+  color:var(--muted); margin:22px 0 10px; }
+.chart-wrap { width:100%; overflow-x:auto; }
+.chart-wrap svg { max-width:100%; }
+.empty-state { color:var(--muted); font-size:13px; padding:20px; text-align:center; }
+.freshness { font-size:11.5px; padding:2px 8px; border-radius:6px; }
+
+@media (max-width: 900px) {
+  body { flex-direction:column; }
+  nav { width:100%; height:auto; position:static; padding:12px; }
+  nav a { padding:10px 12px; }
+  main { padding:18px; max-width:100%; }
+  .kpi-grid { grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); }
+}
+@media (max-width: 560px) {
+  .kpi-grid { grid-template-columns:1fr 1fr; }
+  table { font-size:12px; }
+}
 """
 
 
@@ -247,7 +343,7 @@ class WebApp:
 
         if route in routes:
             nav_key, handler = routes[route]
-            return handler(user, method, form, token, remote_addr, lang, theme)
+            return handler(user, method, form, token, remote_addr, lang, theme, query)
 
         return self._not_found()
 
@@ -336,112 +432,327 @@ class WebApp:
     def _handle_api_live(self, query) -> WebResponse:
         import control_center_api as api
         import hostnet_sync
+        import traffic_format as tf
         settings = hostnet_sync.load_settings(self.config_dir)
         interface = settings.get("interface")
         if not interface:
             return self._json({"configured": False})
         live = api.get_live_network_reading(interface)
-        return self._json({"configured": True, "interface": interface, **live})
+        block = tf.format_traffic_block(live.get("rx_bytes"), live.get("tx_bytes")) if live.get("ok") else {
+            "download": "unavailable", "upload": "unavailable", "combined": "unavailable"}
+        return self._json({"configured": True, "interface": interface, **live, **block})
 
     # ---------- pages (each: user, method, form, session_token, remote_addr, lang, theme) ---
 
-    def _page_overview(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _period_kpi(self, bundle: dict, key: str, label: str) -> str:
+        """Renders one traffic-analytics period as a KPI card -- download/upload/combined via
+        the shared `traffic_format` layer, with an honest coverage badge (never implying full
+        coverage where samples are missing or partial)."""
+        import traffic_format as tf
+        p = bundle.get(key)
+        if not p:
+            return (f'<div class="kpi"><div class="kpi-label">{_html_escape(label)}</div>'
+                    f'<div class="kpi-value muted">unavailable</div></div>')
+        block = tf.format_traffic_block(p.get("rx_bytes"), p.get("tx_bytes"))
+        status = p.get("coverage_status", "")
+        badge_class = {"FULL": "badge-ok", "PARTIAL_COVERAGE": "badge-warn"}.get(status, "badge-off")
+        badge_text = {"FULL": "full coverage", "PARTIAL_COVERAGE": "partial",
+                      "NO_DATA": "no data"}.get(status, status.lower() if status else "n/a")
+        return (f'<div class="kpi"><div class="kpi-label">{_html_escape(label)}</div>'
+                f'<div class="kpi-value">{block["combined"]}</div>'
+                f'<div class="kpi-sub">&darr; {block["download"]} &nbsp; &uarr; {block["upload"]}</div>'
+                f'<div class="kpi-sub"><span class="badge {badge_class}">{badge_text}</span></div></div>')
+
+    def _page_overview(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import control_center_api as api
+        import traffic_format as tf
         snap = api.get_full_snapshot(self.config_dir, self.state_dir)
         fleet = snap["inventory"]["fleet"]
         net = snap["network"]
         ht = snap["host_time"]
+        host = snap.get("host") or {}
+        renewal = snap["renewal"]
+        emp = snap["emergency_policy"]
+        cpu = host.get("cpu") or {}
+        usage = host.get("usage") or {}
+        load = (host.get("uptime") or {}).get("load_average") or {}
+
+        running = fleet.get("running_count", 0)
+        total_vps = fleet.get("total_vps", 0)
+        stopped = fleet.get("stopped_count", 0)
+        suspended = fleet.get("suspended_count", 0)
+        unknown = fleet.get("unknown_status_count", 0)
+
+        mem_pct = usage.get("memory_percent")
+        mem_pct = mem_pct if isinstance(mem_pct, (int, float)) else None
+        load1 = load.get("1m")
+        logical_cpus = cpu.get("logical_cpus")
+        load_pct = (round(100 * load1 / logical_cpus, 1)
+                    if isinstance(load1, (int, float)) and isinstance(logical_cpus, int) and logical_cpus > 0
+                    else None)
+
+        def _gauge_class(pct):
+            if pct is None:
+                return "g-ok"
+            return "g-bad" if pct >= 90 else "g-warn" if pct >= 75 else "g-ok"
+
+        kpi_fleet = f"""
+<div class="kpi kpi-info"><div class="kpi-label">Total VPS</div><div class="kpi-value">{total_vps}</div>
+<div class="kpi-sub">{running} running &nbsp; {stopped} stopped &nbsp; {suspended} suspended &nbsp; {unknown} unknown</div></div>
+<div class="kpi"><div class="kpi-label">CPU load (1m)</div>
+<div class="kpi-value">{load1 if load1 is not None else 'n/a'}</div>
+<div class="kpi-sub">{logical_cpus if logical_cpus else '?'} logical CPUs</div>
+<div class="gauge {_gauge_class(load_pct)}"><span style="width:{min(load_pct, 100) if load_pct is not None else 0}%"></span></div></div>
+<div class="kpi"><div class="kpi-label">Memory</div>
+<div class="kpi-value">{mem_pct if mem_pct is not None else 'n/a'}{'%' if mem_pct is not None else ''}</div>
+<div class="gauge {_gauge_class(mem_pct)}"><span style="width:{min(mem_pct, 100) if mem_pct is not None else 0}%"></span></div></div>
+<div class="kpi"><div class="kpi-label">Host uptime</div><div class="kpi-value" style="font-size:16px">{_html_escape(ht.get('uptime_human'))}</div>
+<div class="kpi-sub">{_html_escape(ht.get('current_local'))}</div></div>
+"""
+        bundle = net.get("traffic_analytics", {}) if net.get("configured") else {}
+        traffic_kpis = "".join([
+            self._period_kpi(bundle, "today", "Today"),
+            self._period_kpi(bundle, "yesterday", "Yesterday"),
+            self._period_kpi(bundle, "last_7_days", "Last 7 days"),
+            self._period_kpi(bundle, "current_gregorian_month", "This month (Gregorian)"),
+            self._period_kpi(bundle, "current_jalali_month", "This month (Jalali)"),
+        ]) if bundle else '<div class="empty-state">No network interface configured yet -- traffic figures unavailable.</div>'
+
+        n_alerts = len(emp.get("pending_reviews", [])) + len(emp.get("proposed_grants", []))
+
+        chart_block = ""
+        if net.get("configured"):
+            import charts
+            series = net.get("daily_series_7d", [])
+            chart_svg = charts.render_daily_bar_chart(series, width=760, height=190,
+                                                        title="Last 7 days download/upload")
+            chart_block = (f'<div class="section-title">Last 7 Days &nbsp; '
+                           f'<a href="/traffic" class="muted" style="text-decoration:none">view full history &rarr;</a></div>'
+                           f'<div class="card chart-wrap">{chart_svg}</div>')
+
         body = f"""
-<div class="card"><b>Server time:</b> {_html_escape(ht.get('current_local'))}
- &nbsp; <b>Uptime:</b> {_html_escape(ht.get('uptime_human'))}</div>
-<div class="card"><b>VPS:</b> {fleet['total_vps']} total
- (running {fleet['running_count']}, stopped {fleet['stopped_count']},
- suspended {fleet['suspended_count']}, unknown {fleet['unknown_status_count']})</div>
-<div class="card"><b>Network:</b> {'configured on ' + _html_escape(net['interface']) if net.get('configured') else 'not configured'}</div>
-<div class="card"><b>Write approved:</b> {snap['renewal'].get('write_approved')}
- &nbsp; <b>Auto-renewal:</b> {snap['renewal'].get('auto_renewal_enabled')}</div>
-<div class="card"><b>Emergency policy mode:</b> {_html_escape(snap['emergency_policy']['mode'])}</div>
+<div class="section-title">Fleet &amp; Host</div>
+<div class="kpi-grid">{kpi_fleet}</div>
+<div class="section-title">Network Traffic</div>
+<div class="kpi-grid">{traffic_kpis}</div>
+{chart_block}
+<div class="card-row">
+<div class="card"><b>Network interface:</b> {'<span class="badge badge-ok">configured on ' + _html_escape(net['interface']) + '</span>' if net.get('configured') else '<span class="badge badge-off">not configured</span>'}</div>
+<div class="card"><b>Renewal:</b> write-approved
+<span class="badge {'badge-ok' if renewal.get('write_approved') else 'badge-off'}">{renewal.get('write_approved')}</span>
+&nbsp; auto-renewal
+<span class="badge {'badge-ok' if renewal.get('auto_renewal_enabled') else 'badge-off'}">{renewal.get('auto_renewal_enabled')}</span></div>
+<div class="card"><b>Emergency policy mode:</b> {_html_escape(emp['mode'])}
+&nbsp; <b>Active alerts:</b> <span class="badge {'badge-warn' if n_alerts else 'badge-ok'}">{n_alerts}</span></div>
+</div>
 """
         return WebResponse(body=self._render_page("Overview", body, lang, theme, "overview"))
 
-    def _page_host(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_host(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import control_center_api as api
         host = api.get_host_snapshot()
         ht = api.get_host_time_overview(self.config_dir, self.state_dir)
+        cpu = host.get("cpu") or {}
+        mem = host.get("memory") or {}
+        usage = host.get("usage") or {}
+        uptime = host.get("uptime") or {}
+        load = uptime.get("load_average") or {}
+        mem_total = mem.get("total_mb")
+        mem_avail = mem.get("available_mb")
+        mem_used = (mem_total - mem_avail) if isinstance(mem_total, int) and isinstance(mem_avail, int) else None
+        mem_pct = usage.get("memory_percent")
+        mem_pct = mem_pct if isinstance(mem_pct, (int, float)) else None
+        swap_total = mem.get("swap_total_mb")
+        swap_free = mem.get("swap_free_mb")
+        swap_used = (swap_total - swap_free) if isinstance(swap_total, int) and isinstance(swap_free, int) else None
+
+        def _gauge_class(pct):
+            if pct is None:
+                return "g-ok"
+            return "g-bad" if pct >= 90 else "g-warn" if pct >= 75 else "g-ok"
+
         body = f"""
-<div class="card" id="live-card"><b>Live network reading</b> (auto-refreshes every 2s, local kernel read only -- no Virtualizor API call):
-<div id="live-readout">loading...</div></div>
-<div class="card"><b>Server local time:</b> {_html_escape(ht.get('current_local'))}<br>
-<b>Uptime:</b> {_html_escape(ht.get('uptime_human'))}<br>
-<b>Last boot:</b> {_html_escape(ht.get('boot_time_local'))}<br>
-<b>Boot ID:</b> {_html_escape(ht.get('boot_id'))}</div>
-<div class="card"><b>CPU:</b> {_html_escape(host.get('cpu'))}</div>
-<div class="card"><b>Memory:</b> {_html_escape(host.get('memory'))}</div>
+<div class="card" id="live-card"><b>Live network reading</b> <span class="muted">(auto-refreshes every 2s, local kernel read only -- no Virtualizor API call)</span>
+<div id="live-readout" class="kpi-value" style="margin-top:8px">loading...</div></div>
+<div class="section-title">CPU</div>
+<div class="kpi-grid">
+<div class="kpi"><div class="kpi-label">Model</div><div class="kpi-value" style="font-size:15px">{_html_escape(cpu.get('model'))}</div>
+<div class="kpi-sub">{_html_escape(cpu.get('vendor'))}</div></div>
+<div class="kpi"><div class="kpi-label">Cores / Threads</div>
+<div class="kpi-value">{_html_escape(cpu.get('physical_cores'))} / {_html_escape(cpu.get('logical_cpus'))}</div>
+<div class="kpi-sub">physical cores / logical CPUs</div></div>
+<div class="kpi"><div class="kpi-label">Load average</div>
+<div class="kpi-value">{_html_escape(load.get('1m'))}</div>
+<div class="kpi-sub">1m / 5m / 15m: {_html_escape(load.get('1m'))} / {_html_escape(load.get('5m'))} / {_html_escape(load.get('15m'))}</div></div>
+</div>
+<div class="section-title">Memory</div>
+<div class="kpi-grid">
+<div class="kpi"><div class="kpi-label">RAM used</div>
+<div class="kpi-value">{mem_pct if mem_pct is not None else 'n/a'}{'%' if mem_pct is not None else ''}</div>
+<div class="kpi-sub">{mem_used if mem_used is not None else '?'} MB of {_html_escape(mem_total)} MB</div>
+<div class="gauge {_gauge_class(mem_pct)}"><span style="width:{min(mem_pct, 100) if mem_pct is not None else 0}%"></span></div></div>
+<div class="kpi"><div class="kpi-label">Swap used</div>
+<div class="kpi-value">{swap_used if swap_used is not None else 'n/a'} MB</div>
+<div class="kpi-sub">of {_html_escape(swap_total)} MB total</div></div>
+</div>
+<div class="section-title">Host</div>
+<div class="kpi-grid">
+<div class="kpi"><div class="kpi-label">Uptime</div><div class="kpi-value" style="font-size:16px">{_html_escape(ht.get('uptime_human'))}</div></div>
+<div class="kpi"><div class="kpi-label">Local time</div><div class="kpi-value" style="font-size:15px">{_html_escape(ht.get('current_local'))}</div></div>
+<div class="kpi"><div class="kpi-label">Last boot</div><div class="kpi-value" style="font-size:15px">{_html_escape(ht.get('boot_time_local'))}</div></div>
+</div>
+<div class="section-title">Technical details</div>
+<div class="card muted">Boot ID: {_html_escape(ht.get('boot_id'))} &nbsp; Kernel: {_html_escape(host.get('os', {}).get('kernel'))}
+ &nbsp; Arch: {_html_escape(host.get('os', {}).get('architecture'))}</div>
 <script>
-function fmtBytes(n){{if(n==null)return 'n/a';var u=['B','KB','MB','GB'];var i=0;while(n>=1000&&i<3){{n/=1000;i++;}}return n.toFixed(2)+' '+u[i];}}
 function poll(){{fetch('/api/live').then(r=>r.json()).then(d=>{{
   var el=document.getElementById('live-readout');
   if(!d.configured){{el.textContent='No interface configured.';return;}}
   if(!d.ok){{el.textContent='Interface '+d.interface+': unavailable';return;}}
-  el.textContent='RX: '+fmtBytes(d.rx_bytes)+'  TX: '+fmtBytes(d.tx_bytes)+' (raw kernel counters, interface '+d.interface+')';
+  el.textContent='Download: '+d.download+'  Upload: '+d.upload+'  Combined: '+d.combined+' (interface '+d.interface+')';
 }});}}
 poll(); setInterval(poll, 2000);
 </script>
 """
         return WebResponse(body=self._render_page("Live Host Monitoring", body, lang, theme, "host"))
 
-    def _page_network(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_network(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import control_center_api as api
+        import traffic_format as tf
         net = api.get_network_overview(self.config_dir, self.state_dir)
         if not net.get("configured"):
-            body = '<div class="card">No network interface configured yet.</div>'
+            body = '<div class="empty-state">No network interface configured yet.</div>'
         else:
             cum = net.get("cumulative") or {}
             rate = net.get("persistent_rate_bytes_per_sec")
+            block = tf.format_traffic_block(cum.get("cumulative_rx_bytes"), cum.get("cumulative_tx_bytes"))
+            rate_str = tf.format_bits_per_second(rate) if isinstance(rate, (int, float)) else None
             body = f"""
 <div class="card"><b>Interface:</b> {_html_escape(net['interface'])}</div>
-<div class="card"><b>Persistent Download (RX) Total:</b> {cum.get('cumulative_rx_bytes')}<br>
-<b>Persistent Upload (TX) Total:</b> {cum.get('cumulative_tx_bytes')}<br>
-<span class="muted">Decimal bytes. Kernel counters are separate and never added to these totals.</span></div>
-<div class="card"><b>Persistent sampler rate:</b> {rate if rate else 'unavailable'}</div>
+<div class="section-title">Persistent Total (since monitoring started)</div>
+<div class="kpi-grid">
+<div class="kpi"><div class="kpi-label">Download (RX)</div><div class="kpi-value">{block['download']}</div></div>
+<div class="kpi"><div class="kpi-label">Upload (TX)</div><div class="kpi-value">{block['upload']}</div></div>
+<div class="kpi kpi-info"><div class="kpi-label">Combined</div><div class="kpi-value">{block['combined']}</div></div>
+</div>
+<div class="card muted">Decimal (SI) bytes. Raw kernel counters are tracked separately and never added into
+this persistent total (that would double-count across counter resets/reboots).</div>
+"""
+            if rate_str:
+                body += f"""
+<div class="section-title">Current sampler rate</div>
+<div class="kpi-grid"><div class="kpi"><div class="kpi-label">Combined rate</div><div class="kpi-value">{rate_str}</div></div></div>
 """
         return WebResponse(body=self._render_page("Network Traffic", body, lang, theme, "network"))
 
-    def _page_traffic(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_traffic(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import control_center_api as api
+        import traffic_format as tf
+        import charts
         net = api.get_network_overview(self.config_dir, self.state_dir)
         if not net.get("configured"):
-            body = '<div class="card">No network interface configured yet.</div>'
+            body = '<div class="empty-state">No network interface configured yet.</div>'
         else:
+            query = query or {}
+            range_choice = (query.get("range", ["7d"])[0] if isinstance(query.get("range"), list)
+                             else query.get("range", "7d")) or "7d"
+            range_choice = range_choice if range_choice in ("7d", "30d") else "7d"
+            series = net.get("daily_series_30d" if range_choice == "30d" else "daily_series_7d", [])
+            chart_svg = charts.render_daily_bar_chart(series, width=760, height=230,
+                                                        title="Daily download/upload")
+            range_toggle = "".join(
+                f'<a href="/traffic?range={r}" class="badge {"badge-ok" if r == range_choice else "badge-off"}" '
+                f'style="margin-right:6px;text-decoration:none">{label}</a>'
+                for r, label in (("7d", "Last 7 days"), ("30d", "Last 30 days"))
+            )
             bundle = net.get("traffic_analytics", {})
+            period_labels = [
+                ("today", "Today"), ("yesterday", "Yesterday"), ("current_week", "This week"),
+                ("last_7_days", "Last 7 days"), ("current_gregorian_month", "This month (Gregorian)"),
+                ("current_jalali_month", "This month (Jalali)"), ("all_time", "All time"),
+            ]
+            badge_class = {"FULL": "badge-ok", "PARTIAL_COVERAGE": "badge-warn"}
+            badge_text = {"FULL": "full coverage", "PARTIAL_COVERAGE": "partial",
+                          "NO_DATA": "no data"}
             rows = ""
-            for key in ("today", "yesterday", "current_week", "last_7_days",
-                        "current_gregorian_month", "current_jalali_month", "all_time"):
+            for key, label in period_labels:
                 p = bundle.get(key)
                 if not p:
                     continue
                 status = p.get("coverage_status", "")
-                combined = p.get("combined_bytes")
-                rows += (f"<tr><td>{_html_escape(key)}</td><td>{combined}</td>"
-                         f"<td>{_html_escape(status)}</td></tr>")
-            body = f'<div class="card"><table><tr><th>Period</th><th>Combined bytes</th>' \
-                   f'<th>Coverage</th></tr>{rows}</table></div>'
+                block = tf.format_traffic_block(p.get("rx_bytes"), p.get("tx_bytes"))
+                rows += (f"<tr><td>{_html_escape(label)}</td>"
+                         f"<td class='num'>{block['download']}</td>"
+                         f"<td class='num'>{block['upload']}</td>"
+                         f"<td class='num'><b>{block['combined']}</b></td>"
+                         f"<td><span class='badge {badge_class.get(status, 'badge-off')}'>"
+                         f"{badge_text.get(status, status.lower() if status else 'n/a')}</span></td></tr>")
+            body = (f'<div class="card muted">Interface: {_html_escape(net["interface"])}. '
+                    f'Historical samples are real measured data -- missing or partial periods are shown honestly, '
+                    f'never implied as continuous coverage.</div>'
+                    f'<div class="section-title">Daily history &nbsp; {range_toggle}</div>'
+                    f'<div class="card chart-wrap">{chart_svg}</div>'
+                    f'<div class="section-title">Standard periods</div>'
+                    f'<div class="table-wrap"><table><tr><th>Period</th><th>Download</th><th>Upload</th>'
+                    f'<th>Combined</th><th>Coverage</th></tr>'
+                    f'{rows or "<tr><td colspan=5>No samples yet.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Traffic Analytics", body, lang, theme, "traffic"))
 
-    def _page_inventory(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_inventory(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import control_center_api as api
+        from decimal import Decimal
         overview = api.get_vps_inventory_overview(self.state_dir)
         records = overview["records"]
+        fleet = overview["fleet"]
+        status_badge = {"running": "badge-ok", "stopped": "badge-off", "suspended": "badge-bad"}
+
+        def _is_unlimited(q):
+            try:
+                return Decimal(str(q)) <= 0
+            except Exception:
+                return False
+
         rows = ""
         for r in records[:200]:
+            status = r.get("runtime_status") or "unknown"
+            quota = r.get("quota_gb")
+            used = r.get("used_gb")
+            unlimited = _is_unlimited(quota)
+            if unlimited:
+                limit_cell, pct_cell = '<span class="badge badge-info">unlimited</span>', '<span class="muted">n/a</span>'
+            else:
+                try:
+                    limit_cell = f"{Decimal(str(quota)):.2f} GB"
+                except Exception:
+                    limit_cell = "unavailable"
+                try:
+                    pct = float(Decimal(str(used)) / Decimal(str(quota)) * 100) if quota and used not in (None, "unavailable") else None
+                except Exception:
+                    pct = None
+                if pct is None:
+                    pct_cell = '<span class="muted">unavailable</span>'
+                else:
+                    gclass = "g-bad" if pct >= 90 else "g-warn" if pct >= 75 else "g-ok"
+                    pct_cell = (f'<div class="gauge-label"><span>{pct:.1f}%</span></div>'
+                                f'<div class="gauge {gclass}"><span style="width:{min(pct,100):.1f}%"></span></div>')
+            try:
+                used_cell = f"{Decimal(str(used)):.2f} GB"
+            except Exception:
+                used_cell = "unavailable"
             rows += (f'<tr><td><a href="/vps/{r["vpsid"]}">{r["vpsid"]}</a></td>'
                       f'<td>{_html_escape(r.get("hostname"))}</td>'
-                      f'<td>{_html_escape(r.get("runtime_status"))}</td>'
-                      f'<td>{_html_escape(r.get("quota_gb"))}</td>'
-                      f'<td>{_html_escape(r.get("used_gb"))}</td></tr>')
-        body = (f'<div class="card">Coverage: {overview["fleet"]["total_vps"]} VPS'
-                f'<table><tr><th>ID</th><th>Host</th><th>Status</th><th>Quota</th><th>Used</th></tr>'
-                f'{rows or "<tr><td colspan=5>No inventory synced yet.</td></tr>"}</table></div>')
+                      f'<td>{_html_escape(r.get("ip_primary"))}</td>'
+                      f'<td><span class="badge {status_badge.get(status, "badge-off")}">{_html_escape(status)}</span></td>'
+                      f'<td class="num">{used_cell}</td>'
+                      f'<td class="num">{limit_cell}</td>'
+                      f'<td style="min-width:110px">{pct_cell}</td></tr>')
+        body = (f'<div class="card">Fleet: {fleet["total_vps"]} VPS total &nbsp; '
+                f'<span class="badge badge-ok">{fleet.get("running_count", 0)} running</span> &nbsp; '
+                f'<span class="badge badge-off">{fleet.get("stopped_count", 0)} stopped</span> &nbsp; '
+                f'<span class="badge badge-bad">{fleet.get("suspended_count", 0)} suspended</span></div>'
+                f'<div class="table-wrap"><table><tr><th>VPS ID</th><th>Name</th><th>IP</th><th>Status</th>'
+                f'<th>Used</th><th>Limit</th><th>Usage %</th></tr>'
+                f'{rows or "<tr><td colspan=7>No inventory synced yet.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("VPS Inventory", body, lang, theme, "inventory"))
 
     def _page_vps_detail(self, user, vpsid_raw, lang, theme) -> WebResponse:
@@ -460,7 +771,7 @@ poll(); setInterval(poll, 2000);
             body = f'<div class="card"><table>{rows}</table></div>'
         return WebResponse(body=self._render_page(f"VPS {vpsid_raw}", body, lang, theme, "inventory"))
 
-    def _page_renewals(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_renewals(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import control_center_api as api
         overview = api.get_renewal_overview(self.config_dir, self.state_dir)
         rows = ""
@@ -478,7 +789,7 @@ poll(); setInterval(poll, 2000);
 """
         return WebResponse(body=self._render_page("Renewal Operations", body, lang, theme, "renewals"))
 
-    def _page_emergency(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_emergency(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import emergency_policy as emp
         import control_center_api as api
         message = ""
@@ -518,7 +829,7 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
 """
         return WebResponse(body=self._render_page("Emergency Bandwidth", body, lang, theme, "emergency"))
 
-    def _page_review(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_review(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import emergency_policy as emp
         message = ""
         conn = emp.open_db(os.path.join(self.state_dir, "emergency_policy.sqlite3"))
@@ -560,7 +871,7 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
                 f'{rows or "<tr><td colspan=5>No pending reviews.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Manual Review", body, lang, theme, "review"))
 
-    def _page_alerts(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_alerts(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import control_center_api as api
         overview = api.get_emergency_policy_overview(self.config_dir, self.state_dir)
         rows = "".join(f'<tr><td>review</td><td>{r["vpsid"]}</td><td>{_html_escape(r["reason"])}</td></tr>'
@@ -571,7 +882,7 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
                 f'{rows or "<tr><td colspan=3>No active alerts.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Alerts", body, lang, theme, "alerts"))
 
-    def _page_reports(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_reports(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import reports as reports_mod
         import telegram_config as tc
         message = ""
@@ -609,7 +920,7 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
 """
         return WebResponse(body=self._render_page("Reports", body, lang, theme, "reports"))
 
-    def _page_telegram(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_telegram(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import telegram_config as tc
         settings = tc.load_telegram_settings(self.config_dir)
         secrets_configured = os.path.exists(tc.default_secrets_path(self.config_dir))
@@ -625,7 +936,7 @@ Grants-approved marker present: {overview['emergency_grants_approved']}<br>
     def _backup_root(self) -> str:
         return os.path.join(os.path.dirname(self.state_dir), "backups")
 
-    def _page_backups(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_backups(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import backup as backup_mod
         message = ""
         backup_root = self._backup_root()
@@ -666,7 +977,7 @@ overwrites live data automatically.</p>
 """
         return WebResponse(body=self._render_page("Backups", body, lang, theme, "backups"))
 
-    def _page_settings(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_settings(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import menu as menu_mod
         import host_time as ht_mod
         message = ""
@@ -700,7 +1011,7 @@ overwrites live data automatically.</p>
         body = f'<div class="card">{message}{admin_form}</div>'
         return WebResponse(body=self._render_page("System Settings", body, lang, theme, "settings"))
 
-    def _page_users(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_users(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import web_auth as wa
         message = ""
         if method == "POST":
@@ -760,7 +1071,7 @@ overwrites live data automatically.</p>
                 f'<th></th></tr>{rows}</table>{create_form}</div>')
         return WebResponse(body=self._render_page("User Management", body, lang, theme, "users"))
 
-    def _page_audit(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_audit(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import audit_log
         conn = audit_log.open_db(self._audit_db_path())
         try:
@@ -774,7 +1085,7 @@ overwrites live data automatically.</p>
                 f'{rows or "<tr><td colspan=4>No events recorded yet.</td></tr>"}</table></div>')
         return WebResponse(body=self._render_page("Audit Logs", body, lang, theme, "audit"))
 
-    def _page_health(self, user, method, form, token, remote_addr, lang, theme) -> WebResponse:
+    def _page_health(self, user, method, form, token, remote_addr, lang, theme, query=None) -> WebResponse:
         import menu as menu_mod
         timers = menu_mod.collect_timer_status()
         rows = ""

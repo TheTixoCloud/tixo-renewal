@@ -81,6 +81,8 @@ def get_network_overview(config_dir: str, state_dir: str, tz_name: str = None) -
         persistent_rate = hostnet.compute_live_throughput(conn, interface)
         recent = hostnet.get_recent_samples(conn, interface, limit=1)
         analytics_bundle = traffic_analytics.all_periods(conn, interface, tz_name=tz_name)
+        daily_7 = traffic_analytics.daily_series(conn, interface, 7, tz_name=tz_name)
+        daily_30 = traffic_analytics.daily_series(conn, interface, 30, tz_name=tz_name)
     finally:
         conn.close()
 
@@ -92,6 +94,8 @@ def get_network_overview(config_dir: str, state_dir: str, tz_name: str = None) -
         "persistent_rate_bytes_per_sec": persistent_rate,
         "latest_sample": recent[-1] if recent else None,
         "traffic_analytics": analytics_bundle,
+        "daily_series_7d": daily_7,
+        "daily_series_30d": daily_30,
     }
 
 

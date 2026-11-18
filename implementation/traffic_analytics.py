@@ -280,6 +280,35 @@ def custom_range(conn, interface: str, start_local: datetime, end_local: datetim
                                  end_utc.isoformat(), complete=complete)
 
 
+def daily_series(conn, interface: str, days: int, tz_name: str = DEFAULT_TIMEZONE,
+                  now: datetime = None) -> list[dict]:
+    """Buckets hostnet samples into `days` consecutive LOCAL calendar days (in `tz_name`,
+    matching every other period boundary in this module -- never a second, independently
+    defined day-boundary rule), oldest first, ending with today. Used for chart rendering
+    (v1.9.0) -- each entry reports rx_bytes/tx_bytes/combined_bytes plus whether ANY sample
+    in that day was a discontinuity-affected/partial read, so a chart can mark that day's bar
+    honestly instead of implying a clean, fully-sampled total."""
+    tz = ZoneInfo(tz_name)
+    local_now = _now_local(tz_name, now)
+    local_today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    out = []
+    for offset in range(days - 1, -1, -1):
+        day_start = local_today_start - timedelta(days=offset)
+        day_end = day_start + timedelta(days=1)
+        samples = hostnet.get_samples_in_range(conn, interface, _to_utc_iso(day_start, tz),
+                                                _to_utc_iso(day_end, tz))
+        totals = hostnet.sum_deltas(samples)
+        out.append({
+            "date": day_start.date().isoformat(),
+            "rx_bytes": totals["rx_bytes"],
+            "tx_bytes": totals["tx_bytes"],
+            "combined_bytes": totals["combined_bytes"],
+            "sample_count": totals["sample_count"],
+            "partial": totals["partial"] or totals["sample_count"] == 0,
+        })
+    return out
+
+
 def all_periods(conn, interface: str, tz_name: str = DEFAULT_TIMEZONE, now: datetime = None) -> dict:
     """Convenience bundle of every standard period, keyed by label -- what a dashboard/report
     widget wants in one call, bounded to a fixed, small number of range-queries (never an
