@@ -29,6 +29,10 @@ from dataclasses import dataclass, field
 from http import cookies as http_cookies
 
 SESSION_COOKIE_NAME = "tixo_session"
+# Caps every request body BEFORE reading it into memory -- this UI's own forms never
+# approach this size; protects a busy hypervisor from a request claiming an enormous
+# Content-Length, authenticated or not.
+MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 THEME_COOKIE_NAME = "tixo_theme"
 LANG_COOKIE_NAME = "tixo_lang"
 
@@ -111,9 +115,13 @@ def _html_escape(text) -> str:
 class WebApp:
     """The pure, socket-free core -- see module docstring."""
 
-    def __init__(self, config_dir: str, state_dir: str):
+    def __init__(self, config_dir: str, state_dir: str, tls_enabled: bool = False):
         self.config_dir = config_dir
         self.state_dir = state_dir
+        # When true, the session cookie is marked Secure (never sent over a future
+        # plaintext connection) -- set by build_server() when a real TLS cert/key pair is
+        # configured. Defaults to False so plain-HTTP/test usage is unaffected.
+        self.tls_enabled = tls_enabled
 
     # ---------- shared plumbing -----------------------------------------------------------
 
@@ -288,6 +296,8 @@ class WebApp:
         cookie[SESSION_COOKIE_NAME] = token
         cookie[SESSION_COOKIE_NAME]["path"] = "/"
         cookie[SESSION_COOKIE_NAME]["httponly"] = True
+        if self.tls_enabled:
+            cookie[SESSION_COOKIE_NAME]["secure"] = True
         return self._redirect("/", {"Set-Cookie": cookie[SESSION_COOKIE_NAME].OutputString()})
 
     def _handle_logout(self, method, cookies) -> WebResponse:
@@ -794,6 +804,11 @@ def _build_handler_class(app: "WebApp"):
 
         def _dispatch(self, method: str):
             length = int(self.headers.get("Content-Length", 0) or 0)
+            if length > MAX_REQUEST_BODY_BYTES:
+                self.send_response(413)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             body = self.rfile.read(length) if length else b""
             cookies = self._parse_cookies()
             remote_addr = self.client_address[0] if self.client_address else "unknown"
@@ -844,7 +859,7 @@ def build_server(config_dir: str, state_dir: str, host: str, port: int,
         daemon_threads = True
         allow_reuse_address = True
 
-    app = WebApp(config_dir, state_dir)
+    app = WebApp(config_dir, state_dir, tls_enabled=bool(tls_cert_path and tls_key_path))
     handler_cls = _build_handler_class(app)
     server = ThreadingHTTPServer((host, port), handler_cls)
 

@@ -247,3 +247,25 @@ def test_cmd_relay_worker_run_starts_and_stops_with_max_iterations(tmp_path, cap
     assert rc == 0
     assert "Starting relay worker" in out
     assert "stopped" in out.lower()
+
+
+def test_real_server_rejects_oversized_request_body(tmp_path):
+    import http.client
+
+    nonce_db = str(tmp_path / "nonces.sqlite3")
+    server, thread = rw.run_server_in_thread(BOT_TOKEN, SHARED_SECRET, nonce_db,
+                                               "127.0.0.1", 0)
+    try:
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        oversized_body = "x" * (rw.MAX_REQUEST_BODY_BYTES + 1)
+        conn.putrequest("POST", "/submit")
+        conn.putheader("Content-Length", str(len(oversized_body)))
+        conn.endheaders()
+        conn.send(oversized_body[:1024].encode())
+        resp = conn.getresponse()
+        assert resp.status == 413
+        conn.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)

@@ -63,6 +63,50 @@ def test_login_success_sets_cookie_and_redirects(tmp_path):
     assert r.status == 200
 
 
+def test_login_cookie_not_secure_when_tls_disabled(tmp_path):
+    app, _, _ = _app_with_admin(tmp_path)
+    body = b"username=admin&password=pw123456"
+    r = app.handle_request("POST", "/login", {}, {}, body, "127.0.0.1")
+    assert "Secure" not in r.headers["Set-Cookie"]
+
+
+def test_login_cookie_is_secure_when_tls_enabled(tmp_path):
+    config_dir, state_dir = _dirs(tmp_path)
+    wa.create_user(config_dir, "admin", "pw123456", role=wa.ROLE_ADMIN)
+    app = ws.WebApp(config_dir, state_dir, tls_enabled=True)
+    body = b"username=admin&password=pw123456"
+    r = app.handle_request("POST", "/login", {}, {}, body, "127.0.0.1")
+    assert "Secure" in r.headers["Set-Cookie"]
+
+
+def test_real_tls_server_marks_login_cookie_secure(tmp_path):
+    import http.client
+    import ssl
+
+    cert_path, key_path = _generate_self_signed_cert(tmp_path)
+    config_dir, state_dir = _dirs(tmp_path)
+    wa.create_user(config_dir, "admin", "pw123456", role=wa.ROLE_ADMIN)
+    server, thread = ws.run_server_in_thread(config_dir, state_dir, "127.0.0.1", 0,
+                                               tls_cert_path=cert_path, tls_key_path=key_path)
+    try:
+        port = server.server_address[1]
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE  # self-signed test cert -- not a trust assertion
+        conn = http.client.HTTPSConnection("127.0.0.1", port, context=ctx, timeout=5)
+        conn.request("POST", "/login", body="username=admin&password=pw123456",
+                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        resp = conn.getresponse()
+        resp.read()
+        cookie_header = resp.getheader("Set-Cookie")
+        conn.close()
+        assert cookie_header is not None
+        assert "Secure" in cookie_header
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
 def test_login_wrong_password_returns_401_no_cookie(tmp_path):
     app, _, _ = _app_with_admin(tmp_path)
     body = b"username=admin&password=WRONG"
@@ -496,6 +540,31 @@ def test_real_tls_server_end_to_end_over_a_real_socket(tmp_path):
         ctx.verify_mode = ssl.CERT_NONE  # self-signed test cert -- not a trust assertion
         resp = urllib.request.urlopen(f"https://127.0.0.1:{port}/login", context=ctx, timeout=5)
         assert resp.status == 200
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_real_server_rejects_oversized_request_body(tmp_path):
+    import http.client
+
+    config_dir, state_dir = _dirs(tmp_path)
+    wa.create_user(config_dir, "admin", "pw123456", role=wa.ROLE_ADMIN)
+    server, thread = ws.run_server_in_thread(config_dir, state_dir, "127.0.0.1", 0)
+    try:
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        oversized_body = "x" * (ws.MAX_REQUEST_BODY_BYTES + 1)
+        conn.putrequest("POST", "/login")
+        conn.putheader("Content-Length", str(len(oversized_body)))
+        conn.endheaders()
+        # Send only a small prefix -- a real attacker claiming a huge Content-Length never
+        # has to actually transmit that much data for this to be a resource-exhaustion
+        # concern if the server naively pre-allocates/reads based on the header alone.
+        conn.send(oversized_body[:1024].encode())
+        resp = conn.getresponse()
+        assert resp.status == 413
+        conn.close()
     finally:
         server.shutdown()
         thread.join(timeout=5)

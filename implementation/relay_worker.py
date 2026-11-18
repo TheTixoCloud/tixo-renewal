@@ -103,11 +103,19 @@ class RelayWorkerApp:
         return 200, json.dumps(signed_result).encode("utf-8")
 
 
+MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024  # envelopes are small signed JSON, never this large
+
+
 def _build_handler_class(app: RelayWorkerApp):
     class RelayWorkerHandler(http.server.BaseHTTPRequestHandler):
         def _dispatch(self, method):
             try:
                 length = int(self.headers.get("Content-Length", 0))
+                if length > MAX_REQUEST_BODY_BYTES:
+                    self.send_response(413)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 body = self.rfile.read(length) if length else b""
                 status, resp_body = app.handle_request(method, self.path, body)
             except Exception as e:  # noqa: BLE001 -- never let one bad request crash the worker

@@ -292,3 +292,25 @@ def test_menu_items_includes_remote_agent_config():
     import menu
     labels = [label for label, _ in menu.MENU_ITEMS]
     assert "Configure Remote Agent (optional, read-only)" in labels
+
+
+def test_real_server_rejects_oversized_request_body(tmp_path):
+    import http.client
+
+    config_dir, state_dir = _dirs(tmp_path)
+    server, thread = ags.run_server_in_thread(config_dir, state_dir, SHARED_SECRET,
+                                                str(tmp_path / "nonces.sqlite3"), "127.0.0.1", 0)
+    try:
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        oversized_body = "x" * (ags.MAX_REQUEST_BODY_BYTES + 1)
+        conn.putrequest("POST", "/query")
+        conn.putheader("Content-Length", str(len(oversized_body)))
+        conn.endheaders()
+        conn.send(oversized_body[:1024].encode())
+        resp = conn.getresponse()
+        assert resp.status == 413
+        conn.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
