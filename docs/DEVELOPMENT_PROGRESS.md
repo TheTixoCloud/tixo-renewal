@@ -514,11 +514,93 @@ mentioning the core monitor timer.
   in-place logic beyond what the already-idempotent `cmd_install`/`write_default_config`
   provide. See "Exact next steps" below for the real remaining scope.
 
+### 15-16. Backup scheduling, encryption-gated Telegram delivery — DONE
+- **`backup_config.py`** (new): `BackupScheduleSettings` (disabled by default;
+  `interval_hours`/`retention_keep`/`encrypt`/`telegram_delivery_enabled` --
+  `telegram_delivery_enabled=True` is REJECTED unless `encrypt=True`, enforced in
+  `__post_init__`, never just a convention). The unattended timer's GPG passphrase is
+  stored at rest with the same 0600-enforced discipline as every other secret in this
+  project -- an explicit, documented tradeoff (root-equivalent access either way).
+- **`telegram_transport.py`**: `DirectTransport.send_document()` -- a hand-built
+  multipart/form-data encoder (stdlib has no multipart support) that checks the file size
+  BEFORE reading it into memory and refuses anything over `max_size_bytes` (Telegram's own
+  real 50MB bot-upload limit by default). `Socks5Transport`/`RelayClientTransport` raise a
+  clear `NotImplementedError` for `send_document` rather than silently mis-delivering --
+  multipart over the from-scratch SOCKS5 raw-HTTP path and embedding binary in a
+  HMAC-signed relay envelope were both judged not worth the added risk surface.
+- **`backup.py`**: `send_backup_to_telegram()` refuses a non-`.gpg` archive by default
+  (`require_encrypted=True`), enforces the size cap, and refuses outright if the transport
+  doesn't support `send_document` at all -- one admin's delivery failure never blocks
+  delivery to the others.
+- **`renewal_cli.py backup-scheduled-run`**: the timer's actual entry point -- reads
+  `BackupScheduleSettings`/the stored passphrase (never an env var, since a timer has no
+  interactive terminal), refuses to run unless explicitly enabled, records every outcome
+  (including a skipped/blocked Telegram delivery) to the audit log.
+- **`write_backup_systemd_unit()`**: deliberately a SEPARATE function from the shared
+  `write_systemd_units()` so reconfiguring the backup interval can never reset another
+  timer's already-customized interval -- a regression class this project has hit before
+  with shared generator functions.
+- **Menu:** "Configure Backup Schedule" screen.
+- **Tests:** `tests/test_backup_config.py` (11) + 17 new in `tests/test_backup_archive.py`
+  (multipart send/size-limit/transport-capability/multi-admin-failure-isolation,
+  `backup-scheduled-run` blocked/unencrypted/encrypted/audit/delivery-skip cases) + 7 in
+  `tests/test_telegram_transport.py`.
+
+### 17. Unified installer core — DONE (detect/upgrade/repair/rollback/health-check)
+**`installer.py`** (new) -- shared by both the interactive menu wizard and noninteractive
+CLI, so there is exactly one implementation of each operation:
+- `detect_installation_state()` -- read-only; fresh vs. existing (via `nodes.json`/
+  `policy.json`/any `.sqlite3` presence).
+- `check_port_available()` -- a real bind-and-close probe, never a guess.
+- `validate_https_prerequisites()` -- cert/key existence, THAT THEY LOAD TOGETHER (catches
+  a mismatched pair before a confusing runtime failure), and port-free check. No network
+  calls (no DNS, no CA validation) -- a local readiness check, not a trust assertion.
+- `request_automatic_certificate()` -- checks certbot presence + port 80 availability;
+  **never invoked automatically by anything in this codebase** -- only attempts issuance
+  (via an injectable `run_fn`, so tests never shell out for real) when a caller explicitly
+  calls it after an operator's explicit confirmation. Never opens a firewall port itself --
+  only checks whether port 80 is already free.
+- `backup_before_change()`/`rollback()` -- every upgrade/repair backs up FIRST; rollback
+  integrity-verifies the source archive, safety-copies the CURRENT state before overwriting
+  anything (mirrors `backup.restore_db`'s existing `.pre-restore` discipline), and reports
+  exactly what was restored.
+- `upgrade()`/`repair()` -- idempotent and config-preserving: re-runs the same
+  directory/default-config/schema/systemd-unit generation `cmd_install` already does (all
+  of it already idempotent), NEVER overwrites an existing `nodes.json`/`policy.json`.
+  `repair()` additionally re-tightens any 0600 secret file whose permissions were loosened
+  (chmod only ever tightens, never widens).
+- `health_check()` -- read-only post-change sanity check (nodes/policy/optional-module
+  settings all load without error); never restarts or enables anything.
+- **CLI:** `install-detect`/`install-upgrade`/`install-repair`/`install-rollback
+  --backup-file F --yes`/`install-health-check`.
+- **Menu:** "Install / Initial Setup" now detects fresh vs. existing and offers
+  upgrade/repair (with an automatic post-change health check) instead of blindly re-running
+  a fresh install every time; the Web Control Center config screen gained domain/HTTPS
+  prompts wired to `validate_https_prerequisites()` and a port-conflict warning.
+- **`web_server.py`**: `build_server()`/`run_server_in_thread()` now wrap the listening
+  socket with a REAL `ssl.SSLContext` when both `tls_cert_path`/`tls_key_path` are given
+  (manual certificate paths only -- this module never requests a certificate itself).
+  Raises `TlsCertificateError` (never silently falls back to plain HTTP) on a bad/missing
+  cert pair. Verified by a real end-to-end test over an actual TLS socket with a
+  self-signed test certificate.
+- **Tests:** `tests/test_installer.py` (29) + 5 new in `tests/test_web_server.py` (TLS
+  wrap/reject-cert-without-key/reject-unreadable-cert/real-TLS-socket-end-to-end/
+  `cmd_web_run`-blocked-on-bad-cert).
+
+### 18. Safe per-module uninstall — DONE
+`installer.uninstall_optional_module()` disables exactly ONE optional module
+(telegram/web/relay_worker/agent/backup_schedule) -- sets its `enabled=False`, optionally
+purges its stored secret ONLY if `--purge-secrets` is explicitly passed (kept by default so
+re-enabling doesn't require re-entering credentials), and removes that module's generated-
+but-never-installed systemd unit file(s). Verified to never touch the core renewal
+install, any other module, or historical data. Wired as `renewal_cli.py uninstall-module
+--module X [--purge-secrets]`. **Tests:** 9 new in `tests/test_installer.py`.
+
 ### Combined test count
-- **Total: 1091 passing** (verified by running the full suite), up from 1088 after the
-  remote agent milestone, 1057 after the relay worker milestone, 1032 after the backup
-  milestone, 1012 after the Web Control Center milestone, and 923 at the start of this
-  sprint.
+- **Total: 1170 passing** (verified by running the full suite), up from 1091 after the
+  installer systemd-unit-generation milestone, 1088 after the remote agent milestone, 1057
+  after the relay worker milestone, 1032 after the backup milestone, 1012 after the Web
+  Control Center milestone, and 923 at the start of the prior sprint.
 
 ---
 
@@ -526,26 +608,34 @@ mentioning the core monitor timer.
 
 These are honestly reported as **not implemented**, not "mostly done" or "mocked":
 
-- **A real cross-host validation of the relay worker AND the remote agent.** Both now exist
-  and are fully tested locally (see sections 12-13 above), but each has only been run
-  against a simulated second host on localhost in this session -- no real second VPS was
-  available. This is the single most important remaining validation step before either
-  feature can be considered production-ready.
+- **A real cross-host validation of the relay worker AND the remote agent.** Both exist and
+  are fully tested locally, but each has only been run against a SIMULATED second host on
+  localhost -- no real second VPS was available this session. **This is simulated, not
+  real two-server validation, and must not be represented otherwise.** This remains the
+  single most important remaining validation step before either feature is production-ready.
 - **A real multi-host "management server" program.** The remote agent's protocol and
   management-server-side client (`agent_server.query_agent()`) exist and are tested, but
-  there is no actual aggregating dashboard/program that polls multiple enrolled agents --
-  that would most naturally extend `web_server.py`'s page patterns to a multi-host view.
-- **Secure Telegram delivery of backup archives.** `backup-full` and the Web `/backups` page
-  create/verify/encrypt/retain archives, but nothing yet sends one through the Telegram bot
-  transport. Explicitly listed in the mission's backup section but not started this pass —
-  next step would be a size-capped, admin-only, encrypted-only (never plaintext) send path
-  reusing `telegram_bot.build_transport` the same way `/reports` already does.
-- **Web dashboard TLS/certificate handling, reverse-proxy guidance.** Not started.
-- **Unified installer (interactive + noninteractive, module install/upgrade/repair/
-  reconfigure/disable/uninstall for Web/Telegram/remote-agent).** Not started — the existing
-  `deploy/install.sh`/`deploy/bootstrap.sh` continue to work exactly as before (regression-
-  tested); no new installer surface was added since there is nothing optional yet to install
-  beyond what the menu's "Configure..." screens already cover.
+  there is no actual aggregating dashboard/program that polls multiple enrolled agents.
+- **Automatic certificate provisioning has never actually been run.**
+  `request_automatic_certificate()` is implemented and unit-tested with an injected
+  `run_fn` (so no real `certbot` subprocess has ever executed in this project's history),
+  since there is no real public domain/DNS record available to test against safely. The
+  manual-certificate-path flow (`validate_https_prerequisites()` + TLS wrapping in
+  `web_server.py`) IS exercised against a real, if self-signed, certificate and a real TLS
+  socket.
+- **No interactive confirmation gate wired between the installer wizard and
+  `request_automatic_certificate()` yet** -- the function exists and is safe to call
+  (it never acts without an explicit call), but the menu's Web config screen only offers
+  the manual-certificate-path flow today; wiring an "attempt automatic issuance" option
+  into that same screen is the most natural next step for this feature.
+- **No domain/subdomain or HTTPS configuration exists for the Telegram bot, relay worker,
+  or remote agent** -- only the Web Control Center gained this. The relay worker and
+  remote agent both still speak plain HTTP (HMAC-authenticated, not confidential) and
+  document that an operator must front them with a reverse proxy/VPN for real transport
+  encryption if exposed beyond localhost.
+- **No reverse-proxy guidance page/document.** Operators choosing a reverse proxy in front
+  of the Web Control Center (instead of this module's own TLS wrapping) are not given
+  worked nginx/Caddy examples anywhere in this repository yet.
 
 ---
 
@@ -576,21 +666,22 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
    checked per polling-loop iteration, no new timer).
 4. ~~Web dashboard (all pages, auth, CSRF, RBAC, audit, live monitoring)...~~ **DONE**
    (see section 10 above).
-5. ~~Secure backup functionality (archive, retention, encryption, verified restore)...~~
-   **DONE** (see section 11 above). **Still open:** no scheduling/timer for `backup-full`
-   yet (manual/CLI-only trigger), and secure Telegram delivery of backup archives is not
-   wired up — this is the current next step for this feature area.
+5. ~~Secure backup functionality (archive, retention, encryption, verified restore,
+   scheduling, encrypted Telegram delivery)...~~ **DONE** (see sections 11 and 15-16
+   above). Nothing left open in this item's original scope.
 6. ~~The relay worker process...~~ **DONE, locally simulated** (see section 12 above).
    **Still open:** a real end-to-end two-host validation (needs a second host) has not been
-   performed. This is now the single highest-priority remaining validation gap.
+   performed. This remains the single highest-priority remaining validation gap, shared
+   with item 7 below.
 7. ~~Remote management/agent mode...~~ **DONE as a read-only MVP, locally simulated** (see
    section 13 above). **Still open:** a real cross-host validation, and a real multi-host
    aggregating management-server program (only the protocol + client helper exist so far).
-8. ~~Installer systemd-unit coverage for every optional module...~~ **DONE** (see section 14
-   above). **Still genuinely open, the real remaining scope of this item:** no interactive
-   mode-selection flow, no domain/HTTPS/cert setup, no install-time timezone/Jalali-calendar
-   prompt, no explicit repair/upgrade-in-place command distinct from the already-idempotent
-   `install`.
+8. ~~Unified installer (detect/upgrade/repair/rollback/health-check, domain/HTTPS with
+   manual cert paths and real TLS, per-module uninstall)...~~ **DONE** (see sections 14,
+   17, and 18 above). **Still genuinely open:** automatic certificate provisioning exists
+   but has never actually been exercised against a real domain (only unit-tested via
+   dependency injection); no interactive confirmation gate wires it into the menu yet; no
+   domain/HTTPS exists for anything other than the Web Control Center.
 
 ## Known limitations of what WAS built
 
@@ -607,3 +698,123 @@ reviewable slice (possibly just these two features) is ready to ship as its own 
 - No migration path was needed for either feature (both use their own new SQLite files), so
   there is nothing to test for upgrade-from-v1.7.3 compatibility beyond the standard
   `CREATE TABLE IF NOT EXISTS` idempotency already exercised by the test suite.
+
+---
+
+## Release-readiness checklist (as of this checkpoint)
+
+### Fully implemented and tested
+- Core renewal engine, multi-node support, policy/carryover, emergency-grant policy with
+  manual-review queue, inventory sync, host network accounting, traffic analytics,
+  Jalali/Gregorian calendar + timezone display (v1.7.3 baseline + prior sprints).
+- Telegram bot: DIRECT and SOCKS5 connectivity modes, command dispatch, authorization,
+  rate limiting, scheduled reports.
+- Web Control Center: all 16 pages with real data, session auth, CSRF, RBAC, audit
+  logging, localization (en/fa, RTL), dark/light theme, live host monitoring with zero
+  extra Virtualizor API load, real TLS (manual certificate paths).
+- Backup: full-archive creation (all known databases + allowlisted non-secret config,
+  secrets provably excluded), integrity verification, retention, GPG encryption,
+  staging-only verified restore, scheduling via an optional systemd timer, encrypted-only
+  Telegram delivery with a size cap and per-admin failure isolation.
+- Unified installer core: fresh-install detection, config-preserving upgrade, repair
+  (including re-tightening loosened secret permissions), explicit rollback with a
+  pre-rollback safety copy, read-only post-change health check, per-module safe uninstall.
+- Relay worker protocol and remote-agent protocol: both fully implemented and tested
+  against a real local HTTP server over a genuine socket.
+
+### Partially implemented
+- **RELAY connectivity mode and the remote management agent**: both complete
+  implementations, but validated ONLY against a simulated second host on localhost in
+  this environment -- **never against two genuinely separate machines**. Treat as
+  "implementation complete, cross-host-validation pending," not "production-ready."
+- **Automatic HTTPS certificate provisioning** (`request_automatic_certificate()`):
+  implemented and unit-tested via dependency injection; the real `certbot` subprocess path
+  has never actually executed, since no public domain was available to test against. Not
+  wired into any interactive confirmation flow yet.
+- **Document/file delivery over Telegram**: works for DIRECT connectivity mode only.
+  SOCKS5 and RELAY modes explicitly raise `NotImplementedError` rather than attempting it.
+
+### Untested real-world scenarios (explicitly, not silently, unverified)
+- A genuine two-host relay-worker or remote-agent deployment over a real network path
+  (including any real-world latency, intermittent connectivity, or firewall/NAT behavior).
+- Automatic certificate issuance against a real, publicly-resolvable domain.
+- The Web Control Center, Telegram bot, relay worker, and remote agent all running
+  simultaneously under real production load/traffic for an extended period.
+- Upgrading a REAL v1.7.3 production installation using `install-upgrade` (the function is
+  tested against synthetic fixtures that mimic the v1.7.3 layout, not an actual v1.7.3
+  install captured from production).
+- Backup restoration of a multi-gigabyte real production database set (tested only with
+  small synthetic databases).
+
+### Security assumptions
+- An operator with root/filesystem access to this host has equivalent access to every
+  secret this software stores (Virtualizor API credentials, Telegram bot token, Web user
+  password hashes, relay/agent shared secrets, backup passphrase) -- 0600 permissions
+  protect against OTHER unprivileged local users, not against the host's own root.
+- HMAC-signed envelopes (relay worker, remote agent) provide authenticity and integrity,
+  NOT transport confidentiality -- both speak plain HTTP by default and require an
+  operator-provided TLS reverse proxy or VPN for confidentiality if ever exposed beyond
+  127.0.0.1.
+- The Web Control Center's own TLS wrapping is sufficient for confidentiality+authenticity
+  together (manual certificate paths only; no automatic provisioning has been exercised).
+- GPG symmetric encryption's security is entirely dependent on the strength/secrecy of the
+  chosen passphrase -- this software never judges passphrase strength.
+
+### Installation prerequisites
+- Python 3 (stdlib only -- no pip/venv/third-party packages anywhere in this project).
+- `systemd` (for every optional/periodic unit; none are installed/enabled automatically).
+- `gpg` or `gpg2` (only required if backup encryption is enabled).
+- `openssl` (only required to generate/inspect a manual TLS certificate; this software
+  never generates a certificate itself).
+- `certbot` (only required if automatic certificate provisioning is ever actually
+  attempted -- not required for any other feature).
+- Outbound HTTPS access to `api.telegram.org` (DIRECT mode) or a reachable SOCKS5
+  proxy/relay worker (SOCKS5/RELAY modes) -- only if the Telegram bot is enabled.
+
+### Rollback procedures
+1. `renewal_cli.py install-rollback --backup-file <archive> --yes` restores config/state
+   from any full backup archive created by `backup-full`/`backup-scheduled-run`/
+   `installer.backup_before_change()` (which `install-upgrade`/`install-repair` both call
+   automatically before making any change). The CURRENT state is itself safety-copied
+   first, so a bad rollback choice is never unrecoverable.
+2. To disable (not uninstall) a single optional module without affecting anything else:
+   `renewal_cli.py uninstall-module --module <name> [--purge-secrets]`.
+3. To fully remove the local install: `renewal_cli.py uninstall [--purge]` (existing,
+   pre-sprint command) -- removes locally-generated systemd unit files and, with `--purge`,
+   local data; never touches anything installed system-wide (that remains a separate,
+   manual, printed `systemctl`/`rm` step).
+
+### Production deployment risks
+- None of this session's new features have been exercised against real production
+  Virtualizor data, a real second host, or real internet-facing traffic.
+- Enabling the Web Control Center, Telegram bot, relay worker, or remote agent on a
+  publicly-reachable interface without a TLS/reverse-proxy/VPN layer in front would expose
+  either plaintext HTTP (relay/agent) or this project's own (untested-at-scale) TLS
+  implementation (Web Control Center) directly to the internet.
+- The backup passphrase, if encryption is enabled for the scheduled timer, is stored at
+  rest on the host -- anyone who compromises root on this host can decrypt all backups.
+
+### Exact operator actions required before any deployment beyond this dev/test environment
+1. Review this checklist and `docs/DEVELOPMENT_PROGRESS.md` in full.
+2. Run the full test suite one more time in the target deployment's actual Python version.
+3. For RELAY mode or the remote agent: provision a real second host and perform a genuine
+   cross-host test BEFORE relying on either feature for anything real.
+4. For HTTPS: either supply real, operator-obtained certificate files (manual path,
+   already tested) or explicitly trigger `request_automatic_certificate()` against a real
+   domain in a controlled test first.
+5. Choose and configure a TLS reverse proxy or VPN for the relay worker/remote agent if
+   either must be reached from outside 127.0.0.1.
+6. Explicitly enable only the optional modules actually needed, via their respective menu
+   "Configure ..." screens -- nothing optional activates merely by existing in code.
+7. Only after the above: consider installing/enabling the generated systemd units into
+   `/etc/systemd/system` (a manual, printed, never-automatic step for every unit in this
+   project) and bumping `renewal_cli.VERSION`/tagging a release -- neither was done this
+   session, per the explicit "do not publish a release" instruction.
+
+### Release readiness assessment
+**Not yet ready for production deployment.** Ready for a **controlled staging/dev
+deployment** to begin real-world validation of: RELAY mode and the remote agent across
+two actual hosts, the Web Control Center's TLS path with a real certificate, and
+`install-upgrade`/`install-repair` against a real (non-synthetic) existing installation.
+All locally-testable functionality (1170/1170 tests) passes; the remaining gap is
+exclusively real-environment validation that a single-host dev session cannot perform.
