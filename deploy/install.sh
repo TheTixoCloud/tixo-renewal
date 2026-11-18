@@ -106,8 +106,19 @@ mkdir -p "$INSTALL_DIR"/{lib,bin,shadow-monitor-state,renewal-config,backups,sys
 cp -f "$SCRIPT_DIR"/lib/*.py "$INSTALL_DIR/lib/"
 cp -f "$SCRIPT_DIR"/bin/*.py "$INSTALL_DIR/bin/"
 chmod +x "$INSTALL_DIR"/bin/*.py
+# Static Web assets (branding, live-bandwidth.js, v1.10.0+) -- a non-.py directory the
+# *.py globs above never touch; copied separately, same cp -f idempotent-overwrite
+# semantics, skipped entirely on an older package that has no lib/static/ to copy from.
+if [ -d "$SCRIPT_DIR/lib/static" ]; then
+  mkdir -p "$INSTALL_DIR/lib/static"
+  cp -f "$SCRIPT_DIR"/lib/static/* "$INSTALL_DIR/lib/static/"
+fi
 
-APP_VERSION="$(PYTHONPATH="$INSTALL_DIR/lib" "$PYTHON_BIN" -c 'import renewal_cli; print(renewal_cli.VERSION)')"
+# renewal_cli.py lives in bin/, not lib/ -- both must be on PYTHONPATH for this import to
+# resolve (bin/ also carries its own non-renewal_cli imports via the script's own directory
+# when run directly, but a bare `python3 -c 'import renewal_cli'` has no "script directory"
+# of its own, so bin/ must be added explicitly here).
+APP_VERSION="$(PYTHONPATH="$INSTALL_DIR/lib:$INSTALL_DIR/bin" "$PYTHON_BIN" -c 'import renewal_cli; print(renewal_cli.VERSION)')"
 echo "TixoCloud Control Center: v$APP_VERSION"
 
 # Idempotent: the CLI's own `install` subcommand writes default configs only if absent, and
