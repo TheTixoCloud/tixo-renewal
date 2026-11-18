@@ -616,7 +616,8 @@ def _section(style, title) -> str:
     return f"{style.BOLD}{style.ACCENT}{title}{style.RESET}"
 
 
-def render_host_info(info: dict, style: Style, show_virtual_interfaces: bool = False) -> str:
+def render_host_info(info: dict, style: Style, show_virtual_interfaces: bool = False,
+                      category_filter: str = None, search_term: str = None) -> str:
     """Grouped into OS / CPU / Memory+swap / Storage / Network / Timezone -- each its own
     compact section rather than one wall of text. Virtual interfaces (one per running VM on
     a busy hypervisor -- previously flooding this screen with dozens of entries) are hidden
@@ -671,10 +672,18 @@ def render_host_info(info: dict, style: Style, show_virtual_interfaces: bool = F
     hidden_count = len(all_ifaces) - len(default_shown)
     lines.append(_section(style, "NETWORK"))
     shown = all_ifaces if show_virtual_interfaces else default_shown
+    if show_virtual_interfaces and (category_filter or search_term):
+        shown = hostinfo.filter_interfaces(shown, category=category_filter, search=search_term)
+        filter_desc = ", ".join(x for x in (
+            f"category={category_filter}" if category_filter and category_filter != "all" else None,
+            f"search='{search_term}'" if search_term else None) if x)
+        lines.append(f"  {style.GRAY}(filtered: {filter_desc}){style.RESET}")
     if not shown:
         lines.append(f"  {style.GRAY}(no interfaces to show){style.RESET}")
     for iface in shown:
-        tag = f" {style.GRAY}[virtual]{style.RESET}" if iface.get("is_virtual") else ""
+        category = hostinfo.classify_interface_category(iface["name"])
+        tag = f" {style.GRAY}[{category}]{style.RESET}" if show_virtual_interfaces else (
+            f" {style.GRAY}[virtual]{style.RESET}" if iface.get("is_virtual") else "")
         rx, tx = iface.get("rx_bytes"), iface.get("tx_bytes")
         rx_str = f"Download (RX) {_format_bytes_human(rx)}" if isinstance(rx, int) else "Download (RX) unavailable"
         tx_str = f"Upload (TX) {_format_bytes_human(tx)}" if isinstance(tx, int) else "Upload (TX) unavailable"
@@ -1314,7 +1323,8 @@ def collect_virtualizor_info() -> dict:
     return v_info
 
 
-def action_system_info(style: Style, show_virtual_interfaces: bool = False):
+def action_system_info(style: Style, show_virtual_interfaces: bool = False,
+                        category_filter: str = None, search_term: str = None):
     """v1.7.0: the obsolete 'v' sub-prompt is gone -- host info and Virtualizor info are
     ALWAYS both printed on this one screen, unconditionally, with no extra keystroke able to
     gate either section. The full (unfiltered) network-interface listing is now a completely
@@ -1328,15 +1338,25 @@ def action_system_info(style: Style, show_virtual_interfaces: bool = False):
                                                                   renewal_cli.STATE_DIR)
     except Exception:
         pass  # a host-time snapshot failure must never take down the whole system-info screen
-    print(render_host_info(info, style, show_virtual_interfaces=show_virtual_interfaces))
+    print(render_host_info(info, style, show_virtual_interfaces=show_virtual_interfaces,
+                            category_filter=category_filter, search_term=search_term))
     print()
     print(render_virtualizor_info(collect_virtualizor_info(), style))
 
 
 def action_system_info_advanced(style: Style):
+    """Full interface list by default; the operator can narrow it by category
+    (physical/bridge/virtual/all) and/or a name search, or press Enter twice for the
+    unfiltered advanced view. This NEVER changes which interface the hostnet sampler
+    actually reads (see hostnet_sync.py) -- display filtering only."""
     print(f"{style.BOLD}{style.ACCENT}=== Advanced: all network interfaces (including "
           f"virtual) ==={style.RESET}\n")
-    action_system_info(style, show_virtual_interfaces=True)
+    category_raw = input(
+        "Filter by category [all/physical/bridge/virtual, Enter = all]: ").strip().lower()
+    category_filter = category_raw if category_raw in ("physical", "bridge", "virtual") else None
+    search_term = input("Search interface names (Enter = no filter): ").strip() or None
+    action_system_info(style, show_virtual_interfaces=True, category_filter=category_filter,
+                        search_term=search_term)
 
 
 def _inventory_db_path() -> str:

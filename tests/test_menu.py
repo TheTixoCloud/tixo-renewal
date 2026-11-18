@@ -513,6 +513,67 @@ def test_render_host_info_shows_virtual_interfaces_when_requested():
     assert "vnet5" in out
 
 
+def _advanced_view_info():
+    return {
+        "os": {"hostname": "h", "distribution": "d", "kernel": "k", "architecture": "a"},
+        "cpu": {"vendor": "v", "model": "m", "physical_cores": 1, "logical_cpus": 2, "threads_per_core": 2},
+        "memory": {"total_mb": 100, "available_mb": 50, "swap_total_mb": 10, "swap_free_mb": 5},
+        "disks": [],
+        "uptime": {"uptime_seconds": 3600, "load_average": {"1m": 1, "5m": 1, "15m": 1}},
+        "usage": {"cpu_percent": "unsupported", "memory_percent": 50.0},
+        "temperature": {"available": False, "reason": "unavailable", "zones": []},
+        "network_interfaces": [
+            {"name": "ens1f1", "state": "up", "ipv4": "1.2.3.4", "is_virtual": False},
+            {"name": "viifbr0", "state": "up", "ipv4": "1.2.3.5", "is_virtual": False},
+            {"name": "viifv1001", "state": "up", "ipv4": "unavailable", "is_virtual": True},
+            {"name": "viifv1002", "state": "up", "ipv4": "unavailable", "is_virtual": True},
+        ],
+        "host_timezone": "UTC",
+    }
+
+
+def test_render_host_info_advanced_view_category_filter_physical():
+    out = menu.render_host_info(_advanced_view_info(), menu.Style(enabled=False),
+                                 show_virtual_interfaces=True, category_filter="physical")
+    assert "ens1f1" in out
+    assert "viifbr0" not in out
+    assert "viifv1001" not in out
+
+
+def test_render_host_info_advanced_view_category_filter_bridge():
+    out = menu.render_host_info(_advanced_view_info(), menu.Style(enabled=False),
+                                 show_virtual_interfaces=True, category_filter="bridge")
+    assert "viifbr0" in out
+    assert "ens1f1" not in out
+    assert "viifv1001" not in out
+
+
+def test_render_host_info_advanced_view_search_term():
+    out = menu.render_host_info(_advanced_view_info(), menu.Style(enabled=False),
+                                 show_virtual_interfaces=True, search_term="viifv")
+    assert "viifv1001" in out
+    assert "viifv1002" in out
+    assert "ens1f1" not in out
+    assert "viifbr0" not in out
+
+
+def test_render_host_info_advanced_view_unfiltered_shows_everything():
+    out = menu.render_host_info(_advanced_view_info(), menu.Style(enabled=False),
+                                 show_virtual_interfaces=True)
+    for name in ("ens1f1", "viifbr0", "viifv1001", "viifv1002"):
+        assert name in out
+
+
+def test_render_host_info_compact_view_always_shows_bridge_and_physical():
+    """The host bridge and physical interfaces must appear in the DEFAULT (compact) view
+    too -- only per-VM virtual interfaces are hidden by default."""
+    out = menu.render_host_info(_advanced_view_info(), menu.Style(enabled=False))
+    assert "ens1f1" in out
+    assert "viifbr0" in out
+    assert "viifv1001" not in out
+    assert "viifv1002" not in out
+
+
 def test_render_vps_detail_shows_all_fields():
     record = {"vpsid": 42, "hostname": "web1", "status": "suspended", "runtime_status": "running",
               "quota_gb": "100", "used_gb": "50", "ram_mb": "2048", "cores": "2", "disk_gb": "40",

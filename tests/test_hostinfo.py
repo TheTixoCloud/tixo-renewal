@@ -111,6 +111,54 @@ def test_is_virtual_interface_recognizes_viifv_prefix():
     assert hostinfo.is_virtual_interface("viifv0") is True
 
 
+# ---------- classify_interface_category / filter_interfaces (advanced-view search/filter) -----
+
+def test_classify_interface_category_physical():
+    assert hostinfo.classify_interface_category("ens1f1") == "physical"
+    assert hostinfo.classify_interface_category("eth0") == "physical"
+
+
+def test_classify_interface_category_bridge():
+    assert hostinfo.classify_interface_category("viifbr0") == "bridge"
+
+
+def test_classify_interface_category_virtual_takes_priority_over_bridge_substring():
+    # "virbr0" matches the virtual-prefix list AND contains "br" -- virtual wins.
+    assert hostinfo.classify_interface_category("virbr0") == "virtual"
+    assert hostinfo.classify_interface_category("viifv1001") == "virtual"
+
+
+def test_filter_interfaces_by_category():
+    interfaces = [{"name": "ens1f1"}, {"name": "viifbr0"}, {"name": "viifv1001"},
+                  {"name": "viifv1002"}]
+    assert [i["name"] for i in hostinfo.filter_interfaces(interfaces, category="physical")] \
+        == ["ens1f1"]
+    assert [i["name"] for i in hostinfo.filter_interfaces(interfaces, category="bridge")] \
+        == ["viifbr0"]
+    assert [i["name"] for i in hostinfo.filter_interfaces(interfaces, category="virtual")] \
+        == ["viifv1001", "viifv1002"]
+
+
+def test_filter_interfaces_category_all_is_a_no_op():
+    interfaces = [{"name": "ens1f1"}, {"name": "viifbr0"}]
+    assert hostinfo.filter_interfaces(interfaces, category="all") == interfaces
+    assert hostinfo.filter_interfaces(interfaces, category=None) == interfaces
+
+
+def test_filter_interfaces_by_search_term_case_insensitive():
+    interfaces = [{"name": "ens1f1"}, {"name": "viifbr0"}, {"name": "viifv1001"}]
+    assert [i["name"] for i in hostinfo.filter_interfaces(interfaces, search="VIIF")] \
+        == ["viifbr0", "viifv1001"]
+    assert [i["name"] for i in hostinfo.filter_interfaces(interfaces, search="ens")] \
+        == ["ens1f1"]
+
+
+def test_filter_interfaces_combines_category_and_search():
+    interfaces = [{"name": "viifbr0"}, {"name": "viifbr1"}, {"name": "viifv1001"}]
+    result = hostinfo.filter_interfaces(interfaces, category="bridge", search="1")
+    assert [i["name"] for i in result] == ["viifbr1"]
+
+
 def test_get_network_interfaces_includes_rx_tx_bytes():
     interfaces = hostinfo.get_network_interfaces()
     assert all("rx_bytes" in i and "tx_bytes" in i for i in interfaces)

@@ -233,6 +233,39 @@ def is_virtual_interface(name: str) -> bool:
     return any(name.startswith(p) for p in VIRTUAL_INTERFACE_PREFIXES)
 
 
+# Bridge-naming heuristic, same "err toward showing" philosophy as is_virtual_interface:
+# Virtualizor's own host bridge is named `viifbr<N>` (e.g. `viifbr0`) -- distinct from the
+# per-VM `viifv<N>` interfaces (already classified virtual above) despite sharing the
+# `viif` prefix. A generic Linux bridge not managed by Virtualizor/Docker (already caught
+# by the `br-`/`virbr` virtual prefixes) would still show up here as "bridge" via the
+# `br` substring check -- intentional, since an operator-created bridge is exactly the
+# kind of "genuinely important host interface" the default view should never hide.
+def classify_interface_category(name: str) -> str:
+    """Returns 'virtual', 'bridge', or 'physical' -- used by the advanced network-interface
+    view's category filter. Never changes is_virtual_interface's own default-view decision;
+    this is purely an additional display classification."""
+    if is_virtual_interface(name):
+        return "virtual"
+    if "br" in name.lower():
+        return "bridge"
+    return "physical"
+
+
+def filter_interfaces(interfaces: list[dict], category: str = None,
+                       search: str = None) -> list[dict]:
+    """Pure filtering helper for the advanced network-interface view: `category` narrows to
+    exactly 'physical', 'bridge', or 'virtual' (None/'all' = no category filtering);
+    `search` keeps only interfaces whose name contains the given substring
+    (case-insensitive). Never touches actual interface data -- display filtering only."""
+    result = interfaces
+    if category and category != "all":
+        result = [i for i in result if classify_interface_category(i["name"]) == category]
+    if search:
+        needle = search.lower()
+        result = [i for i in result if needle in i["name"].lower()]
+    return result
+
+
 def get_interface_mac(name: str) -> str:
     """Reads /sys/class/net/<name>/address -- used as a strong (though not infallible)
     identity signal for detecting an interface RENAME (same physical device, new kernel
