@@ -20,6 +20,27 @@ DEPLOY_DIR = os.path.join(os.path.dirname(__file__), "..", "deploy")
 
 @pytest.mark.skipif(not os.path.exists(os.path.join(DEPLOY_DIR, "build_package.sh")),
                      reason="deploy/ not present in this checkout")
+def test_build_is_byte_for_byte_reproducible():
+    """Release-readiness requirement: building the package twice from the same source must
+    produce an IDENTICAL archive, so a published SHA256SUMS actually verifies provenance.
+    Catches regressions like tar embedding real file mtimes or directory-read order."""
+    result1 = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                              capture_output=True, text=True, timeout=30)
+    assert result1.returncode == 0, result1.stderr
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    checksum1 = subprocess.run(["sha256sum", pkg], capture_output=True, text=True).stdout.split()[0]
+
+    time.sleep(1.1)  # ensure a real build-to-build time difference would show up if unfixed
+    result2 = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                              capture_output=True, text=True, timeout=30)
+    assert result2.returncode == 0, result2.stderr
+    checksum2 = subprocess.run(["sha256sum", pkg], capture_output=True, text=True).stdout.split()[0]
+
+    assert checksum1 == checksum2, "two builds from identical source produced different archives"
+
+
+@pytest.mark.skipif(not os.path.exists(os.path.join(DEPLOY_DIR, "build_package.sh")),
+                     reason="deploy/ not present in this checkout")
 def test_built_package_imports_cleanly_in_total_isolation(tmp_path):
     result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
                              capture_output=True, text=True, timeout=30)

@@ -30,7 +30,14 @@ chmod +x "$HERE/install.sh" "$HERE/uninstall.sh" "$HERE/bin/renewal_cli.py" "$HE
 
 find "$HERE/lib" "$HERE/bin" -type d -name __pycache__ -exec rm -rf {} +
 
-tar -czf "$HERE/tixo-renewal-package.tar.gz" -C "$HERE" lib bin install.sh uninstall.sh
+# Reproducible archive: fixed mtime/owner/ordering (tar) and no embedded mtime (gzip -n)
+# so building twice from the same source produces byte-identical output (verified by
+# tests/test_deploy_package.py) -- otherwise tar embeds each file's real mtime and
+# directory-read order, and gzip embeds its own mtime, both of which vary run to run and
+# would make the published SHA256SUMS meaningless for verifying "did this really come
+# from this source".
+tar --sort=name --mtime="@0" --owner=0 --group=0 --numeric-owner \
+    -cf - -C "$HERE" lib bin install.sh uninstall.sh | gzip -n > "$HERE/tixo-renewal-package.tar.gz"
 
 # SHA256SUMS is published as its own release asset alongside the tarball -- bootstrap.sh
 # downloads both from the SAME immutable release tag and verifies before extracting anything.
