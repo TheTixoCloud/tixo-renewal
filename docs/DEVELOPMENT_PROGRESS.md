@@ -818,3 +818,56 @@ two actual hosts, the Web Control Center's TLS path with a real certificate, and
 `install-upgrade`/`install-repair` against a real (non-synthetic) existing installation.
 All locally-testable functionality (1170/1170 tests) passes; the remaining gap is
 exclusively real-environment validation that a single-host dev session cannot perform.
+
+---
+
+## Final QA / Release Candidate pass (v1.8.0-rc1)
+
+A dedicated final-QA session re-verified the above, added real end-to-end staging
+acceptance tests against the ACTUAL built package (not just in-process unit tests),
+performed a real security review (not just "no third-party deps / no shell=True"), and
+fixed three real issues found during that review:
+
+1. **Session cookie never marked `Secure` under TLS** -- fixed: `WebApp.tls_enabled`
+   (set by `build_server()` whenever a real cert/key pair is configured) now marks the
+   login cookie `Secure`.
+2. **Unbounded request-body reads** in `web_server.py`/`relay_worker.py`/`agent_server.py`
+   -- all three trusted the client-supplied `Content-Length` header without any cap before
+   reading that many bytes into memory, a real resource-consumption risk on a busy
+   hypervisor. Fixed: all three now cap body size (2MB web, 1MB relay/agent) and return
+   413 before reading past the cap.
+3. **Non-reproducible release package** -- `build_package.sh` produced a different SHA256
+   on every run (tar/gzip both embed timestamps). Fixed: `--sort=name --mtime=@0
+   --owner=0 --group=0 --numeric-owner` + `gzip -n` now produce a byte-identical archive
+   across builds, verified by a new regression test.
+
+New real end-to-end staging acceptance tests (genuine subprocesses against the actual
+extracted `tixo-renewal-package.tar.gz`, not in-process imports):
+- Full install -> install-detect -> status -> dry-run -> install-upgrade ->
+  install-health-check -> re-install cycle.
+- The Web Control Center's real `web-run` CLI command, driven with genuine HTTP requests
+  over a real loopback socket: login, all 16 top-level pages returning 200, fa/RTL and
+  light-theme cookies, and the live-network endpoint's honest "not configured" response.
+- Every optional-module `*-run` command's real `--help` registration and
+  blocked-while-disabled behavior.
+
+**Full suite: 1180 passing, 0 failed, 0 skipped** (verified by re-running from a clean
+checkout at the start of this QA session, and again after every fix above).
+
+**New documentation** (all in `docs/`): `INSTALL_GUIDE.md`, `WEB_AND_TELEGRAM_SETUP.md`,
+`BACKUP_AND_RESTORE.md`, `REMOTE_AND_RELAY.md` (explicit "simulated, not real two-host
+validation" limitations), `SECURITY_CHECKLIST.md`, and
+`RELEASE_NOTES_v1.8.0-rc1.md` (release notes, staging acceptance results table, upgrade/
+rollback instructions, known limitations, and the production deployment checklist).
+
+**Release packaging**: `deploy/build_package.sh` now builds a reproducible
+`tixo-renewal-package.tar.gz`, verified to contain no secrets/credentials/database files.
+`renewal_cli.VERSION` deliberately remains `1.7.3` -- this release candidate is
+**local and unpublished**; no tag was pushed, no GitHub Release was created, matching the
+explicit "do not publish" instruction every session in this engagement has operated under.
+
+**Production readiness: BLOCKED on real-infrastructure validation, not on anything fixable
+in this environment.** Every locally-verifiable gate passes (tests, security review,
+reproducible packaging, rollback, config preservation). The remaining gates --
+real cross-host relay/agent validation and real certificate issuance -- require
+infrastructure this single-host development environment does not have.
