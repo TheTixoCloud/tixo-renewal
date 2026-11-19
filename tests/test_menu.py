@@ -1160,3 +1160,117 @@ def test_render_vps_table_progress_bar_stays_compact(monkeypatch):
     assert bar in out
     assert out.count("50.0%") == 1  # never duplicated -- the bar's own embedded percent is the only one
     assert menu._display_width(bar) <= 20  # "[########] 100.0%" worst case -- compact, not an oversized widget
+
+
+# ---------- v1.10.2: action_uninstall -- real two-mode flow + clean process exit -----------
+
+def _fake_preview(purge, **overrides):
+    base = {
+        "mode": "full_purge" if purge else "standard",
+        "install_dir_exists": True,
+        "will_stop_disable_units": [],
+        "will_remove_unit_files": [],
+        "will_remove_global_wrapper": True,
+        "will_remove_entries": ["lib", "bin", "systemd"] + (["renewal-config", "shadow-monitor-state"] if purge else []),
+        "will_preserve_entries": ["backups"] + ([] if purge else ["renewal-config", "shadow-monitor-state"]),
+        "unknown_entries_never_touched": [],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_action_uninstall_cancelled_at_mode_choice_never_calls_uninstall(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda *a: "9")  # invalid mode choice
+    called = []
+    monkeypatch.setattr(menu.renewal_cli, "cmd_uninstall", lambda args: called.append(args) or 0)
+    with pytest.raises(SystemExit) as exc_info:
+        # Should return normally (no SystemExit) if truly cancelled -- assert it does NOT exit.
+        menu.action_uninstall(menu.Style(enabled=False))
+        raise SystemExit(99)  # sentinel: reached here means action_uninstall returned normally
+    assert exc_info.value.code == 99
+    assert called == []
+
+
+def test_action_uninstall_standard_wrong_confirmation_cancels(monkeypatch, capsys):
+    inputs = iter(["1", "not uninstall"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(inputs))
+    monkeypatch.setattr(menu.renewal_cli, "cmd_uninstall", lambda args: (_ for _ in ()).throw(
+        AssertionError("must never call cmd_uninstall when confirmation text is wrong")))
+    monkeypatch.setattr(menu.un, "preview_uninstall", lambda root, purge: _fake_preview(purge))
+    with pytest.raises(SystemExit) as exc_info:
+        menu.action_uninstall(menu.Style(enabled=False))
+        raise SystemExit(99)
+    assert exc_info.value.code == 99
+    out = capsys.readouterr().out
+    assert "Cancelled" in out
+
+
+def test_action_uninstall_standard_confirmed_calls_cmd_uninstall_with_yes_and_exits(monkeypatch, capsys):
+    inputs = iter(["1", "UNINSTALL", "n"])  # mode, confirm, decline backup deletion
+    monkeypatch.setattr("builtins.input", lambda *a: next(inputs))
+    monkeypatch.setattr(menu.un, "preview_uninstall", lambda root, purge: _fake_preview(purge))
+    captured = {}
+    def fake_uninstall(args):
+        captured["args"] = args
+        return 0
+    monkeypatch.setattr(menu.renewal_cli, "cmd_uninstall", fake_uninstall)
+    with pytest.raises(SystemExit) as exc_info:
+        menu.action_uninstall(menu.Style(enabled=False))
+    assert exc_info.value.code == 0
+    assert captured["args"].purge is False
+    assert captured["args"].yes is True
+    assert captured["args"].delete_backups is False
+    out = capsys.readouterr().out
+    assert "Uninstall complete" in out
+
+
+def test_action_uninstall_purge_requires_exact_phrase(monkeypatch, capsys):
+    inputs = iter(["2", "purge everything please"])  # mode=purge, wrong phrase
+    monkeypatch.setattr("builtins.input", lambda *a: next(inputs))
+    monkeypatch.setattr(menu.un, "preview_uninstall", lambda root, purge: _fake_preview(purge))
+    monkeypatch.setattr(menu.renewal_cli, "cmd_uninstall", lambda args: (_ for _ in ()).throw(
+        AssertionError("must never purge without the exact confirmation phrase")))
+    with pytest.raises(SystemExit) as exc_info:
+        menu.action_uninstall(menu.Style(enabled=False))
+        raise SystemExit(99)
+    assert exc_info.value.code == 99
+
+
+def test_action_uninstall_purge_confirmed_passes_correct_confirm_phrase(monkeypatch, capsys):
+    inputs = iter(["2", menu.renewal_cli.REQUIRED_PURGE_PHRASE, "n"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(inputs))
+    monkeypatch.setattr(menu.un, "preview_uninstall", lambda root, purge: _fake_preview(purge))
+    captured = {}
+    def fake_uninstall(args):
+        captured["args"] = args
+        return 0
+    monkeypatch.setattr(menu.renewal_cli, "cmd_uninstall", fake_uninstall)
+    with pytest.raises(SystemExit) as exc_info:
+        menu.action_uninstall(menu.Style(enabled=False))
+    assert exc_info.value.code == 0
+    assert captured["args"].purge is True
+    assert captured["args"].confirm == menu.renewal_cli.REQUIRED_PURGE_PHRASE
+
+
+def test_action_uninstall_failed_uninstall_exits_nonzero(monkeypatch, capsys):
+    inputs = iter(["1", "UNINSTALL", "n"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(inputs))
+    monkeypatch.setattr(menu.un, "preview_uninstall", lambda root, purge: _fake_preview(purge))
+    monkeypatch.setattr(menu.renewal_cli, "cmd_uninstall", lambda args: 1)
+    with pytest.raises(SystemExit) as exc_info:
+        menu.action_uninstall(menu.Style(enabled=False))
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "problems" in out.lower()
+
+
+def test_action_uninstall_unknown_entries_shown_in_preview(monkeypatch, capsys):
+    inputs = iter(["1", "UNINSTALL", "n"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(inputs))
+    monkeypatch.setattr(menu.un, "preview_uninstall",
+                         lambda root, purge: _fake_preview(purge, unknown_entries_never_touched=["mystery.txt"]))
+    monkeypatch.setattr(menu.renewal_cli, "cmd_uninstall", lambda args: 0)
+    with pytest.raises(SystemExit):
+        menu.action_uninstall(menu.Style(enabled=False))
+    out = capsys.readouterr().out
+    assert "mystery.txt" in out

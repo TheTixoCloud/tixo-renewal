@@ -33,6 +33,7 @@ import inventory_sync as isync
 import nodes as nodes_mod
 import policy as pol
 import renewal_cli
+import uninstaller as un
 import shadow_monitor as sm
 import virtualizor_info as vinfo
 import hostnet
@@ -1408,15 +1409,72 @@ def action_restore():
     renewal_cli.cmd_rollback(argparse.Namespace(node=node_id, backup_file=name, yes=True))
 
 
-def action_uninstall():
-    print("This removes the generated systemd unit files (local review copies) and, with")
-    print("--purge, all local config/credentials/ledger data too.")
-    typed = input("Type EXACTLY 'UNINSTALL' to proceed, anything else cancels: ")
-    if typed != "UNINSTALL":
+def action_uninstall(style: "Style" = None):
+    """v1.10.2: this used to only ever remove LOCALLY GENERATED systemd unit template
+    copies and print manual commands for the operator to run themselves -- leaving all
+    application code, any actually-installed systemd units, and the global wrapper behind.
+    The real two-mode logic lives entirely in uninstaller.py + renewal_cli.cmd_uninstall
+    (never re-implemented here) -- this function is purely the interactive mode-selection,
+    confirmation, and (critically) clean-process-exit orchestration.
+
+    Because a successful uninstall/purge DELETES this very file (lib/menu.py) and its
+    siblings, this function must NEVER return to the normal menu loop afterward -- doing so
+    would either crash on the next redraw (code gone) or, worse, silently keep running the
+    OLD in-memory module as if nothing happened. It calls sys.exit() directly instead."""
+    style = style or Style(enabled=False)
+
+    print(f"{style.BOLD}{style.ACCENT}Uninstall TixoCloud Control Center{style.RESET}")
+    print("  1. Standard -- removes application code and systemd services/timers;")
+    print("     PRESERVES configuration, secrets, databases, ledgers, and backups.")
+    print("  2. Full purge -- also permanently removes configuration, secrets, databases,")
+    print("     and renewal ledgers. Backups are still never removed by this (separate step).")
+    choice = input("Choose [1/2, anything else cancels]: ").strip()
+    if choice not in ("1", "2"):
         print("Cancelled.")
         return
-    purge = _confirm("Also permanently delete config/credentials/ledger data (--purge)?")
-    renewal_cli.cmd_uninstall(argparse.Namespace(purge=purge))
+    purge = choice == "2"
+
+    preview = un.preview_uninstall(renewal_cli.WORKSPACE_ROOT, purge=purge)
+    print(f"\n{style.BOLD}Preview (nothing has been changed yet):{style.RESET}")
+    print(f"  Will stop/disable/remove systemd units: {preview['will_stop_disable_units'] or '(none installed)'}")
+    print(f"  Will remove: {preview['will_remove_entries']}")
+    print(f"  Will preserve: {preview['will_preserve_entries']}")
+    if preview["unknown_entries_never_touched"]:
+        print(f"  {style.YELLOW}Found entries NOT created by this installer -- never "
+              f"touched: {preview['unknown_entries_never_touched']}{style.RESET}")
+
+    if purge:
+        print(f"\n{style.RED}{style.BOLD}This permanently deletes configuration, secrets, "
+              f"databases, and renewal ledgers. This cannot be undone.{style.RESET}")
+        typed = input(f"Type EXACTLY '{renewal_cli.REQUIRED_PURGE_PHRASE}' to proceed, "
+                       f"anything else cancels: ")
+        if typed != renewal_cli.REQUIRED_PURGE_PHRASE:
+            print("Cancelled.")
+            return
+    else:
+        typed = input("Type EXACTLY 'UNINSTALL' to proceed, anything else cancels: ")
+        if typed != "UNINSTALL":
+            print("Cancelled.")
+            return
+
+    delete_backups = False
+    if preview["will_preserve_entries"] and "backups" in preview["will_preserve_entries"]:
+        delete_backups = _confirm("Also permanently delete backup archives? (separate, "
+                                   "extra-explicit confirmation follows if yes)")
+
+    args = argparse.Namespace(purge=purge, yes=True,
+                               confirm=renewal_cli.REQUIRED_PURGE_PHRASE if purge else None,
+                               delete_backups=delete_backups)
+    rc = renewal_cli.cmd_uninstall(args)
+
+    print()
+    if rc == 0:
+        print(f"{style.GREEN}Uninstall complete.{style.RESET} Exiting -- this application's "
+              f"own code has been removed, so the menu cannot continue.")
+    else:
+        print(f"{style.RED}Uninstall finished with problems -- see the report above. "
+              f"Exiting.{style.RESET}")
+    sys.exit(0 if rc == 0 else 1)
 
 
 def collect_virtualizor_info() -> dict:
@@ -2557,6 +2615,8 @@ def run_menu():
                     action_configure_backup_schedule(style)
                 elif label == "Check for updates":
                     action_check_updates(style)
+                elif label == "Uninstall":
+                    action_uninstall(style)
                 else:
                     fn()
             except Exception as e:
