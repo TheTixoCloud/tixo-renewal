@@ -176,3 +176,32 @@ echo "  Web Control Center    -> menu: 'Configure Web Control Center (optional)'
 echo "  Relay worker          -> runs on a SEPARATE host; see 'Configure Relay Worker' there"
 echo "  Remote agent          -> menu: 'Configure Remote Agent (optional, read-only)'"
 echo "Their generated-but-not-installed systemd units are at $INSTALL_DIR/systemd/virt-renewal-{telegram-bot,web,relay-worker,agent}.service"
+
+# ---- open the management menu, but ONLY in a genuinely interactive session ----------------
+# Reaching this line at all already means install succeeded (set -euo pipefail aborted the
+# script on any earlier failure) -- the only remaining question is whether to open the menu.
+#
+# `curl ... | sudo bash` (the documented one-liner) feeds THIS SCRIPT's own source through
+# stdin -- by the time execution reaches here, stdin is already exhausted/closed as a
+# pipe, so `[ -t 0 ]` is useless for detecting "is a human watching this". `[ -t 1 ]`
+# (stdout still a terminal) is the right first signal; `/dev/tty` -- the controlling
+# terminal device, independent of stdin/stdout redirection -- is what the menu's own
+# input()/getpass() calls actually need to work, so both are required together. A
+# noninteractive run (CI, cron, `ssh host 'curl ... | bash'` without a pty, a script
+# capturing output) will fail one or both checks and skip the menu, exactly as required.
+echo
+if [ -n "${TIXO_RENEWAL_NO_AUTO_MENU:-}" ]; then
+  echo "TIXO_RENEWAL_NO_AUTO_MENU set -- skipping automatic menu launch."
+elif [ -t 1 ] && [ -r /dev/tty ] && [ -w /dev/tty ] 2>/dev/null; then
+  echo "Launching the TixoCloud management menu..."
+  if [ -x "$WRAPPER_PATH" ]; then
+    exec "$WRAPPER_PATH" < /dev/tty > /dev/tty 2> /dev/tty
+  else
+    export TIXO_RENEWAL_INSTALL_DIR="$INSTALL_DIR"
+    exec "$PYTHON_BIN" "$INSTALL_DIR/lib/menu.py" < /dev/tty > /dev/tty 2> /dev/tty
+  fi
+else
+  echo "Noninteractive session detected (no controlling terminal) -- skipping automatic"
+  echo "menu launch. Run 'tixo-renewal' yourself (or the fallback command printed above)"
+  echo "to open the management menu."
+fi

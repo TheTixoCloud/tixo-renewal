@@ -7,6 +7,7 @@ once during manual review.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -456,3 +457,172 @@ def test_readme_install_command_matches_current_version():
         f"README.md's one-command install is pinned to v{m.group(1)} but "
         f"renewal_cli.VERSION is {renewal_cli.VERSION} -- update README.md's install command"
     )
+
+
+# ---------- v1.10.2: install.sh auto-launches the menu in a REAL interactive terminal -----------
+
+def _run_install_sh_with_pty(staging_dir, install_dir, extra_env=None, timeout=15):
+    """Runs install.sh with its stdin/stdout/stderr attached to a REAL pseudo-terminal (not
+    a captured pipe, which is what subprocess.run's capture_output normally gives you and
+    is exactly what `[ -t 1 ]` correctly reports as non-interactive). Returns the captured
+    output text. This is what actually exercises the `curl | bash`-interactive code path,
+    not a simulation of it."""
+    import pty
+    import select
+
+    master_fd, slave_fd = pty.openpty()
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_INSTALL_DIR"] = install_dir
+    if extra_env:
+        env.update(extra_env)
+
+    proc = subprocess.Popen(["bash", "install.sh"], cwd=staging_dir, stdin=slave_fd,
+                             stdout=slave_fd, stderr=slave_fd, env=env, start_new_session=True)
+    os.close(slave_fd)
+
+    output = b""
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                # Drain any remaining buffered output, then stop.
+                try:
+                    r, _, _ = select.select([master_fd], [], [], 0.3)
+                    if r:
+                        output += os.read(master_fd, 65536)
+                except OSError:
+                    pass
+                break
+            try:
+                r, _, _ = select.select([master_fd], [], [], 0.5)
+            except OSError:
+                break
+            if r:
+                try:
+                    chunk = os.read(master_fd, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                output += chunk
+                # Once the menu banner shows up, we've proven the launch happened --
+                # terminate the (now-interactive, input()-blocked) menu process rather
+                # than waiting out the full timeout.
+                if b"Choose an option:" in output:
+                    break
+    finally:
+        try:
+            os.killpg(os.getpgid(proc.pid), 9)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    return output.decode("utf-8", errors="replace")
+
+
+@pytest.mark.skipif(not hasattr(os, "openpty") and not __import__("pty"),
+                     reason="pty not available on this platform")
+def test_install_sh_opens_menu_on_real_interactive_terminal(tmp_path):
+    """The exact requirement: the published one-command install must open the management
+    menu afterward on a REAL interactive SSH-like terminal -- tested here with a genuine
+    pseudo-terminal (pty), not a subprocess.run() simulation (which `[ -t 1 ]` correctly
+    treats as noninteractive and is exactly why that would NOT exercise this code path)."""
+    result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                             capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    with tarfile.open(pkg) as tf:
+        tf.extractall(staging, filter="data")
+
+    install_dir = tmp_path / "opt-tixo-renewal"
+    output = _run_install_sh_with_pty(str(staging), str(install_dir))
+
+    assert "Install complete" in output
+    assert "Launching the TixoCloud management menu" in output
+    # The menu itself actually started (its own banner/title text appeared) -- this is the
+    # real proof the menu opened, not just that install.sh printed an intent-to-launch line.
+    assert "TixoCloud Control Center" in output
+
+
+def test_install_sh_skips_menu_in_noninteractive_subprocess(tmp_path):
+    """The companion requirement: a noninteractive run (exactly what every OTHER test in
+    this file does via subprocess.run with captured/piped stdout) must never attempt to
+    launch the menu -- confirmed explicitly here via the printed skip message, not just by
+    the test happening not to hang."""
+    result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                             capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    with tarfile.open(pkg) as tf:
+        tf.extractall(staging, filter="data")
+
+    install_dir = tmp_path / "opt-tixo-renewal"
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+    r = subprocess.run(["bash", "install.sh"], cwd=str(staging), capture_output=True,
+                        text=True, timeout=30, env=env)
+    assert r.returncode == 0
+    assert "Noninteractive session detected" in r.stdout
+    assert "Launching the TixoCloud management menu" not in r.stdout
+
+
+def test_install_sh_no_auto_menu_env_var_suppresses_launch_even_with_a_pty(tmp_path):
+    """TIXO_RENEWAL_NO_AUTO_MENU=1 must suppress the menu launch even on a real pty --
+    the explicit opt-out this project's own test suite (and any CI that wants a PTY for
+    other reasons) relies on."""
+    result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                             capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    with tarfile.open(pkg) as tf:
+        tf.extractall(staging, filter="data")
+
+    install_dir = tmp_path / "opt-tixo-renewal"
+    output = _run_install_sh_with_pty(str(staging), str(install_dir),
+                                       extra_env={"TIXO_RENEWAL_NO_AUTO_MENU": "1"}, timeout=10)
+    assert "TIXO_RENEWAL_NO_AUTO_MENU set" in output
+    assert "Choose an option:" not in output  # menu never actually started
+
+
+def test_install_sh_never_launches_menu_after_a_failed_install(tmp_path):
+    """A failed install (here: simulated by making install_dir's parent unwritable) must
+    never reach the menu-launch code at all -- `set -euo pipefail` aborts the script on the
+    first failing command, so this is really a test that nothing downstream of that point
+    can still run."""
+    result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                             capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    with tarfile.open(pkg) as tf:
+        tf.extractall(staging, filter="data")
+
+    # Point PYTHON_BIN detection at a broken environment by corrupting PATH so python3
+    # cannot be found -- install.sh fails fast with its own clear "ERROR: python3 not
+    # found" message, well before any code copy or menu-launch logic.
+    install_dir = tmp_path / "opt-tixo-renewal"
+    bash_path = shutil.which("bash")
+    env = {"PATH": "/nonexistent", "TIXO_RENEWAL_INSTALL_DIR": str(install_dir)}
+    r = subprocess.run([bash_path, "install.sh"], cwd=str(staging), capture_output=True,
+                        text=True, timeout=15, env=env)
+    assert r.returncode != 0
+    assert "Launching the TixoCloud management menu" not in r.stdout
+    assert not install_dir.exists()
