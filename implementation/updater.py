@@ -131,7 +131,7 @@ def _copy_tree_contents(src: str, dst: str) -> None:
 
 
 def apply_update(install_dir: str, config_dir: str, state_dir: str, backup_root: str,
-                  tag: str, download_fn=download_file, fetch_fn=fetch_release_info,
+                  tag: str, download_fn=None, fetch_fn=None,
                   run_install_upgrade_fn=None, health_check_fn=None) -> dict:
     """Downloads, verifies, and applies release `tag` to `install_dir`. Every step that can
     fail does so WITHOUT destroying the previous working install:
@@ -162,6 +162,11 @@ def apply_update(install_dir: str, config_dir: str, state_dir: str, backup_root:
     `policy.json`/`nodes.json`, never touches systemd unit installation/enablement."""
     report = {"ok": False, "tag": tag, "stage": None, "error": None,
               "backup_path": None, "rolled_back": False}
+
+    if fetch_fn is None:
+        fetch_fn = fetch_release_info
+    if download_fn is None:
+        download_fn = download_file
 
     info = fetch_fn(tag=tag)
     if not info["ok"]:

@@ -1235,3 +1235,128 @@ def test_optional_persistent_units_are_simple_restart_always_not_timers(cli_env,
     assert cli_command in content
     timer_name = unit_name.replace(".service", ".timer")
     assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, timer_name))
+
+
+# ---------- v1.10.2: cmd_update_check / cmd_update_apply -- real CLI update flow -----------
+
+def test_cmd_update_check_reports_up_to_date(cli_env, monkeypatch, capsys):
+    import json as _json
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return _json.dumps({"tag_name": f"v{renewal_cli.VERSION}", "body": "",
+                                 "assets": []}).encode()
+
+    import updater
+    monkeypatch.setattr(updater.urllib.request, "urlopen", lambda req, timeout: FakeResp())
+    rc = renewal_cli.cmd_update_check(argparse_namespace())
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Already up to date" in out
+
+
+def test_cmd_update_apply_full_cli_flow_preserves_config_and_restarts_active_services(
+        cli_env, monkeypatch, tmp_path, capsys):
+    """End-to-end at the REAL CLI command layer (not just updater.apply_update() directly,
+    which test_updater.py already covers exhaustively at the function level): builds a
+    'new' package, points cmd_update_apply's network layer at it via monkeypatched
+    updater.fetch_release_info/download_file, and confirms the actual CLI command preserves
+    config/secrets, applies the new code, and restarts exactly the services that were
+    already active before the update -- simulating an upgrade from a v1.10.0/v1.10.1-shaped
+    install to the current version."""
+    import hashlib
+    import tarfile
+    import updater
+
+    renewal_cli.cmd_install(argparse_namespace())
+    config_path = renewal_cli._policy_config_path()
+    original_policy_bytes = open(config_path, "rb").read()
+
+    # Build a fake 'new' release package.
+    src = tmp_path / "pkg-src"
+    (src / "lib" / "static").mkdir(parents=True)
+    (src / "bin").mkdir(parents=True)
+    (src / "lib" / "renewal_cli.py").write_text('VERSION = "99.0.0"\n')
+    (src / "bin" / "renewal_cli.py").write_text("# bin stub\n")
+    tarball = tmp_path / "tixo-renewal-package.tar.gz"
+    with tarfile.open(tarball, "w:gz") as tf:
+        tf.add(src / "lib", arcname="lib")
+        tf.add(src / "bin", arcname="bin")
+    digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
+    sums = tmp_path / "SHA256SUMS"
+    sums.write_text(f"{digest}  {updater.ASSET_NAME}\n")
+
+    def fake_fetch(tag=None):
+        return {"ok": True, "tag": "v99.0.0", "version": "99.0.0", "notes": "test release",
+                "assets": {updater.ASSET_NAME: "fake://pkg", updater.CHECKSUMS_NAME: "fake://sums"},
+                "error": None}
+
+    def fake_download(url, dest_path, timeout=60.0, max_bytes=None):
+        import shutil as _shutil
+        _shutil.copy2(str(tarball) if "pkg" in url else str(sums), dest_path)
+
+    monkeypatch.setattr(updater, "fetch_release_info", fake_fetch)
+    monkeypatch.setattr(updater, "download_file", fake_download)
+
+    restart_calls = []
+    def fake_run(cmd, *a, **k):
+        restart_calls.append(cmd)
+        class R:
+            returncode = 0
+            stdout = "active" if cmd[:2] == ["systemctl", "is-active"] else ""
+        return R()
+    monkeypatch.setattr(renewal_cli.subprocess, "run", fake_run)
+
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(
+        AssertionError("--yes must skip the interactive confirmation")))
+
+    rc = renewal_cli.cmd_update_apply(argparse_namespace(version=None, yes=True, force=False))
+    assert rc == 0, capsys.readouterr().out
+
+    # New code applied.
+    new_version = open(os.path.join(renewal_cli.WORKSPACE_ROOT, "lib", "renewal_cli.py")).read()
+    assert '"99.0.0"' in new_version
+
+    # Config untouched (byte-identical).
+    assert open(config_path, "rb").read() == original_policy_bytes
+
+    # Web + Telegram services (reported "active" by the fake systemctl) were restarted.
+    restart_cmds = [c for c in restart_calls if c[:2] == ["systemctl", "restart"]]
+    restarted_units = {c[2] for c in restart_cmds}
+    assert "virt-renewal-web.service" in restarted_units
+    assert "virt-renewal-telegram-bot.service" in restarted_units
+
+
+def test_cmd_update_apply_refuses_without_yes_or_confirmation(cli_env, monkeypatch, capsys):
+    import updater
+
+    def fake_fetch(tag=None):
+        return {"ok": True, "tag": "v99.0.0", "version": "99.0.0", "notes": "",
+                "assets": {updater.ASSET_NAME: "x", updater.CHECKSUMS_NAME: "y"}, "error": None}
+    monkeypatch.setattr(updater, "fetch_release_info", fake_fetch)
+    monkeypatch.setattr("builtins.input", lambda *a: "no")  # declines
+
+    called = []
+    monkeypatch.setattr(updater, "apply_update", lambda *a, **k: called.append(1) or {"ok": True})
+    rc = renewal_cli.cmd_update_apply(argparse_namespace(version=None, yes=False, force=False))
+    assert rc == 1
+    assert called == []
+
+
+def test_cmd_update_apply_noop_when_already_up_to_date_without_force(cli_env, monkeypatch, capsys):
+    import updater
+
+    def fake_fetch(tag=None):
+        return {"ok": True, "tag": f"v{renewal_cli.VERSION}", "version": renewal_cli.VERSION,
+                "notes": "", "assets": {updater.ASSET_NAME: "x", updater.CHECKSUMS_NAME: "y"},
+                "error": None}
+    monkeypatch.setattr(updater, "fetch_release_info", fake_fetch)
+    called = []
+    monkeypatch.setattr(updater, "apply_update", lambda *a, **k: called.append(1) or {"ok": True})
+    rc = renewal_cli.cmd_update_apply(argparse_namespace(version=None, yes=True, force=False))
+    assert rc == 0
+    assert called == []
+    out = capsys.readouterr().out
+    assert "nothing to do" in out
