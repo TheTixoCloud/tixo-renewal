@@ -121,6 +121,86 @@ def test_check_for_update_never_raises_on_network_failure(monkeypatch):
     assert "error" in result
 
 
+# ---------- v1.10.2: action_check_updates -- real offer-to-apply flow --------------------
+
+def _fake_check_response(tag, monkeypatch):
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return json.dumps({"tag_name": tag, "html_url": "https://example.invalid"}).encode()
+    monkeypatch.setattr(menu.urllib.request, "urlopen", lambda req, timeout=5: FakeResp())
+
+
+def test_action_check_updates_no_update_available_never_prompts(monkeypatch, capsys):
+    _fake_check_response("v1.1.0", monkeypatch)
+    menu.renewal_cli.VERSION = "1.1.0"
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(
+        AssertionError("must never prompt when already up to date")))
+    menu.action_check_updates(menu.Style(enabled=False))
+    out = capsys.readouterr().out
+    assert "Already up to date" in out
+
+
+def test_action_check_updates_declined_never_applies(monkeypatch, capsys):
+    _fake_check_response("v9.9.9", monkeypatch)
+    menu.renewal_cli.VERSION = "1.1.0"
+    monkeypatch.setattr("builtins.input", lambda *a: "no")
+    called = {"apply": False}
+    monkeypatch.setattr(menu.renewal_cli, "cmd_update_apply",
+                         lambda args: called.__setitem__("apply", True) or 0)
+    menu.action_check_updates(menu.Style(enabled=False))
+    assert called["apply"] is False
+    out = capsys.readouterr().out
+    assert "Not applying" in out
+
+
+def test_action_check_updates_confirmed_success_reexecs_the_process(monkeypatch, capsys):
+    """The success path must re-exec a fresh process (never just 'return' and keep running
+    the OLD in-memory code) -- this test replaces os.execv with a recorder instead of a
+    real process replacement, which would terminate the test runner itself."""
+    _fake_check_response("v9.9.9", monkeypatch)
+    menu.renewal_cli.VERSION = "1.1.0"
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    monkeypatch.setattr(menu.renewal_cli, "cmd_update_apply", lambda args: 0)
+    execv_calls = []
+    monkeypatch.setattr(menu.os, "execv", lambda *a: execv_calls.append(a))
+    menu.action_check_updates(menu.Style(enabled=False))
+    assert len(execv_calls) == 1
+    out = capsys.readouterr().out
+    assert "Update applied successfully" in out
+
+
+def test_action_check_updates_failed_apply_never_execs_and_reports_clearly(monkeypatch, capsys):
+    _fake_check_response("v9.9.9", monkeypatch)
+    menu.renewal_cli.VERSION = "1.1.0"
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    monkeypatch.setattr(menu.renewal_cli, "cmd_update_apply", lambda args: 1)
+    execv_calls = []
+    monkeypatch.setattr(menu.os, "execv", lambda *a: execv_calls.append(a))
+    menu.action_check_updates(menu.Style(enabled=False))
+    assert execv_calls == []  # never re-execs on a failed update
+    out = capsys.readouterr().out
+    assert "Update failed" in out
+    assert "previous install remains in place" in out
+
+
+def test_action_check_updates_apply_called_with_yes_to_avoid_double_confirmation(monkeypatch, capsys):
+    """action_check_updates already confirms via its own _confirm() prompt -- it must pass
+    yes=True through to cmd_update_apply so the operator is never asked to confirm twice."""
+    _fake_check_response("v9.9.9", monkeypatch)
+    menu.renewal_cli.VERSION = "1.1.0"
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    captured_args = {}
+    def fake_apply(args):
+        captured_args["args"] = args
+        return 0
+    monkeypatch.setattr(menu.renewal_cli, "cmd_update_apply", fake_apply)
+    monkeypatch.setattr(menu.os, "execv", lambda *a: None)
+    menu.action_check_updates(menu.Style(enabled=False))
+    assert captured_args["args"].yes is True
+
+
 # ---------- dashboard data collection / rendering -----------------------------------------
 
 def test_collect_dashboard_data_reports_policy_and_write_approved(tmp_path):

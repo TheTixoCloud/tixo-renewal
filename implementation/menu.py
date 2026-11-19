@@ -1348,16 +1348,45 @@ def action_view_logs():
             print(f"  {r}")
 
 
-def action_check_updates():
+def action_check_updates(style: "Style" = None):
+    """v1.10.2: this used to only ever PRINT the comparison -- it now offers a real,
+    explicitly-confirmed apply. The actual download/verify/backup/apply/rollback logic
+    lives entirely in updater.py + renewal_cli.cmd_update_apply (never re-implemented
+    here) -- this function is purely the interactive confirmation + re-exec-after-success
+    orchestration, consistent with every other destructive menu action in this file."""
+    style = style or Style(enabled=False)
     result = check_for_update()
     if not result["ok"]:
         print(f"Could not check for updates: {result['error']}")
         return
-    if result["update_available"]:
-        print(f"Update available: v{result['current']} -> v{result['latest']}")
-        print(f"  {result['url']}")
-    else:
-        print(f"Up to date (v{result['current']}).")
+    print(f"Installed version: {result['current']}")
+    print(f"Latest release:    v{result['latest']}")
+    if not result["update_available"]:
+        print("Already up to date.")
+        return
+
+    print(f"\n{style.BOLD}{style.ACCENT}Update available: v{result['current']} -> "
+          f"v{result['latest']}{style.RESET}")
+    print(f"  {result['url']}")
+    if not _confirm("Download, verify, and apply this update now? A full backup is taken "
+                    "first and any failure is automatically rolled back"):
+        print("Not applying. You can also run this noninteractively any time: "
+              "renewal_cli.py update-apply --yes")
+        return
+
+    rc = renewal_cli.cmd_update_apply(argparse.Namespace(version=None, yes=True, force=False))
+    if rc != 0:
+        print(f"\n{style.RED}Update failed -- see details above. The previous install "
+              f"remains in place and fully functional.{style.RESET}")
+        return
+
+    print(f"\n{style.GREEN}Update applied successfully.{style.RESET} Reopening the "
+          f"updated menu...")
+    # Re-exec a FRESH process from the (now-updated) menu.py on disk -- this process
+    # already has the OLD code loaded in memory, so simply "continuing the loop" would
+    # silently keep running stale code even though the files on disk have changed. This
+    # is the only way to genuinely "reopen the updated menu", not a lookalike of it.
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
 
 
 def action_backup():
@@ -2526,6 +2555,8 @@ def run_menu():
                     action_configure_remote_agent(style)
                 elif label == "Configure Backup Schedule (optional)":
                     action_configure_backup_schedule(style)
+                elif label == "Check for updates":
+                    action_check_updates(style)
                 else:
                     fn()
             except Exception as e:
