@@ -298,6 +298,128 @@ def test_apply_update_rejects_release_missing_expected_assets(tmp_path):
     assert "missing expected assets" in result["error"]
 
 
+def test_apply_update_interrupted_download_mid_transfer_never_touches_install_dir(tmp_path):
+    """Simulates a connection drop partway through the tarball download: download_fn raises
+    AFTER having already written SOME bytes to tarball_path. install_dir must remain fully
+    untouched (download happens into a tempdir, before any backup or move)."""
+    install_dir = _make_install_dir(tmp_path, old_version="1.10.1")
+    config_dir = os.path.join(install_dir, "renewal-config")
+    state_dir = os.path.join(install_dir, "shadow-monitor-state")
+    backup_root = str(tmp_path / "backups")
+
+    def fetch_fn(tag=None):
+        return {"ok": True, "tag": "v1.10.2", "version": "1.10.2", "notes": "",
+                "assets": {updater.ASSET_NAME: "https://x/pkg.tar.gz",
+                           updater.CHECKSUMS_NAME: "https://x/sums"},
+                "error": None}
+
+    calls = {"n": 0}
+
+    def flaky_download(url, dest_path, timeout=60.0, max_bytes=None):
+        calls["n"] += 1
+        with open(dest_path, "wb") as f:
+            f.write(b"partial-bytes-before-the-connection-dropped")
+        raise ConnectionResetError("connection reset by peer")
+
+    result = updater.apply_update(
+        install_dir, config_dir, state_dir, backup_root, tag="v1.10.2",
+        download_fn=flaky_download, fetch_fn=fetch_fn,
+    )
+
+    assert result["ok"] is False
+    assert result["stage"] == "download"
+    assert "connection reset" in result["error"]
+    assert result["backup_path"] is None  # never reached the backup step
+    assert calls["n"] == 1  # failed on the first asset; never attempted the second
+
+    # install_dir completely untouched -- old code, config, and state all intact.
+    old_cli = open(os.path.join(install_dir, "lib", "renewal_cli.py")).read()
+    assert '"1.10.1"' in old_cli
+    assert open(os.path.join(config_dir, "policy.json")).read() == '{"monthly_grant_gb": "100"}'
+    assert open(os.path.join(state_dir, "self.sqlite3"), "rb").read() == b"fake-sqlite-bytes"
+
+
+def test_apply_update_missing_dependency_during_post_update_install_rolls_back(tmp_path):
+    """run_install_upgrade_fn raising ModuleNotFoundError (e.g. a required stdlib-adjacent
+    module missing on this host's Python) must be treated exactly like any other
+    apply_or_verify failure: full rollback, old version restored, error surfaced."""
+    install_dir = _make_install_dir(tmp_path, old_version="1.10.1")
+    config_dir = os.path.join(install_dir, "renewal-config")
+    state_dir = os.path.join(install_dir, "shadow-monitor-state")
+    backup_root = str(tmp_path / "backups")
+
+    new_tarball = _make_fake_package(tmp_path, "1.10.2")
+    new_sums = _make_checksums(tmp_path, new_tarball, updater.ASSET_NAME)
+    fake_files = {"https://x/pkg.tar.gz": new_tarball, "https://x/sums": new_sums}
+
+    def fetch_fn(tag=None):
+        return {"ok": True, "tag": "v1.10.2", "version": "1.10.2", "notes": "",
+                "assets": {updater.ASSET_NAME: "https://x/pkg.tar.gz",
+                           updater.CHECKSUMS_NAME: "https://x/sums"},
+                "error": None}
+
+    def missing_dependency(*a, **k):
+        raise ModuleNotFoundError("No module named 'sqlite3'")
+
+    result = updater.apply_update(
+        install_dir, config_dir, state_dir, backup_root, tag="v1.10.2",
+        download_fn=_real_download_fn(fake_files), fetch_fn=fetch_fn,
+        run_install_upgrade_fn=missing_dependency,
+    )
+
+    assert result["ok"] is False
+    assert result["stage"] == "apply_or_verify"
+    assert result["rolled_back"] is True
+    assert "sqlite3" in result["error"]
+
+    cli_text = open(os.path.join(install_dir, "lib", "renewal_cli.py")).read()
+    assert '"1.10.1"' in cli_text
+    assert not os.path.isdir(os.path.join(install_dir, "lib.pre-update"))
+    assert not os.path.isdir(os.path.join(install_dir, "bin.pre-update"))
+    assert open(os.path.join(config_dir, "policy.json")).read() == '{"monthly_grant_gb": "100"}'
+
+
+def test_apply_update_import_error_in_health_check_rolls_back(tmp_path):
+    """health_check_fn raising ImportError (e.g. the newly-copied lib/ has a broken import --
+    a bad release artifact) must also be caught as a generic apply_or_verify failure and
+    trigger the same clean rollback -- it must not propagate out of apply_update."""
+    install_dir = _make_install_dir(tmp_path, old_version="1.10.1")
+    config_dir = os.path.join(install_dir, "renewal-config")
+    state_dir = os.path.join(install_dir, "shadow-monitor-state")
+    backup_root = str(tmp_path / "backups")
+
+    new_tarball = _make_fake_package(tmp_path, "1.10.2")
+    new_sums = _make_checksums(tmp_path, new_tarball, updater.ASSET_NAME)
+    fake_files = {"https://x/pkg.tar.gz": new_tarball, "https://x/sums": new_sums}
+
+    def fetch_fn(tag=None):
+        return {"ok": True, "tag": "v1.10.2", "version": "1.10.2", "notes": "",
+                "assets": {updater.ASSET_NAME: "https://x/pkg.tar.gz",
+                           updater.CHECKSUMS_NAME: "https://x/sums"},
+                "error": None}
+
+    def broken_health_check(*a, **k):
+        raise ImportError("cannot import name 'quota_engine' from 'renewal_cli'")
+
+    result = updater.apply_update(
+        install_dir, config_dir, state_dir, backup_root, tag="v1.10.2",
+        download_fn=_real_download_fn(fake_files), fetch_fn=fetch_fn,
+        run_install_upgrade_fn=lambda: {"ok": True},
+        health_check_fn=broken_health_check,
+    )
+
+    assert result["ok"] is False
+    assert result["stage"] == "apply_or_verify"
+    assert result["rolled_back"] is True
+    assert "quota_engine" in result["error"]
+
+    cli_text = open(os.path.join(install_dir, "lib", "renewal_cli.py")).read()
+    assert '"1.10.1"' in cli_text
+    assert not os.path.isdir(os.path.join(install_dir, "lib.pre-update"))
+    assert not os.path.isdir(os.path.join(install_dir, "bin.pre-update"))
+    assert result["backup_path"] and os.path.exists(result["backup_path"])
+
+
 def test_full_filesystem_backup_includes_secrets_unlike_the_other_backup_format(tmp_path):
     install_dir = _make_install_dir(tmp_path, old_version="1.10.1")
     backup_root = str(tmp_path / "backups")
