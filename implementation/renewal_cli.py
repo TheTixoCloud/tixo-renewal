@@ -985,6 +985,118 @@ def cmd_install_health_check(args):
     return 0 if result["ok"] else 1
 
 
+# ---------- update (real download/verify/apply, v1.10.2) ----------------------------------------
+
+def cmd_update_check(args):
+    """Read-only: current vs. latest published GitHub release, with release notes. Never
+    downloads or applies anything -- see `update-apply` for that, which always requires
+    either an interactive confirmation or an explicit --yes."""
+    import updater
+    result = updater.fetch_release_info()
+    if not result["ok"]:
+        print(f"Could not check for updates: {result['error']}")
+        return 1
+    newer = menu_is_newer_version(result["version"], VERSION)
+    print(f"Installed version: {VERSION}")
+    print(f"Latest release:    {result['version']} ({result['tag']})")
+    if newer:
+        print("\nAn update is available.")
+        if result["notes"]:
+            print("\nRelease notes:\n" + result["notes"])
+        print(f"\nTo apply: renewal_cli.py update-apply --yes   (or use the menu's "
+              f"'Check for updates' screen for an interactive confirmation)")
+    else:
+        print("\nAlready up to date.")
+    return 0
+
+
+def _lazy_menu():
+    """menu.py imports renewal_cli at module level (for VERSION/paths), so renewal_cli
+    cannot import menu.py at ITS module level without a circular import -- deferred here,
+    used only by the two update commands that want menu.py's already-tested semantic
+    version comparison instead of re-implementing it."""
+    import menu as menu_mod
+    return menu_mod
+
+
+def menu_is_newer_version(latest, current) -> bool:
+    return _lazy_menu().is_newer_version(latest, current)
+
+
+def cmd_update_apply(args):
+    """Downloads, verifies, and applies a release (default: latest) via updater.apply_update
+    -- full safety backup first, atomic-ish code swap (old code moved aside, never deleted,
+    until a post-update health check passes), automatic rollback on any failure. Requires
+    either an interactive 'yes' confirmation or --yes (for scripted/CI use, e.g. a tested
+    upgrade pipeline) -- NEVER applies without one or the other. Restarts only the
+    application's own Web/Telegram services if they were active before the update (never
+    any other service, never Virtualizor, never a host reboot). Never touches renewal
+    policy, VPS quotas, or write-approval state."""
+    import updater
+    target_tag = f"v{args.version}" if args.version else None
+    info = updater.fetch_release_info(tag=target_tag)
+    if not info["ok"]:
+        print(f"Could not fetch release info: {info['error']}")
+        return 1
+
+    menu_mod = _lazy_menu()
+    if not menu_mod.is_newer_version(info["version"], VERSION) and not args.force:
+        print(f"Installed version ({VERSION}) is already >= latest release "
+              f"({info['version']}) -- nothing to do. Pass --force to re-apply anyway.")
+        return 0
+
+    print(f"Current version: {VERSION}")
+    print(f"Target version:  {info['version']} ({info['tag']})")
+    if info["notes"]:
+        print(f"\nRelease notes:\n{info['notes']}\n")
+
+    if not args.yes:
+        confirm = input(f"Apply update to {info['tag']}? This will take a full backup first "
+                         f"and roll back automatically on any failure. Type 'yes' to proceed: ")
+        if confirm.strip().lower() != "yes":
+            print("Cancelled.")
+            return 1
+
+    # Determine which application-owned services were active BEFORE the update, so we
+    # restart only those, and only after the new code has passed its health check.
+    services_to_restart = []
+    for svc in ("virt-renewal-web.service", "virt-renewal-telegram-bot.service"):
+        try:
+            result = subprocess.run(["systemctl", "is-active", svc], capture_output=True,
+                                     text=True, timeout=5)
+            if result.stdout.strip() == "active":
+                services_to_restart.append(svc)
+        except (OSError, subprocess.SubprocessError):
+            pass  # systemctl unavailable (e.g. a non-systemd dev/test environment) -- skip
+
+    print("\nDownloading, verifying, and applying update...")
+    result = updater.apply_update(WORKSPACE_ROOT, CONFIG_DIR, STATE_DIR, BACKUP_DIR,
+                                   tag=info["tag"])
+
+    if not result["ok"]:
+        print(f"\nUPDATE FAILED at stage '{result['stage']}': {result['error']}")
+        if result["rolled_back"]:
+            print("Automatically rolled back -- the previous working install is unchanged.")
+        if result["backup_path"]:
+            print(f"Full safety backup (unaffected either way): {result['backup_path']}")
+        return 1
+
+    print(f"\nUpdate applied successfully: v{VERSION} -> {info['tag']}")
+    print(f"Full pre-update safety backup: {result['backup_path']}")
+
+    for svc in services_to_restart:
+        print(f"Restarting {svc} (was active before the update)...")
+        try:
+            subprocess.run(["systemctl", "restart", svc], timeout=15, check=True)
+            print(f"  {svc}: restarted.")
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"  {svc}: WARNING -- could not restart automatically ({e}). "
+                  f"Restart it manually: sudo systemctl restart {svc}")
+
+    print("\nRe-run 'renewal_cli.py install-health-check' or reopen the menu to verify.")
+    return 0
+
+
 # ---------- uninstall ----------
 
 UNINSTALL_UNIT_NAMES = (
@@ -1785,6 +1897,20 @@ def main():
 
     sub.add_parser("install-health-check", help="Read-only post-change sanity check"
                    ).set_defaults(func=cmd_install_health_check)
+
+    sub.add_parser("update-check", help="Read-only: current vs. latest GitHub release"
+                   ).set_defaults(func=cmd_update_check)
+
+    update_apply_p = sub.add_parser(
+        "update-apply", help="Download, verify, and apply a release (backs up first, "
+                              "rolls back automatically on any failure)")
+    update_apply_p.add_argument("--version", default=None,
+                                 help="Specific version to apply (e.g. 1.10.2); default: latest")
+    update_apply_p.add_argument("--yes", action="store_true",
+                                 help="Skip the interactive confirmation (for scripted use)")
+    update_apply_p.add_argument("--force", action="store_true",
+                                 help="Apply even if the target is not newer than the installed version")
+    update_apply_p.set_defaults(func=cmd_update_apply)
 
     uninstall_module_p = sub.add_parser(
         "uninstall-module",
