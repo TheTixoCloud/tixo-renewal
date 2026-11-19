@@ -1111,26 +1111,101 @@ UNINSTALL_UNIT_NAMES = (
 )
 
 
+REQUIRED_PURGE_PHRASE = "PURGE ALL TIXOCLOUD DATA"
+
+
+def cmd_uninstall_preview(args):
+    """Read-only. Shows exactly what `uninstall`/`uninstall --purge` WOULD do -- never
+    modifies anything. Always run this (or let the menu show it) before confirming either
+    destructive mode."""
+    import uninstaller as un
+    import json as _json
+    preview = un.preview_uninstall(WORKSPACE_ROOT, purge=args.purge)
+    print(_json.dumps(preview, indent=2))
+    return 0
+
+
 def cmd_uninstall(args):
-    for name in UNINSTALL_UNIT_NAMES:
-        local_path = os.path.join(SYSTEMD_OUT_DIR, name)
-        if os.path.exists(local_path):
-            os.remove(local_path)
-    print("Local systemd unit files removed from", SYSTEMD_OUT_DIR)
-    print("If any were installed system-wide, also run (as root, your own explicit action --")
-    print("the apply timer is write-capable, disable it FIRST if it was ever enabled):")
-    print("  sudo systemctl disable --now virt-renewal-apply.timer virt-renewal-monitor.timer virt-renewal-readiness-notifier.timer virt-renewal-inventory-sync.timer virt-renewal-telegram-bot.service virt-renewal-web.service virt-renewal-relay-worker.service virt-renewal-agent.service")
-    print("  sudo rm /etc/systemd/system/virt-renewal-{apply,monitor,readiness-notifier,inventory-sync}.{service,timer} /etc/systemd/system/virt-renewal-{telegram-bot,web,relay-worker,agent}.service")
-    print("  sudo systemctl daemon-reload")
-    print("  rm -f " + WRITE_APPROVAL_MARKER + "  # belt-and-suspenders: ensure no write capability survives uninstall")
+    """Real two-mode uninstall (v1.10.2), replacing the previous version which only ever
+    removed LOCALLY GENERATED systemd unit template copies and printed manual commands for
+    the operator to run themselves. See uninstaller.py's module docstring for the full
+    ownership-verification/safety discipline this builds on.
+
+    Standard mode (default): stops+disables+removes every actually-installed owned systemd
+    unit, removes the global 'tixo-renewal' wrapper, removes application CODE (lib/, bin/,
+    local systemd template copies) -- PRESERVES renewal-config/, shadow-monitor-state/, and
+    backups/ for possible recovery.
+
+    --purge (full purge): everything above PLUS removes renewal-config/ and
+    shadow-monitor-state/ (config, secrets, databases, ledgers). Requires
+    --confirm="PURGE ALL TIXOCLOUD DATA" (exact match) when --yes is also passed (for
+    scripted/tested use); otherwise prompts interactively for that exact phrase. Backups
+    are NEVER removed by either mode -- see the separate `uninstall --purge --delete-backups`
+    flag, which still requires its own confirmation.
+
+    Never touches Virtualizor, customer VPS data, or any file/service this project's own
+    installer did not create."""
+    import uninstaller as un
+    import json as _json
+
     if args.purge:
-        import shutil
-        for d in (STATE_DIR, CONFIG_DIR):
-            if os.path.exists(d):
-                shutil.rmtree(d)
-        print(f"--purge: removed {STATE_DIR} and {CONFIG_DIR}")
+        if args.yes:
+            if args.confirm != REQUIRED_PURGE_PHRASE:
+                print(f"--purge with --yes requires --confirm={REQUIRED_PURGE_PHRASE!r} "
+                      f"(exact match) -- refusing to proceed without it.")
+                return 1
+        else:
+            print(f"This will PERMANENTLY remove all TixoCloud application code, "
+                  f"configuration, secrets, databases, and renewal ledgers under "
+                  f"{WORKSPACE_ROOT}.")
+            print(f"Backups under {WORKSPACE_ROOT}/backups are NOT removed by this.")
+            typed = input(f"Type exactly '{REQUIRED_PURGE_PHRASE}' to proceed, anything "
+                           f"else cancels: ")
+            if typed != REQUIRED_PURGE_PHRASE:
+                print("Cancelled.")
+                return 1
+        report = un.full_purge(WORKSPACE_ROOT)
     else:
-        print("Local ledger/config data kept (pass --purge to remove it too).")
+        if not args.yes:
+            print(f"This will stop/disable/remove TixoCloud's systemd units and remove its "
+                  f"application code under {WORKSPACE_ROOT}. Configuration, secrets, "
+                  f"databases, and backups are PRESERVED.")
+            if input("Type 'UNINSTALL' to proceed, anything else cancels: ") != "UNINSTALL":
+                print("Cancelled.")
+                return 1
+        report = un.standard_uninstall(WORKSPACE_ROOT)
+
+    print(_json.dumps(report, indent=2))
+
+    if args.delete_backups:
+        if not args.yes:
+            backup_dir = os.path.join(WORKSPACE_ROOT, "backups")
+            existing = os.listdir(backup_dir) if os.path.isdir(backup_dir) else []
+            print(f"\nThe following {len(existing)} backup archive(s) would be permanently "
+                  f"deleted:")
+            for name in existing:
+                print(f"  {name}")
+            if input("Type 'DELETE BACKUPS' to proceed, anything else cancels: ") != "DELETE BACKUPS":
+                print("Backups kept.")
+                return 0 if not report["problems"] else 1
+        backup_report = un.delete_backups(WORKSPACE_ROOT)
+        print(_json.dumps(backup_report, indent=2))
+
+    verify = un.verify_no_residue(WORKSPACE_ROOT, purge=args.purge)
+    if not verify["ok"]:
+        print("\nWARNING: residual TixoCloud-owned artifacts remain after uninstall:")
+        for p in verify["problems"]:
+            print(f"  {p}")
+        return 1
+
+    if report["problems"] or report["unknown_entries"]:
+        print("\nUninstall completed with issues -- see 'problems'/'unknown_entries' above. "
+              "This was NOT a silent/complete purge.")
+        return 1
+
+    print("\nUninstall complete. No TixoCloud-owned processes, timers, services, or "
+          "executable launchers remain.")
+    return 0
 
 
 # ---------- apply (structurally blocked without explicit approval) ----------
@@ -1943,8 +2018,25 @@ def main():
     rollback_p.add_argument("--yes", action="store_true")
     rollback_p.set_defaults(func=cmd_rollback)
 
+    uninstall_preview_p = sub.add_parser(
+        "uninstall-preview", help="Read-only: exactly what 'uninstall'/'uninstall --purge' "
+                                   "would do, without doing it")
+    uninstall_preview_p.add_argument("--purge", action="store_true")
+    uninstall_preview_p.set_defaults(func=cmd_uninstall_preview)
+
     uninstall_p = sub.add_parser("uninstall")
-    uninstall_p.add_argument("--purge", action="store_true")
+    uninstall_p.add_argument("--purge", action="store_true",
+                              help="Full purge: also removes config/secrets/databases/ledgers "
+                                   "(never backups/ -- see --delete-backups). Requires typing "
+                                   "'PURGE ALL TIXOCLOUD DATA' (or --confirm with --yes).")
+    uninstall_p.add_argument("--confirm", default=None,
+                              help="Must exactly equal 'PURGE ALL TIXOCLOUD DATA' when "
+                                   "used with --purge --yes (scripted/tested use)")
+    uninstall_p.add_argument("--delete-backups", action="store_true",
+                              help="ALSO delete install_dir/backups/ -- separate from, and "
+                                   "requires its own confirmation beyond, --purge")
+    uninstall_p.add_argument("--yes", action="store_true",
+                              help="Skip interactive confirmation prompts (for scripted use)")
     uninstall_p.set_defaults(func=cmd_uninstall)
 
     sub.add_parser("policy-show").set_defaults(func=cmd_policy_show)

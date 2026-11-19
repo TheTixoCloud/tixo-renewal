@@ -626,3 +626,128 @@ def test_install_sh_never_launches_menu_after_a_failed_install(tmp_path):
     assert r.returncode != 0
     assert "Launching the TixoCloud management menu" not in r.stdout
     assert not install_dir.exists()
+
+
+# ---------- v1.10.2: real CLI uninstall/purge, end to end against the built package --------
+
+def _install_real_package(tmp_path):
+    result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                             capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    with tarfile.open(pkg) as tf:
+        tf.extractall(staging, filter="data")
+
+    install_dir = tmp_path / "opt-tixo-renewal"
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+    env["TIXO_RENEWAL_NO_AUTO_MENU"] = "1"
+    r = subprocess.run(["bash", "install.sh"], cwd=str(staging), capture_output=True,
+                        text=True, timeout=30, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return str(install_dir)
+
+
+def _cli_env(install_dir):
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_INSTALL_DIR"] = install_dir
+    env["PYTHONPATH"] = os.path.join(install_dir, "lib")
+    return env
+
+
+def test_cli_uninstall_preview_is_real_and_read_only(tmp_path):
+    install_dir = _install_real_package(tmp_path)
+    cli_path = os.path.join(install_dir, "bin", "renewal_cli.py")
+    before = sorted(os.listdir(install_dir))
+
+    r = subprocess.run([sys.executable, cli_path, "uninstall-preview"], capture_output=True,
+                        text=True, timeout=15, env=_cli_env(install_dir))
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = json.loads(r.stdout)
+    assert data["mode"] == "standard"
+    assert "lib" in data["will_remove_entries"]
+    assert "renewal-config" in data["will_preserve_entries"]
+
+    after = sorted(os.listdir(install_dir))
+    assert before == after
+
+
+def test_cli_uninstall_standard_removes_code_preserves_data(tmp_path):
+    install_dir = _install_real_package(tmp_path)
+    cli_path = os.path.join(install_dir, "bin", "renewal_cli.py")
+
+    r = subprocess.run([sys.executable, cli_path, "uninstall", "--yes"], capture_output=True,
+                        text=True, timeout=15, env=_cli_env(install_dir))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "Uninstall complete" in r.stdout
+
+    assert not os.path.exists(os.path.join(install_dir, "lib"))
+    assert not os.path.exists(os.path.join(install_dir, "bin"))
+    assert os.path.exists(os.path.join(install_dir, "renewal-config", "policy.json"))
+    assert os.path.exists(os.path.join(install_dir, "renewal-config", "nodes.json"))
+
+
+def test_cli_uninstall_purge_requires_exact_confirm_phrase(tmp_path):
+    install_dir = _install_real_package(tmp_path)
+    cli_path = os.path.join(install_dir, "bin", "renewal_cli.py")
+
+    r = subprocess.run([sys.executable, cli_path, "uninstall", "--purge", "--yes",
+                         "--confirm", "purge all tixocloud data"],  # wrong case -- must fail
+                        capture_output=True, text=True, timeout=15, env=_cli_env(install_dir))
+    assert r.returncode != 0
+    assert os.path.exists(os.path.join(install_dir, "lib"))  # nothing was touched
+
+
+def test_cli_uninstall_purge_removes_config_and_secrets_never_backups(tmp_path):
+    install_dir = _install_real_package(tmp_path)
+    cli_path = os.path.join(install_dir, "bin", "renewal_cli.py")
+
+    # Create a fake backup to confirm it survives the purge.
+    backups_dir = os.path.join(install_dir, "backups")
+    os.makedirs(backups_dir, exist_ok=True)
+    with open(os.path.join(backups_dir, "fake-backup.tar.gz"), "wb") as f:
+        f.write(b"fake")
+
+    r = subprocess.run([sys.executable, cli_path, "uninstall", "--purge", "--yes",
+                         "--confirm", "PURGE ALL TIXOCLOUD DATA"],
+                        capture_output=True, text=True, timeout=15, env=_cli_env(install_dir))
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    assert not os.path.exists(os.path.join(install_dir, "lib"))
+    assert not os.path.exists(os.path.join(install_dir, "renewal-config"))
+    assert not os.path.exists(os.path.join(install_dir, "shadow-monitor-state"))
+    # Backups survive a full purge by default.
+    assert os.path.exists(os.path.join(install_dir, "backups", "fake-backup.tar.gz"))
+
+
+def test_cli_uninstall_purge_then_delete_backups_removes_everything(tmp_path):
+    install_dir = _install_real_package(tmp_path)
+    cli_path = os.path.join(install_dir, "bin", "renewal_cli.py")
+    backups_dir = os.path.join(install_dir, "backups")
+    os.makedirs(backups_dir, exist_ok=True)
+    with open(os.path.join(backups_dir, "fake-backup.tar.gz"), "wb") as f:
+        f.write(b"fake")
+
+    r = subprocess.run([sys.executable, cli_path, "uninstall", "--purge", "--yes",
+                         "--confirm", "PURGE ALL TIXOCLOUD DATA", "--delete-backups"],
+                        capture_output=True, text=True, timeout=15, env=_cli_env(install_dir))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not os.path.exists(backups_dir)
+
+
+def test_cli_uninstall_after_partial_install_handles_missing_units_gracefully(tmp_path):
+    """Partial install (code present, nothing ever installed system-wide) must uninstall
+    cleanly -- no crash, no error about missing systemd units."""
+    install_dir = _install_real_package(tmp_path)
+    # Simulate a partial install: remove the renewal-config dir entirely (as if install had
+    # failed partway, matching the ir2 scenario from the v1.10.1 fix).
+    shutil.rmtree(os.path.join(install_dir, "renewal-config"))
+    cli_path = os.path.join(install_dir, "bin", "renewal_cli.py")
+
+    r = subprocess.run([sys.executable, cli_path, "uninstall", "--yes"], capture_output=True,
+                        text=True, timeout=15, env=_cli_env(install_dir))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not os.path.exists(os.path.join(install_dir, "lib"))

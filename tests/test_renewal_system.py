@@ -166,6 +166,13 @@ def cli_env(tmp_path, monkeypatch):
     config_dir = str(tmp_path / "renewal-config")
     backup_dir = str(tmp_path / "backups")
     systemd_dir = str(tmp_path / "systemd")
+    # WORKSPACE_ROOT is patched too so it stays aligned with the individually-patched dirs
+    # above -- in every real deployment STATE_DIR/CONFIG_DIR/BACKUP_DIR/SYSTEMD_OUT_DIR are
+    # ALL derived from WORKSPACE_ROOT (see renewal_cli.py's own module-level definitions),
+    # and cmd_uninstall/cmd_update_apply rely on that same alignment to find the right
+    # install_dir -- letting WORKSPACE_ROOT silently diverge here would make this fixture
+    # describe a layout no real install ever has.
+    monkeypatch.setattr(renewal_cli, "WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setattr(renewal_cli, "STATE_DIR", state_dir)
     monkeypatch.setattr(renewal_cli, "CONFIG_DIR", config_dir)
     monkeypatch.setattr(renewal_cli, "BACKUP_DIR", backup_dir)
@@ -216,7 +223,7 @@ def test_uninstall_removes_all_three_unit_pairs_not_just_monitor(cli_env):
     leaving apply/notifier files behind (and never mentioning the write-capable apply timer
     in its system-wide cleanup instructions)."""
     renewal_cli.cmd_install(argparse_namespace())
-    renewal_cli.cmd_uninstall(argparse_namespace(purge=False))
+    renewal_cli.cmd_uninstall(argparse_namespace(purge=False, yes=True, confirm=None, delete_backups=False))
     for name in ("virt-renewal-monitor.service", "virt-renewal-monitor.timer",
                  "virt-renewal-apply.service", "virt-renewal-apply.timer",
                  "virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer",
@@ -446,14 +453,16 @@ def test_rollback_without_yes_refuses(cli_env):
 
 def test_uninstall_removes_local_unit_files_but_keeps_data_by_default(cli_env):
     renewal_cli.cmd_install(argparse_namespace())
-    renewal_cli.cmd_uninstall(argparse_namespace(purge=False))
+    renewal_cli.cmd_uninstall(argparse_namespace(purge=False, yes=True, confirm=None, delete_backups=False))
     assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-monitor.service"))
     assert os.path.isdir(renewal_cli.STATE_DIR)  # data kept
 
 
 def test_uninstall_purge_removes_data(cli_env):
     renewal_cli.cmd_install(argparse_namespace())
-    renewal_cli.cmd_uninstall(argparse_namespace(purge=True))
+    renewal_cli.cmd_uninstall(argparse_namespace(purge=True, yes=True,
+                                                   confirm=renewal_cli.REQUIRED_PURGE_PHRASE,
+                                                   delete_backups=False))
     assert not os.path.exists(renewal_cli.STATE_DIR)
 
 
@@ -1199,7 +1208,7 @@ def test_write_backup_systemd_unit_custom_interval_does_not_touch_other_units(cl
 
 def test_uninstall_removes_backup_unit_files(cli_env):
     renewal_cli.cmd_install(argparse_namespace())
-    renewal_cli.cmd_uninstall(argparse_namespace(purge=False))
+    renewal_cli.cmd_uninstall(argparse_namespace(purge=False, yes=True, confirm=None, delete_backups=False))
     assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-backup.service"))
     assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-backup.timer"))
 
