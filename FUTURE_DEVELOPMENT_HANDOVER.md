@@ -264,35 +264,54 @@ components.
 Neither host was touched while producing this release. The following is a checklist for an
 operator to run manually, not something this session executed.
 
+**Important nuance confirmed by real testing during this release (see the closeout
+report):** `update-check`/`update-apply` are themselves *new in v1.10.2* — a host still
+running v1.10.0 or v1.10.1 does not have these commands yet, so it cannot "self-update" to
+v1.10.2 using them. The first hop to v1.10.2 on each host must go through the same
+bootstrap/`install.sh` path used for a fresh install (which is idempotent and
+config-preserving — see `docs/INSTALL_GUIDE.md` → Upgrade). Only *after* a host is running
+v1.10.2 do `update-check`/`update-apply` become available for the *next* release.
+
 **ir1** (v1.10.0 code on disk, Web + Telegram + TLS + 5 systemd timers + a live SOCKS5 patch
 and existing config/ledger, per the v1.10.1 handover):
 1. Preflight: `tixo-renewal backup` (fresh app-level backup, in addition to whatever infra
-   snapshot ir1's owner normally takes), confirm free disk space for a second full
-   filesystem backup (`update-apply` takes its own automatically), confirm
+   snapshot ir1's owner normally takes), confirm free disk space, confirm
    `systemctl list-timers` shows the expected 5 owned timers before starting.
-2. Update command (interactive, from the existing install directory):
-   `tixo-renewal update-check` to confirm v1.10.2 is offered, then `tixo-renewal update-apply`
-   (prompts for confirmation; add `--yes` only for a pre-agreed non-interactive run).
+2. Update command (from the existing install directory, as root or with
+   `TIXO_RENEWAL_INSTALL_DIR` set to ir1's real install path):
+   ```
+   curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.2/deploy/bootstrap.sh | sudo bash
+   ```
+   This re-extracts the v1.10.2 package and runs `install.sh` against the *existing* install
+   directory — idempotent, never overwrites `policy.json`/`nodes.json`/secrets. (Verified
+   during this release: a real v1.10.0-shaped install directory, with its original
+   `policy.json`/`nodes.json`/ledger content, upgraded cleanly to v1.10.2 via this exact
+   mechanism — see the closeout report.)
 3. Post-update verification: `tixo-renewal --status`, confirm `VERSION` reports `1.10.2`;
    confirm Web (`curl -s localhost:<port>/api/health` or equivalent) and the Telegram bot
    both respond; confirm `systemctl list-timers` still shows the same 5 timers, still
    enabled; confirm `policy.json`/`nodes.json`/secrets/the SOCKS5 patch are byte-identical to
    pre-update (diff against the pre-update backup).
-4. Rollback (only if step 3 fails): `update-apply` already auto-rolls-back on a failed
-   health check, so this should only be needed if a problem surfaces *after* the process
-   exits ok. Restore from the full filesystem backup `update-apply` printed the path to
-   (`tar -xzf <backup_path> -C /` after stopping the owned services), or from the step-1
-   `tixo-renewal backup` as a second line of defense, then restart the owned services.
+4. Rollback (only if step 3 fails): restore from the step-1 `tixo-renewal backup`, or from
+   whatever infra-level snapshot was taken beforehand, then restart the owned services.
+5. **From this point on** (ir1 now running v1.10.2), future releases beyond v1.10.2 can use
+   `tixo-renewal update-check` / `tixo-renewal update-apply` directly — which take their own
+   full filesystem backup automatically and auto-roll-back on a failed health check (verified
+   end-to-end during this release, including a genuine induced-failure rollback — see the
+   closeout report).
 
 **ir2** (existing v1.10.1 install, independent Virtualizor environment, no shared
 credentials/ledger with ir1):
 1. Preflight: same as ir1 step 1, scoped to ir2's own install directory and timers.
-2. Update command: identical to ir1 step 2, run against ir2's own install.
+2. Update command: identical to ir1 step 2 (the bootstrap one-liner), run against ir2's own
+   install. (Also verified during this release against a real v1.10.1 install directory —
+   see the closeout report.)
 3. Post-update verification: identical to ir1 step 3, scoped to ir2's own services/timers/
    config. ir2 has no Web/Telegram services active per the v1.10.1 handover — skip those
    checks if still true, but re-verify current state first rather than assuming it hasn't
    changed.
 4. Rollback: identical to ir1 step 4.
+5. From this point on: identical to ir1 step 5.
 
 Neither procedure above has been run. Do not run it without the operator's explicit
 go-ahead, and never run both hosts' updates simultaneously without first confirming each
