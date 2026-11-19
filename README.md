@@ -9,12 +9,14 @@ them.
 ## One-command install (Ubuntu 24.04 + Virtualizor)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.1/deploy/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.2/deploy/bootstrap.sh | sudo bash
 ```
 
-This is pinned to the `v1.10.1` release tag (never a mutable branch), downloads the release
+This is pinned to the `v1.10.2` release tag (never a mutable branch), downloads the release
 tarball and its published `SHA256SUMS` from that *same* immutable release, verifies the
-checksum locally, then runs `install.sh`. After install, manage everything through:
+checksum locally, then runs `install.sh`. When run from an interactive terminal (including a
+piped `curl | bash`, via `/dev/tty`), a successful install automatically opens the management
+menu; a failed install never does. After install, manage everything through:
 
 ```bash
 tixo-renewal           # interactive menu: dashboard, credentials, gift/interval config,
@@ -95,11 +97,28 @@ zero-vs-unset guarantees).
 
 ## CLI commands
 
-`install`, `status`, `dry-run`, `verify`, `backup`, `rollback`, `uninstall`, `policy-show`,
-`policy-validate`, `preview`, `store-credentials`, `validate-credentials`, `diagnose-api`,
-`inspect-vps`, `apply`, `apply-due`, `resolve-operation`. Every command's exact read/write
-behavior is documented in `implementation/renewal_cli.py`'s module docstring and in
-`docs/DEPLOYMENT.md`. The `tixo-renewal` menu wraps the common ones in a guided interface.
+`install`, `status`, `dry-run`, `verify`, `backup`, `rollback`, `uninstall`,
+`uninstall-preview`, `update-check`, `update-apply`, `policy-show`, `policy-validate`,
+`preview`, `store-credentials`, `validate-credentials`, `diagnose-api`, `inspect-vps`,
+`apply`, `apply-due`, `resolve-operation`. Every command's exact read/write behavior is
+documented in `implementation/renewal_cli.py`'s module docstring and in `docs/DEPLOYMENT.md`.
+The `tixo-renewal` menu wraps the common ones (including "Check for updates" and "Uninstall")
+in a guided interface.
+
+`update-check` queries the latest published GitHub release and reports whether a newer
+version is available (never downloads or modifies anything). `update-apply` downloads,
+checksum-verifies, and applies a specific or latest release: it takes a full raw filesystem
+backup of the install directory first, preserves `renewal-config/` (policy, nodes, secrets,
+`WRITE_APPROVED`) and `shadow-monitor-state/` (the ledger) untouched, restarts any
+already-active Web/Telegram services afterward, and automatically rolls back to the exact
+pre-update state if the post-update health check fails — it requires `--yes` (or interactive
+confirmation) and never applies silently.
+
+`uninstall` supports two modes: standard (removes app code and app-owned systemd
+services/timers, preserves `renewal-config/`, `shadow-monitor-state/`, and backups) and
+`--purge` (removes everything app-owned, including config/secrets/ledger/backups, and
+requires typing the exact confirmation phrase printed by `uninstall-preview`). Neither mode
+ever touches Virtualizor itself, other VPSs, or any file/service it does not own.
 
 ## Safety model
 

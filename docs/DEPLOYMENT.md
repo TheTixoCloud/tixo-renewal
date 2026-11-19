@@ -88,10 +88,24 @@ python3 /opt/tixo-renewal/bin/renewal_cli.py backup
 python3 /opt/tixo-renewal/bin/renewal_cli.py rollback --node self --backup-file <name> --yes
 ```
 
+## Updating to a newer release (ON the Virtualizor host, v1.10.2+)
+
+```bash
+cd /opt/tixo-renewal
+python3 bin/renewal_cli.py update-check          # read-only
+python3 bin/renewal_cli.py update-apply --yes    # backs up first; auto-rolls-back on failure
+```
+
+See `docs/INSTALL_GUIDE.md` for the full behavior (what's preserved, what triggers a
+rollback). Never run this against `ir1` or `ir2` without an operator's explicit go-ahead —
+see `FUTURE_DEVELOPMENT_HANDOVER.md` for the prepared, host-specific checklist.
+
 ## Uninstall (ON the Virtualizor host)
 
 ```bash
 cd /opt/tixo-renewal   # or wherever install.sh reported
+python3 bin/renewal_cli.py uninstall-preview            # read-only, shows what would happen
 python3 bin/renewal_cli.py uninstall          # keeps ledger/config
-python3 bin/renewal_cli.py uninstall --purge  # removes everything local
+python3 bin/renewal_cli.py uninstall --purge  # removes everything local (requires typing
+                                               # 'PURGE ALL TIXOCLOUD DATA' when prompted)
 ```

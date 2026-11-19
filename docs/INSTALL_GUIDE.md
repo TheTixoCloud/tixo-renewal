@@ -28,6 +28,11 @@ What it does (and nothing more):
   That is always a separate, manual, explicit step (printed at the end of install).
 - Installs a global `tixo-renewal` command (launches the interactive menu) if
   `/usr/local/bin` is writable.
+- **(v1.10.2+)** If `install.sh` was run from a genuinely interactive terminal — including a
+  piped `curl | bash` one-liner, via explicit `/dev/tty` redirection — a *successful* install
+  automatically opens the `tixo-renewal` management menu afterward. A failed install never
+  does this. Set `TIXO_RENEWAL_NO_AUTO_MENU=1` beforehand to suppress it for a scripted or
+  CI install.
 
 Nothing is enabled. Write capability (an actual renewal) remains permanently blocked until
 you deliberately create `renewal-config/WRITE_APPROVED`.
@@ -90,15 +95,47 @@ Valid `--module` values: `telegram`, `web`, `relay_worker`, `agent`, `backup_sch
 Disables the module (`enabled=False`), optionally purges its secret, removes its generated
 systemd unit file. Never touches the core install, any other module, or historical data.
 
+## Checking for and applying updates (v1.10.2+)
+
+```bash
+renewal_cli.py update-check              # read-only: current vs. latest GitHub release
+renewal_cli.py update-apply              # interactive confirmation required
+renewal_cli.py update-apply --yes        # scripted use
+renewal_cli.py update-apply --version 1.10.2 --yes   # a specific version instead of latest
+```
+
+`update-apply` re-fetches the target release, downloads and checksum-verifies the package
+**before touching anything**, takes a full raw filesystem backup (printed path — this is the
+complete-filesystem format, including secrets, distinct from `backup-full`'s secret-excluding
+format), swaps in the new code, re-runs the idempotent install step, and runs a health
+check. `renewal-config/` and `shadow-monitor-state/` are never touched. On any failure at
+any stage, the previous code is restored exactly and the command exits nonzero with the
+failing stage named — it never leaves the install half-updated. The interactive menu's
+"Check for updates" screen wraps this same flow and reopens the (now-updated) menu on
+success.
+
 ## Full uninstall (the whole local install)
 
 ```bash
-renewal_cli.py uninstall          # removes local systemd unit files only, keeps all data
-renewal_cli.py uninstall --purge  # also deletes shadow-monitor-state/ and renewal-config/
+renewal_cli.py uninstall-preview               # read-only: shows exactly what would happen
+renewal_cli.py uninstall-preview --purge       # same, for purge mode
+renewal_cli.py uninstall                       # standard: removes app code + app-owned
+                                                # systemd units; KEEPS renewal-config/,
+                                                # shadow-monitor-state/, and backups/
+renewal_cli.py uninstall --purge               # full purge: ALSO removes config/secrets/
+                                                # databases/ledgers (not backups/ unless
+                                                # --delete-backups is also given) -- requires
+                                                # typing 'PURGE ALL TIXOCLOUD DATA' when
+                                                # prompted (or --confirm 'PURGE ALL TIXOCLOUD
+                                                # DATA' --yes for scripted use)
 ```
 
-If any unit was ever actually installed into `/etc/systemd/system`, the command prints the
-exact `systemctl disable --now ...` / `rm` commands — it never runs them for you.
+Both modes only stop/disable/remove systemd units and files this project itself owns (a
+fixed allowlist, matched by name AND by checking for a known signature file inside each
+directory before deleting it — never by directory name alone, and never a glob/wildcard
+match) — an unrelated file sitting in the install directory, or any Virtualizor/VPS data,
+is never touched by either mode. The interactive menu's "Uninstall" screen wraps this same
+flow and exits the process cleanly afterward (both modes delete the menu's own source file).
 
 ## Idempotent repeated installation
 

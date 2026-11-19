@@ -1,7 +1,7 @@
 # Known Limitations & Technical Debt
 
-Honest list, compiled at project closeout (v1.10.1). Each item notes impact and suggested
-next step.
+Honest list, compiled at project closeout (v1.10.2, updated from the v1.10.1 version of this
+file). Each item notes impact and suggested next step.
 
 ## 1. `deploy/install.sh`'s `APP_VERSION` detection line — RESOLVED in v1.10.1
 
@@ -92,8 +92,24 @@ current test suite.
 production deployment safety during this engagement) are BOTH called "backups" in
 conversation but have very different scope — the former deliberately excludes secrets, the
 latter includes everything. `docs/BACKUP_AND_RESTORE.md` and `docs/ARCHITECTURE.md` now
-both document this distinction explicitly; worth considering a CLI subcommand for the raw
-full-tree variant too, rather than it only existing as an ad hoc `tar` invocation.
+both document this distinction explicitly. **Partially addressed in v1.10.2**:
+`updater.create_full_filesystem_backup()` formalizes the raw full-tree variant as a real,
+tested function (used automatically by `update-apply` before every update) — but it is still
+only reachable through the updater, not as a standalone operator-invokable CLI subcommand of
+its own.
+
+## 12. v1.10.2 in-app updater and uninstaller are untested against two specific real-world
+    upgrade paths
+
+`update-apply`'s full CLI flow is covered end-to-end against fixture-built "new version"
+tarballs (see `tests/test_renewal_system.py` and `tests/test_updater.py`), including
+checksum failure, health-check-triggered rollback, interrupted downloads, missing
+dependencies, and import errors during the post-update step. What remains unverified as of
+this closeout: an actual upgrade run against the **real, published** v1.10.2 release
+artifact starting from genuine v1.10.0-shaped and v1.10.1-shaped install directories (as
+opposed to a synthetic fixture), and both uninstall modes run against that same published
+artifact rather than the in-repo `implementation/` modules. See the closeout report for
+which of these were actually exercised before publishing.
 
 ## 11. Telegram relay/agent modules are "locally tested, not yet cross-host validated"
 

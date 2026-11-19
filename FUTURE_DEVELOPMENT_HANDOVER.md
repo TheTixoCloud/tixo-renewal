@@ -1,13 +1,15 @@
 # TixoCloud Control Center — Future Development Handover
 
 **Status at handover: v1.10.0 in production on ir1 (web/Telegram live and verified
-working); v1.10.1 is the latest tagged GitHub release (installer + README fixes — see
-`docs/RELEASE_NOTES_v1.10.1.md`), not yet deployed to ir1 or ir2. ir2's first install is
-still pending — it previously failed with the exact bug v1.10.1 fixes. Production (ir1)
-code now matches the v1.10.1 release source for every file except `renewal_cli.VERSION`
-itself (ir1 still reports v1.10.0 — the application code is otherwise current). See
-`docs/DEVELOPMENT_PROGRESS.md` for the full chronological history and
-`docs/KNOWN_LIMITATIONS.md` for honest outstanding issues.**
+working); v1.10.2 is the latest tagged GitHub release (real in-app updater, auto-launch
+install menu, two-mode uninstaller — see `docs/RELEASE_NOTES_v1.10.2.md`), not yet deployed
+to ir1 or ir2. ir2's first install is still pending — it previously failed with the exact
+bug v1.10.1 fixed (see `docs/KNOWN_LIMITATIONS.md` §1). Production (ir1) code was, as of the
+v1.10.1 handover, current for every file except `renewal_cli.VERSION` itself (ir1 still
+reports v1.10.0). **No code on ir1 or ir2 has been touched as part of the v1.10.2 work** —
+both remain exactly as the v1.10.1 handover left them; see §17 for the prepared (not
+executed) upgrade procedure. See `docs/DEVELOPMENT_PROGRESS.md` for the full chronological
+history and `docs/KNOWN_LIMITATIONS.md` for honest outstanding issues.**
 
 ## 1. What TixoCloud currently does
 
@@ -86,7 +88,7 @@ gh release create vX.Y.Z deploy/tixo-renewal-package.tar.gz deploy/SHA256SUMS \
 and `test_readme_install_command_matches_current_version` both guard against this drifting
 again, but check anyway):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.1/deploy/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.2/deploy/bootstrap.sh | sudo bash
 ```
 
 Full procedure in `docs/DEPLOYMENT.md`. Short version for an **existing** install:
@@ -97,7 +99,9 @@ Full procedure in `docs/DEPLOYMENT.md`. Short version for an **existing** instal
 4. Run `install.sh` from the staging directory — as of v1.10.1 this completes cleanly
    end-to-end (the `ModuleNotFoundError` partial-install bug from v1.10.0 and earlier is
    fixed; see `docs/KNOWN_LIMITATIONS.md` §1). Never overwrites existing
-   `policy.json`/`nodes.json`/secrets.
+   `policy.json`/`nodes.json`/secrets. As of v1.10.2, a successful install run from an
+   interactive terminal (including piped `curl | bash`) automatically opens the management
+   menu afterward; a failed install never does.
 5. Run `install-health-check`; confirm it reports `{"ok": true}`.
 6. If a Web/Telegram service was running, restart ONLY that service
    (`systemctl restart virt-renewal-web.service` / `...-telegram-bot.service`) — the five
@@ -251,6 +255,45 @@ components.
 
 - `TixoCloud-Final-Development-Archive.zip` — sanitized source + full git history + all
   documentation (this file included) — see the accompanying closeout report for its exact
-  path/checksum.
-- Production recovery backup — encrypted, stored separately from the development archive,
-  never in Git — see the closeout report for its path/checksum and restore instructions.
+  path/checksum. **This v1.10.2 closeout deliberately does not include a production
+  recovery backup** — none was requested or created; see §17 for how to apply this release
+  to ir1/ir2 safely when the operator chooses to.
+
+## 17. Prepared (not executed) ir1/ir2 upgrade procedure for v1.10.2
+
+Neither host was touched while producing this release. The following is a checklist for an
+operator to run manually, not something this session executed.
+
+**ir1** (v1.10.0 code on disk, Web + Telegram + TLS + 5 systemd timers + a live SOCKS5 patch
+and existing config/ledger, per the v1.10.1 handover):
+1. Preflight: `tixo-renewal backup` (fresh app-level backup, in addition to whatever infra
+   snapshot ir1's owner normally takes), confirm free disk space for a second full
+   filesystem backup (`update-apply` takes its own automatically), confirm
+   `systemctl list-timers` shows the expected 5 owned timers before starting.
+2. Update command (interactive, from the existing install directory):
+   `tixo-renewal update-check` to confirm v1.10.2 is offered, then `tixo-renewal update-apply`
+   (prompts for confirmation; add `--yes` only for a pre-agreed non-interactive run).
+3. Post-update verification: `tixo-renewal --status`, confirm `VERSION` reports `1.10.2`;
+   confirm Web (`curl -s localhost:<port>/api/health` or equivalent) and the Telegram bot
+   both respond; confirm `systemctl list-timers` still shows the same 5 timers, still
+   enabled; confirm `policy.json`/`nodes.json`/secrets/the SOCKS5 patch are byte-identical to
+   pre-update (diff against the pre-update backup).
+4. Rollback (only if step 3 fails): `update-apply` already auto-rolls-back on a failed
+   health check, so this should only be needed if a problem surfaces *after* the process
+   exits ok. Restore from the full filesystem backup `update-apply` printed the path to
+   (`tar -xzf <backup_path> -C /` after stopping the owned services), or from the step-1
+   `tixo-renewal backup` as a second line of defense, then restart the owned services.
+
+**ir2** (existing v1.10.1 install, independent Virtualizor environment, no shared
+credentials/ledger with ir1):
+1. Preflight: same as ir1 step 1, scoped to ir2's own install directory and timers.
+2. Update command: identical to ir1 step 2, run against ir2's own install.
+3. Post-update verification: identical to ir1 step 3, scoped to ir2's own services/timers/
+   config. ir2 has no Web/Telegram services active per the v1.10.1 handover — skip those
+   checks if still true, but re-verify current state first rather than assuming it hasn't
+   changed.
+4. Rollback: identical to ir1 step 4.
+
+Neither procedure above has been run. Do not run it without the operator's explicit
+go-ahead, and never run both hosts' updates simultaneously without first confirming each
+independently.

@@ -968,3 +968,37 @@ nothing was deployed to `ir1.tixocloud.com`. A disposable, localhost-only previe
 host only, for visual inspection. Publishing the release and deploying to production each
 remain gated behind a separate, explicit operator approval. Telegram connectivity and
 HTTPS/public exposure were both deliberately left untouched this round.
+
+## v1.10.0 / v1.10.1
+
+See `docs/RELEASE_NOTES_v1.10.1.md` and `docs/KNOWN_LIMITATIONS.md` §1-3 for what shipped
+in these two releases (installer/release-process fixes) — not duplicated here.
+
+## v1.10.2 — real updater, auto-launch install menu, two-mode uninstaller
+
+Closed the three remaining gaps in the release lifecycle, all fully implemented and tested
+rather than partially stubbed:
+
+- **`implementation/updater.py`** (new): real download/checksum-verify/apply/rollback engine
+  backing `update-check`/`update-apply`. Found and fixed a late-binding default-argument bug
+  during this round's own testing — `apply_update()`'s `download_fn`/`fetch_fn` defaults were
+  bound to the original function objects at module-import time, so a caller relying on the
+  defaults could not be redirected by monkeypatching the module attributes; fixed by
+  resolving both lazily inside the function body.
+- **`implementation/uninstaller.py`** (new): standard and `--purge` uninstall modes, both
+  gated on ownership verification (directory name AND a known signature file inside it,
+  never name alone) and a fixed systemd-unit allowlist (never a glob match).
+- **`deploy/install.sh`**: auto-launches the management menu after a successful interactive
+  install (including piped `curl | bash`, via explicit `/dev/tty` redirection, since stdin
+  is already consumed by the script's own source at that point) — never after a failed one.
+- New tests: `tests/test_updater.py` (18), `tests/test_uninstaller.py` (22), plus menu- and
+  deploy-package-level coverage, including real-PTY tests of the auto-launch behavior
+  (`subprocess.run()` alone can't exercise this path, since it makes `[ -t 1 ]` false).
+- **Stable version bump**: `renewal_cli.VERSION` 1.10.1 -> **1.10.2**. `deploy/bootstrap.sh`'s
+  default pinned tag, `README.md`'s install command, and `docs/CLI_REFERENCE.md`/
+  `docs/INSTALL_GUIDE.md`/`docs/DEPLOYMENT.md` all updated to match.
+
+**Full suite: 1374 passing, 0 failed.** New doc: `docs/RELEASE_NOTES_v1.10.2.md`. Neither
+`ir1` nor `ir2` was touched — see `FUTURE_DEVELOPMENT_HANDOVER.md` §17 for the prepared
+(not executed) upgrade procedure for both hosts. No production recovery backup was created
+as part of this round, per explicit operator instruction.

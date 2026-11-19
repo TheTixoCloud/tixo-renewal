@@ -21,11 +21,28 @@ install-rollback --backup-file F --yes
                             Restores config/state from a full backup archive (destructive by
                             design -- safety-copies current state first).
 install-health-check        Read-only post-change sanity check (JSON).
+update-check                Read-only: current vs. latest published GitHub release.
+update-apply [--version V] [--yes] [--force]
+                            Downloads, checksum-verifies, and applies a release (latest, or
+                            a specific --version). Takes a full raw filesystem backup first;
+                            preserves renewal-config/ and shadow-monitor-state/ untouched;
+                            auto-rolls-back on any failure (bad checksum, failed download,
+                            missing dependency, broken import, failed health check). Requires
+                            --yes or interactive confirmation; --force applies even if the
+                            target isn't newer than the installed version.
 uninstall-module --module {telegram,web,relay_worker,agent,backup_schedule} [--purge-secrets]
                             Disables ONE optional module without touching the core install.
-uninstall [--purge]         Removes locally generated systemd unit files (prints the manual
-                            `systemctl disable` command for any installed into
-                            /etc/systemd/system -- never does that automatically).
+uninstall-preview [--purge]  Read-only: exactly what `uninstall`/`uninstall --purge` would do
+                            (which units stop, which paths are removed vs. preserved), without
+                            doing it.
+uninstall [--purge] [--confirm PHRASE] [--delete-backups] [--yes]
+                            Standard mode: stops/disables only the app's own systemd units,
+                            removes app code, preserves renewal-config/, shadow-monitor-state/,
+                            and existing backups. --purge also removes config/secrets/
+                            databases/ledgers (never backups/ unless --delete-backups is also
+                            given) -- requires typing 'PURGE ALL TIXOCLOUD DATA' (or --confirm
+                            with that exact phrase, for scripted use with --yes). Never removes
+                            Virtualizor data, other VPSs, or anything not app-owned.
 ```
 
 ## Status / verification (read-only)
