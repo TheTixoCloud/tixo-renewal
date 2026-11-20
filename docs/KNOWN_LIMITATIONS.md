@@ -116,3 +116,45 @@ which of these were actually exercised before publishing.
 Per `docs/REMOTE_AND_RELAY.md` (unchanged this engagement) — both complete and unit-tested
 over real sockets, but never exercised between two genuinely separate hosts over the real
 internet. Still true as of this closeout.
+
+## 13. v1.10.3 hardening round: real root causes fixed, but full mission scope not claimed complete
+
+This round was explicitly scoped by the operator as a large, multi-section hardening
+mission (installer automation, write-authorization unification, full renewal-state-machine
+audit, all 29 menu options, CI/CD quality gates, multi-distro testing, full security audit,
+documentation). What was genuinely implemented, tested, and verified this round:
+
+- Automatic systemd activation of the 4 read-only core timers (`service_activation.py`,
+  `install-activate-core-timers`), replacing the error-prone manual `cp`/`systemctl`
+  sequence that caused the exact reported `ir2` symptoms (missed units, enabled-but-not-
+  persisted state, no trustworthy health check). Verified against this project's own real,
+  functional systemd (not mocked) in `tests/test_deploy_package.py`, including a genuine
+  activate → verify → uninstall round-trip.
+- Unified production-write authorization (`enable-auto-renewal`/`disable-auto-renewal`,
+  `installer.enable_auto_renewal`/`disable_auto_renewal`) replacing three previously
+  separate, undocumented manual steps.
+- Two real, previously-undiscovered bugs found and fixed BY running the above against real
+  systemd rather than only against mocks: `cmd_apply_due`'s exit-1-for-a-safety-refusal
+  (now exit 3 + `SuccessExitStatus=3`), and `cmd_inventory_sync`'s exit-1-for-not-yet-
+  configured (now exit 0 + `NOT_CONFIGURED`) — the second of which would have made the
+  newly-auto-enabled inventory-sync timer show "failed" on every single fresh install
+  before `store-credentials` was run, had it shipped unfixed.
+- A targeted security scan (shell=True/os.system/eval/exec/pickle/yaml.load usage,
+  subprocess argument-list discipline, tempfile handling, secret-file permission
+  enforcement) found no new issues; the existing codebase's established discipline
+  (list-args-only subprocess calls, GPG passphrases via stdin fd never argv, 0600 secret
+  files, path-traversal-safe tempfile suffixes) was confirmed intact, not re-derived from
+  scratch.
+- Existing regression coverage for unlimited-VPS exclusion, frozen-candidate safeguards,
+  and emergency-grant cooldown/eligibility (21 pre-existing tests in
+  `test_emergency_policy.py` alone) was confirmed still passing, not rewritten.
+
+What was explicitly NOT attempted at full rigor this round, and should not be assumed done:
+a line-by-line audit of all 29 individual menu options beyond what the above changes
+touched; a rebuilt CI/CD pipeline with static analysis, type checking, or dependency
+vulnerability scanning (none of these tools were added — the existing pytest suite remains
+the only automated gate); testing on any Linux distribution other than this project's one
+verified target (Ubuntu 24.04); a full renewal-state-machine audit beyond what the
+pre-existing test suite already covers (timezone/leap-year/month-end edge cases were not
+independently re-verified this round). See the v1.10.3 closeout report for the exact,
+itemized final status.

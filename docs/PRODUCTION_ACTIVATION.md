@@ -63,6 +63,15 @@ sudo systemctl enable --now virt-renewal-apply.timer
 This is the ONLY step that creates a truly unattended write path. Nothing before this point
 does. Consider running Step A manually for at least one full billing cycle before this step.
 
+**v1.10.3 convenience note:** once you've deliberately decided to proceed past Step A (i.e.
+you're ready for Steps B, C, and E together, globally), `renewal_cli.py enable-auto-renewal`
+(or the menu's "Enable automatic renewal" screen) performs exactly Steps B and E as one
+confirmed action, plus setting `auto_renewal_enabled=true` globally -- it does NOT replace
+the graduated, per-VPS approach above if you want that level of control; it's there for an
+operator who has already decided on a global rollout and wants the three steps done
+together rather than tracked separately (see installer.enable_auto_renewal's docstring for
+exactly what it does).
+
 ## Rollback of this activation
 
 ```bash
@@ -71,4 +80,5 @@ rm /opt/tixo-renewal/renewal-config/WRITE_APPROVED
 ```
 
 Removing `WRITE_APPROVED` alone is sufficient to block all further writes, even if the timer
-is still enabled.
+is still enabled. Equivalently, `renewal_cli.py disable-auto-renewal` does both of these
+together, plus setting `auto_renewal_enabled=false`.

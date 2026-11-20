@@ -35,8 +35,9 @@ bash install.sh
 
 This is idempotent and **read-only with respect to Virtualizor**: it only creates files under
 `/opt/tixo-renewal` (or `$TIXO_RENEWAL_INSTALL_DIR` if set), writes default `nodes.json` /
-`policy.json` (only if they don't already exist), and generates (but does not install or
-enable) systemd unit files.
+`policy.json` (only if they don't already exist), generates every systemd unit file, and
+(v1.10.3+, root only) installs+enables the 4 READ-ONLY core timers for real -- see Step 6.
+It never touches the write-capable `apply` timer.
 
 ## Step 4 — Configure your real policy (ON the Virtualizor host)
 
@@ -64,17 +65,19 @@ python3 /opt/tixo-renewal/bin/renewal_cli.py status
 Run these repeatedly, for real, against real VPS data, before trusting any number they
 produce. `preview` always says `[PREVIEW ONLY, NOT APPLIED]`.
 
-## Step 6 — Activate the read-only monitoring timer (optional, ON the Virtualizor host)
+## Step 6 — Activate the read-only monitoring/inventory/hostnet/notifier timers (ON the Virtualizor host)
+
+As of v1.10.3, `install.sh` does this automatically when run as root (Step 3) -- this step
+is only needed if you set `TIXO_RENEWAL_NO_AUTO_SYSTEMD=1` during install, or are running
+as a non-root user:
 
 ```bash
-sudo cp /opt/tixo-renewal/systemd/virt-renewal-monitor.service \
-        /opt/tixo-renewal/systemd/virt-renewal-monitor.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now virt-renewal-monitor.timer
+sudo renewal_cli.py install-activate-core-timers
 ```
 
-This timer only ever runs `dry-run` (read-only) every 30 minutes. It never calls `apply` or
-`apply-due`.
+Installs and enables all 4 READ-ONLY core timers (monitor, inventory-sync, hostnet-sync,
+readiness-notifier) -- none of them can call `apply`/`apply-due`, by construction. Safe to
+re-run (idempotent). Verify any time with `renewal_cli.py install-health-check`.
 
 ## Production write activation
 

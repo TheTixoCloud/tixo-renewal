@@ -24,8 +24,16 @@ What it does (and nothing more):
 - Writes a **safe-by-default** `policy.json` (`auto_renewal_enabled=false`) and `nodes.json`
   (`mode=local`, this host) — never overwrites either if they already exist.
 - Writes every systemd unit file (core timers + every optional module's unit) into
-  `systemd/` — **never copies them into `/etc/systemd/system` or enables/starts anything**.
-  That is always a separate, manual, explicit step (printed at the end of install).
+  `systemd/`.
+- **(v1.10.3+, root only)** Automatically installs and enables the 4 READ-ONLY core timers
+  (monitor, inventory-sync, hostnet-sync, readiness-notifier) into real systemd: copies
+  their unit files into `/etc/systemd/system`, runs `daemon-reload`, then
+  `enable --now` each one. None of these four can write to Virtualizor by construction.
+  Opt out with `TIXO_RENEWAL_NO_AUTO_SYSTEMD=1` for full manual control (or run it later
+  yourself: `sudo renewal_cli.py install-activate-core-timers`, safe to re-run). Skipped
+  automatically (never fatal) when not running as root.
+- The write-capable `apply` timer is **never** touched by `install.sh`, under any
+  circumstance — see "Automatic renewal and production-write authorization" below.
 - Installs a global `tixo-renewal` command (launches the interactive menu) if
   `/usr/local/bin` is writable.
 - **(v1.10.2+)** If `install.sh` was run from a genuinely interactive terminal — including a
@@ -34,8 +42,35 @@ What it does (and nothing more):
   does this. Set `TIXO_RENEWAL_NO_AUTO_MENU=1` beforehand to suppress it for a scripted or
   CI install.
 
-Nothing is enabled. Write capability (an actual renewal) remains permanently blocked until
-you deliberately create `renewal-config/WRITE_APPROVED`.
+Write capability (an actual renewal) remains permanently blocked until you deliberately
+authorize it -- see the next section.
+
+## Automatic renewal and production-write authorization (v1.10.3+)
+
+Before v1.10.3, "enabling automatic renewal" meant three separate, undocumented manual
+steps: creating `renewal-config/WRITE_APPROVED` by hand, editing `policy.json`'s
+`auto_renewal_enabled` field, and separately installing the write-capable `apply` timer.
+These are now ONE confirmed action:
+
+```bash
+renewal_cli.py enable-auto-renewal          # interactive confirmation
+renewal_cli.py enable-auto-renewal --yes    # scripted use
+```
+
+This creates `WRITE_APPROVED`, sets `auto_renewal_enabled=true`, and (if run as root)
+installs+enables `virt-renewal-apply.timer` -- all together, so there is never a partial
+state where one of the three is true and the others aren't. The interactive menu's "Enable
+automatic renewal" screen does exactly the same thing, with an explanation printed first.
+
+To reverse it -- always all together, never partially:
+
+```bash
+renewal_cli.py disable-auto-renewal
+```
+
+This removes `WRITE_APPROVED`, sets `auto_renewal_enabled=false`, and (if root)
+stops/disables/removes the apply timer. Monitoring, inventory sync, and all historical
+ledger data are explicitly untouched.
 
 ## Existing-installation detection
 

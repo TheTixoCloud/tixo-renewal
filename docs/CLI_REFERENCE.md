@@ -20,7 +20,27 @@ install-repair              Recreates missing files/schemas, fixes loosened 0600
 install-rollback --backup-file F --yes
                             Restores config/state from a full backup archive (destructive by
                             design -- safety-copies current state first).
-install-health-check        Read-only post-change sanity check (JSON).
+install-health-check        Read-only post-change sanity check (JSON). As of v1.10.3 this
+                            ALSO verifies real systemd state (enabled/active/failed) for
+                            every one of this project's own timers -- not just that config
+                            files parse.
+install-activate-core-timers
+                            Root-only, v1.10.3+: installs and enables the 4 READ-ONLY core
+                            timers (monitor, inventory-sync, hostnet-sync,
+                            readiness-notifier) into real systemd -- copies the unit files,
+                            runs daemon-reload, then `enable --now` on each timer. Called
+                            automatically by install.sh when run as root (opt out with
+                            TIXO_RENEWAL_NO_AUTO_SYSTEMD=1). Idempotent; never touches the
+                            write-capable apply timer.
+enable-auto-renewal [--yes]  v1.10.3+: the single, unified production-write authorization
+                            step -- creates renewal-config/WRITE_APPROVED, sets
+                            policy.json's auto_renewal_enabled=true, AND (if root)
+                            installs+enables the write-capable virt-renewal-apply timer,
+                            all together. Requires --yes or interactive confirmation.
+disable-auto-renewal         v1.10.3+: always reverses all three of the above together --
+                            removes WRITE_APPROVED, sets auto_renewal_enabled=false, and
+                            (if root) stops/disables/removes the apply timer. There is no
+                            supported in-between state. Monitoring/historical data untouched.
 update-check                Read-only: current vs. latest published GitHub release.
 update-apply [--version V] [--yes] [--force]
                             Downloads, checksum-verifies, and applies a release (latest, or
@@ -91,6 +111,12 @@ apply --node N [--vpsid V] [--period-key K] [--new-quota-gb G] [--execute] [--no
                             renewal-config/WRITE_APPROVED present; interactive confirmation
                             unless --non-interactive (still requires --execute).
 apply-due --node N [--non-interactive]         Applies every currently-due renewal for a node.
+                                                Exit 3 (not 1) specifically when
+                                                WRITE_APPROVED is missing -- a deliberate,
+                                                by-design safety refusal, not a crash; this
+                                                command's own unit declares
+                                                SuccessExitStatus=3 so systemd never shows
+                                                it as a failed service for that reason.
 inspect-vps --node N --vpsid V                 Detailed single-VPS state for debugging.
 resolve-operation --node N [--mark-resolved ID] [--resolution {APPLIED,FAILED}] [--verified-quota-gb G]
                             Manually resolves an uncertain/failed renewal operation record.
@@ -116,6 +142,11 @@ send-report [--period LABEL]            Sends a manual report through the config
 ```
 inventory-sync --node N                 Forces an immediate inventory sync (normally the
                                         inventory-sync timer does this automatically).
+                                        Exits 0 with status=NOT_CONFIGURED (not a failure)
+                                        if credentials haven't been stored yet -- this is
+                                        the ExecStart of a timer now auto-enabled on every
+                                        fresh install, so "not configured yet" must never
+                                        look like a crash.
 hostnet-suggest                         Lists candidate physical/bridge interfaces.
 hostnet-configure --interface IFACE [--yes]
                                         Confirms which interface the hostnet sampler reads
@@ -126,7 +157,11 @@ hostnet-sync                            Forces one immediate hostnet sample (nor
 
 ## Exit codes
 
-`0` success, `1` failure/blocked (e.g. `install-health-check` with problems, a rejected
-`apply` without `--execute`). Commands never raise an uncaught traceback for an expected
+`0` success (including a deliberate, by-design "not configured yet" state such as
+`inventory-sync` before credentials are stored), `1` failure/blocked (e.g.
+`install-health-check` with problems, a rejected `apply` without `--execute`), `3`
+specifically for `apply-due`'s "WRITE_APPROVED missing" refusal (see above -- kept distinct
+from `1` so systemd's `SuccessExitStatus=3` on that one unit can tell a deliberate safety
+block apart from a real crash). Commands never raise an uncaught traceback for an expected
 failure mode (missing config, invalid credentials, policy validation errors) — always a
-clean message + nonzero exit.
+clean message + the appropriate exit code.
