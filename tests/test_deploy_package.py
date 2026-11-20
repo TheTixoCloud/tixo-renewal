@@ -267,6 +267,76 @@ def test_install_activate_core_timers_real_systemd_round_trip(tmp_path):
 
 @pytest.mark.skipif(not os.path.exists(os.path.join(DEPLOY_DIR, "build_package.sh")),
                      reason="deploy/ not present in this checkout")
+@pytest.mark.skipif(not _real_systemd_usable(),
+                     reason="requires root + a genuinely functional systemd on this host")
+def test_uninstall_standard_mode_removes_genuinely_activated_real_units(tmp_path):
+    """uninstaller.standard_uninstall's OWNED_SYSTEMD_UNITS handling was only ever exercised
+    before against units that existed purely as local template files -- this verifies it
+    also correctly stops/disables/removes units that install-activate-core-timers genuinely
+    installed into /etc/systemd/system, which real ir1/ir2-shaped installs will now have
+    after v1.10.3. Always cleans up in a finally block regardless of outcome."""
+    result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                             capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    extract_dir = tmp_path / "extracted"
+    extract_dir.mkdir()
+    with tarfile.open(pkg) as tf:
+        tf.extractall(extract_dir, filter="data")
+
+    install_dir = tmp_path / "staging-install-uninstall-real-systemd"
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+    env["TIXO_RENEWAL_NO_AUTO_MENU"] = "1"
+
+    install_result = subprocess.run(["bash", "install.sh"], cwd=extract_dir,
+                                      capture_output=True, text=True, timeout=60, env=env)
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+
+    cli_path = str(install_dir / "bin" / "renewal_cli.py")
+    env["PYTHONPATH"] = str(install_dir / "lib")
+
+    def run(*args):
+        return subprocess.run([sys.executable, cli_path, *args], capture_output=True,
+                               text=True, timeout=30, env=env)
+
+    core_timers = ("virt-renewal-monitor.timer", "virt-renewal-inventory-sync.timer",
+                   "virt-renewal-hostnet-sync.timer", "virt-renewal-readiness-notifier.timer")
+    core_services = ("virt-renewal-monitor.service", "virt-renewal-inventory-sync.service",
+                      "virt-renewal-hostnet-sync.service", "virt-renewal-readiness-notifier.service")
+
+    try:
+        r = run("install-activate-core-timers")
+        assert r.returncode == 0, r.stdout + r.stderr
+        for timer in core_timers:
+            check = subprocess.run(["systemctl", "is-enabled", timer], capture_output=True,
+                                    text=True, timeout=10)
+            assert check.stdout.strip() == "enabled"
+
+        r = run("uninstall", "--yes")
+        assert r.returncode == 0, r.stdout + r.stderr
+
+        for timer in core_timers:
+            check = subprocess.run(["systemctl", "is-enabled", timer], capture_output=True,
+                                    text=True, timeout=10)
+            assert check.returncode != 0, f"{timer} still enabled after uninstall"
+        for name in core_timers + core_services:
+            assert not os.path.exists(os.path.join("/etc/systemd/system", name)), (
+                f"{name} unit file still present after uninstall")
+    finally:
+        for timer in core_timers:
+            subprocess.run(["systemctl", "disable", "--now", timer], capture_output=True,
+                            text=True, timeout=10)
+        for name in core_timers + core_services:
+            path = os.path.join("/etc/systemd/system", name)
+            if os.path.exists(path):
+                os.remove(path)
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True, timeout=10)
+
+
+@pytest.mark.skipif(not os.path.exists(os.path.join(DEPLOY_DIR, "build_package.sh")),
+                     reason="deploy/ not present in this checkout")
 def test_built_package_web_control_center_real_http_staging_acceptance(tmp_path):
     """Real staging acceptance test: builds the package, installs it to a disposable
     directory, enables the Web Control Center, runs the ACTUAL `web-run` CLI command as a
