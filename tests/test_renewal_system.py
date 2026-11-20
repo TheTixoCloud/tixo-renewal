@@ -570,8 +570,11 @@ def test_install_generates_renewal_apply_units_but_never_enables_them(cli_env):
     content = Path(service).read_text()
     assert "apply-due" in content
     assert "NOT enabled by default" in content or "NOT ENABLED BY DEFAULT" in Path(timer).read_text()
-    # install.sh itself never copies anything into /etc/systemd/system -- verified separately
-    # by reading deploy/install.sh; this test only confirms the files exist locally.
+    # Unlike the 4 read-only core timers (which v1.10.3's install.sh DOES now auto-activate,
+    # see test_deploy_package.py's real-systemd round-trip test), the write-capable apply
+    # unit is NEVER copied into /etc/systemd/system by install.sh -- only by the separate,
+    # explicitly-confirmed enable-auto-renewal flow (installer.enable_auto_renewal). This
+    # test only confirms the apply unit's template files exist locally and are unenabled.
 
 
 # ---------- store-credentials / apply-due (unattended path), fully mocked ----------------------

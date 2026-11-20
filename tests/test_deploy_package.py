@@ -498,6 +498,7 @@ def test_install_sh_fresh_install_succeeds_end_to_end(tmp_path):
     install_dir = tmp_path / "opt-tixo-renewal"
     env = dict(os.environ)
     env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+    env["TIXO_RENEWAL_NO_AUTO_SYSTEMD"] = "1"  # never touch this test-runner host's real systemd
     r = subprocess.run(["bash", "install.sh"], cwd=str(staging), capture_output=True,
                         text=True, timeout=30, env=env)
     assert r.returncode == 0, (
@@ -542,6 +543,7 @@ def test_install_sh_second_run_recovers_and_stays_idempotent(tmp_path):
     install_dir = tmp_path / "opt-tixo-renewal"
     env = dict(os.environ)
     env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+    env["TIXO_RENEWAL_NO_AUTO_SYSTEMD"] = "1"  # never touch this test-runner host's real systemd
 
     r1 = subprocess.run(["bash", "install.sh"], cwd=str(staging), capture_output=True,
                          text=True, timeout=30, env=env)
@@ -609,6 +611,7 @@ def _run_install_sh_with_pty(staging_dir, install_dir, extra_env=None, timeout=1
     master_fd, slave_fd = pty.openpty()
     env = dict(os.environ)
     env["TIXO_RENEWAL_INSTALL_DIR"] = install_dir
+    env["TIXO_RENEWAL_NO_AUTO_SYSTEMD"] = "1"  # never touch this test-runner host's real systemd
     if extra_env:
         env.update(extra_env)
 
@@ -708,6 +711,7 @@ def test_install_sh_skips_menu_in_noninteractive_subprocess(tmp_path):
     install_dir = tmp_path / "opt-tixo-renewal"
     env = dict(os.environ)
     env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+    env["TIXO_RENEWAL_NO_AUTO_SYSTEMD"] = "1"  # never touch this test-runner host's real systemd
     r = subprocess.run(["bash", "install.sh"], cwd=str(staging), capture_output=True,
                         text=True, timeout=30, env=env)
     assert r.returncode == 0
@@ -734,6 +738,36 @@ def test_install_sh_no_auto_menu_env_var_suppresses_launch_even_with_a_pty(tmp_p
                                        extra_env={"TIXO_RENEWAL_NO_AUTO_MENU": "1"}, timeout=10)
     assert "TIXO_RENEWAL_NO_AUTO_MENU set" in output
     assert "Choose an option:" not in output  # menu never actually started
+
+
+def test_install_sh_no_auto_systemd_env_var_suppresses_activation(tmp_path):
+    """TIXO_RENEWAL_NO_AUTO_SYSTEMD=1 must suppress the real systemd activation step even
+    when running as root -- the explicit opt-out for an operator who wants full manual
+    control, and (not coincidentally) exactly what this project's own test suite uses
+    everywhere else in this file to avoid touching the real test-runner host's systemd."""
+    result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                             capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    with tarfile.open(pkg) as tf:
+        tf.extractall(staging, filter="data")
+
+    install_dir = tmp_path / "opt-tixo-renewal"
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+    env["TIXO_RENEWAL_NO_AUTO_MENU"] = "1"
+    env["TIXO_RENEWAL_NO_AUTO_SYSTEMD"] = "1"
+    r = subprocess.run(["bash", "install.sh"], cwd=str(staging), capture_output=True,
+                        text=True, timeout=30, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "TIXO_RENEWAL_NO_AUTO_SYSTEMD set -- skipping automatic core-timer activation" in r.stdout
+    assert "Core timer activation succeeded" not in r.stdout
+    # Confirm it genuinely never touched the real host's systemd for these unit names.
+    for timer in ("virt-renewal-monitor.timer", "virt-renewal-inventory-sync.timer"):
+        assert not os.path.exists(os.path.join("/etc/systemd/system", timer))
 
 
 def test_install_sh_never_launches_menu_after_a_failed_install(tmp_path):
@@ -781,6 +815,7 @@ def _install_real_package(tmp_path):
     env = dict(os.environ)
     env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
     env["TIXO_RENEWAL_NO_AUTO_MENU"] = "1"
+    env["TIXO_RENEWAL_NO_AUTO_SYSTEMD"] = "1"  # never touch this test-runner host's real systemd
     r = subprocess.run(["bash", "install.sh"], cwd=str(staging), capture_output=True,
                         text=True, timeout=30, env=env)
     assert r.returncode == 0, r.stdout + r.stderr

@@ -14,12 +14,16 @@
 #     (set TIXO_RENEWAL_MONTHLY_BASE_GB to configure the monthly base/initial grant at
 #     install time instead of hand-editing policy.json afterward -- e.g.
 #     TIXO_RENEWAL_MONTHLY_BASE_GB=250 ./install.sh)
-#   - writes systemd unit files locally (does NOT install them into /etc/systemd/system --
-#     that remains a separate, explicit step, printed at the end)
+#   - writes systemd unit files locally under systemd/, then (v1.10.3+, root only, opt out
+#     with TIXO_RENEWAL_NO_AUTO_SYSTEMD=1) installs+enables the 4 READ-ONLY core timers
+#     (monitor, inventory-sync, hostnet-sync, readiness-notifier) into /etc/systemd/system
+#     for real -- never the write-capable 'apply' timer, which stays a separate, explicit,
+#     confirmed step (menu: "Enable automatic renewal", or `renewal_cli.py
+#     enable-auto-renewal`) that also grants WRITE_APPROVED in the same step
 #
-# It NEVER modifies Virtualizor itself, its cron, its database, or any VPS. The installed
-# software's `dry-run` is the only thing the generated systemd timer ever runs, and that is
-# read-only by construction.
+# It NEVER modifies Virtualizor itself, its cron, its database, or any VPS. None of the 4
+# core timers this script activates can write anything -- each one's own ExecStart is
+# read-only by construction (see renewal_cli.py's unit templates).
 set -euo pipefail
 
 INSTALL_DIR="${TIXO_RENEWAL_INSTALL_DIR:-/opt/tixo-renewal}"
@@ -126,6 +130,37 @@ echo "TixoCloud Control Center: v$APP_VERSION"
 export TIXO_RENEWAL_INSTALL_DIR="$INSTALL_DIR"
 PYTHONPATH="$INSTALL_DIR/lib" "$PYTHON_BIN" "$INSTALL_DIR/bin/renewal_cli.py" install
 
+# v1.10.3: automatically install+enable the four READ-ONLY core timers (monitor,
+# inventory-sync, hostnet-sync, readiness-notifier) into real systemd -- this is exactly the
+# error-prone manual `cp`/`systemctl` sequence a real installation previously required by
+# hand, one unit at a time, with some missed entirely. Requires root (writes to
+# /etc/systemd/system); gracefully skipped (never fatal) when not root, or when explicitly
+# opted out via TIXO_RENEWAL_NO_AUTO_SYSTEMD=1 for an operator who wants full manual control.
+# The write-capable apply timer is deliberately NEVER touched here -- see the menu's "Enable
+# automatic renewal" screen / `renewal_cli.py enable-auto-renewal`, which is the only
+# supported way to activate it, together with granting WRITE_APPROVED.
+ACTIVATED_CORE_TIMERS=0
+if [ -n "${TIXO_RENEWAL_NO_AUTO_SYSTEMD:-}" ]; then
+  echo
+  echo "TIXO_RENEWAL_NO_AUTO_SYSTEMD set -- skipping automatic core-timer activation."
+elif [ "$(id -u)" -eq 0 ]; then
+  echo
+  echo "Activating the 4 read-only core timers (monitor, inventory-sync, hostnet-sync,"
+  echo "readiness-notifier) into systemd..."
+  if PYTHONPATH="$INSTALL_DIR/lib" "$PYTHON_BIN" "$INSTALL_DIR/bin/renewal_cli.py" install-activate-core-timers; then
+    ACTIVATED_CORE_TIMERS=1
+  else
+    echo "WARNING: automatic core-timer activation reported problems (see above). The"
+    echo "install itself still succeeded -- run 'renewal_cli.py install-activate-core-timers'"
+    echo "yourself to retry, or 'renewal_cli.py install-health-check' to see current status."
+  fi
+else
+  echo
+  echo "Not running as root -- skipped automatic core-timer activation (requires writing to"
+  echo "/etc/systemd/system). Re-run as root, or run yourself later:"
+  echo "  sudo renewal_cli.py install-activate-core-timers"
+fi
+
 # Global `tixo-renewal` command -> launches the interactive management menu. Only attempted
 # if /usr/local/bin is writable (root, or a writable custom prefix); never fatal if not --
 # the operator can always run menu.py directly.
@@ -159,15 +194,19 @@ echo
 echo "Dry-run (read-only, safe to run any time):"
 echo "  TIXO_RENEWAL_INSTALL_DIR=$INSTALL_DIR PYTHONPATH=$INSTALL_DIR/lib $PYTHON_BIN $INSTALL_DIR/bin/renewal_cli.py dry-run"
 echo
-echo "To activate the periodic READ-ONLY dry-run timer (never writes anything), as a separate"
-echo "explicit step once you've reviewed $INSTALL_DIR/systemd/*:"
-echo "  sudo cp $INSTALL_DIR/systemd/*.service $INSTALL_DIR/systemd/*.timer /etc/systemd/system/"
-echo "  sudo systemctl daemon-reload"
-echo "  sudo systemctl enable --now virt-renewal-monitor.timer"
+if [ "$ACTIVATED_CORE_TIMERS" -eq 1 ]; then
+  echo "The 4 read-only core timers (monitor, inventory-sync, hostnet-sync, readiness-notifier)"
+  echo "are now installed, enabled, and running -- verify any time with:"
+  echo "  tixo-renewal --status   # or: renewal_cli.py install-health-check"
+else
+  echo "To activate the 4 READ-ONLY core timers (never writes anything), as root:"
+  echo "  sudo renewal_cli.py install-activate-core-timers"
+fi
 echo
-echo "Production WRITE capability remains permanently blocked until you deliberately create:"
-echo "  $INSTALL_DIR/renewal-config/WRITE_APPROVED"
-echo "...and even then, 'apply' requires --execute and live interactive credentials every time."
+echo "Production WRITE capability (the 5th timer, 'apply') remains permanently blocked until"
+echo "you deliberately grant it -- from the menu: 'Enable automatic renewal', or:"
+echo "  renewal_cli.py enable-auto-renewal --yes"
+echo "...and even then, every write still re-verifies live state immediately before/after."
 echo
 echo "Optional modules (ALL disabled by default; each needs its own explicit enable step"
 echo "from the 'tixo-renewal' menu before its generated systemd unit does anything):"
