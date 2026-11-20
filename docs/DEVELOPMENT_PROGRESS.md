@@ -1002,3 +1002,46 @@ rather than partially stubbed:
 `ir1` nor `ir2` was touched — see `FUTURE_DEVELOPMENT_HANDOVER.md` §17 for the prepared
 (not executed) upgrade procedure for both hosts. No production recovery backup was created
 as part of this round, per explicit operator instruction.
+
+## v1.10.3 — automatic systemd activation + unified write authorization
+
+A hardening release responding to a real, reported second-host (`ir2`) installation
+experience: missing timers, units active-but-not-enabled, a confusing multi-step
+production-write switch, deliberate safety refusals that looked like crashes, and no
+trustworthy single health check.
+
+- **`implementation/service_activation.py`** (new): installs/enables/disables/verifies
+  this project's own systemd units for real (`systemctl` via the project's established
+  `_systemctl()` mock-point convention) -- `CORE_READONLY_UNITS` (monitor, inventory-sync,
+  hostnet-sync, readiness-notifier) vs. the deliberately-separate `WRITE_CAPABLE_UNIT`
+  (apply).
+- **New CLI commands**: `install-activate-core-timers` (root-only, idempotent, called
+  automatically by `install.sh` as of this release -- opt out with
+  `TIXO_RENEWAL_NO_AUTO_SYSTEMD=1`), `enable-auto-renewal`/`disable-auto-renewal` (unify
+  WRITE_APPROVED + policy.json's auto_renewal_enabled + the apply timer into one confirmed
+  action each way, shared between the CLI and the rewritten `menu.action_toggle_auto_renewal`).
+- **Two real bugs found by testing the above against genuine, functional systemd (not
+  mocks)**: `cmd_apply_due` now exits 3 (not 1) for its deliberate WRITE_APPROVED-missing
+  refusal, with the apply unit declaring `SuccessExitStatus=3`; `cmd_inventory_sync` now
+  exits 0 with `status=NOT_CONFIGURED` (not 1) when credentials haven't been stored yet --
+  previously this would have made the newly-auto-enabled inventory-sync timer show
+  **failed** on every single fresh install until `store-credentials` was run.
+- **`installer.health_check(check_systemd=True)`**: now optionally verifies real
+  `systemctl is-enabled`/`is-active`/`is-failed` state for every core timer -- used by
+  `install-health-check`, deliberately NOT wired into `updater.apply_update`'s own
+  automatic rollback gate (which must keep working for pre-v1.10.3-shaped installs).
+- Targeted security scan (shell=True/os.system/eval/exec/pickle/yaml.load, subprocess
+  argument-list discipline, tempfile/secret-permission handling) found no issues, new or
+  pre-existing.
+- New tests include a genuine real-systemd round-trip (`tests/test_deploy_package.py`,
+  always root+systemd-gated and self-cleaning) and a real-systemd uninstall verification --
+  the first tests in this project to exercise actually-activated systemd units rather than
+  only local template files or mocks.
+- **Stable version bump**: `renewal_cli.VERSION` 1.10.2 -> **1.10.3**. `deploy/bootstrap.sh`'s
+  default pinned tag and `README.md`'s install command updated to match.
+
+**Full suite: 1381 passing, 0 failed.** New doc: `docs/RELEASE_NOTES_v1.10.3.md`. Neither
+`ir1` nor `ir2` was touched -- see `FUTURE_DEVELOPMENT_HANDOVER.md` §17 (updated for this
+release) for the prepared (not executed) upgrade procedure. Scope explicitly NOT attempted
+at full rigor this round (full 29-menu-option audit, CI/CD pipeline rebuild, multi-distro
+testing) is itemized honestly in `docs/KNOWN_LIMITATIONS.md` §13.

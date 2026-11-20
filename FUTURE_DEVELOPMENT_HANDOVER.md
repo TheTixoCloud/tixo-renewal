@@ -1,14 +1,17 @@
 # TixoCloud Control Center — Future Development Handover
 
 **Status at handover: v1.10.0 in production on ir1 (web/Telegram live and verified
-working); v1.10.2 is the latest tagged GitHub release (real in-app updater, auto-launch
-install menu, two-mode uninstaller — see `docs/RELEASE_NOTES_v1.10.2.md`), not yet deployed
-to ir1 or ir2. ir2's first install is still pending — it previously failed with the exact
-bug v1.10.1 fixed (see `docs/KNOWN_LIMITATIONS.md` §1). Production (ir1) code was, as of the
-v1.10.1 handover, current for every file except `renewal_cli.VERSION` itself (ir1 still
-reports v1.10.0). **No code on ir1 or ir2 has been touched as part of the v1.10.2 work** —
-both remain exactly as the v1.10.1 handover left them; see §17 for the prepared (not
-executed) upgrade procedure. See `docs/DEVELOPMENT_PROGRESS.md` for the full chronological
+working); v1.10.3 is the latest tagged GitHub release (automatic systemd activation of the
+4 read-only core timers, unified production-write authorization — see
+`docs/RELEASE_NOTES_v1.10.3.md`), not yet deployed to ir1 or ir2. ir2's first install is
+still pending — it previously failed with the exact bug v1.10.1 fixed (see
+`docs/KNOWN_LIMITATIONS.md` §1); a second, real ir2 installation attempt separately
+surfaced the manual-systemd-activation problems v1.10.3 fixes (see
+`docs/KNOWN_LIMITATIONS.md` §13). Production (ir1) code was, as of the v1.10.1 handover,
+current for every file except `renewal_cli.VERSION` itself (ir1 still reports v1.10.0).
+**No code on ir1 or ir2 has been touched as part of the v1.10.2 or v1.10.3 work** — both
+remain exactly as the v1.10.1 handover left them; see §17 for the prepared (not executed)
+upgrade procedure. See `docs/DEVELOPMENT_PROGRESS.md` for the full chronological
 history and `docs/KNOWN_LIMITATIONS.md` for honest outstanding issues.**
 
 ## 1. What TixoCloud currently does
@@ -88,7 +91,7 @@ gh release create vX.Y.Z deploy/tixo-renewal-package.tar.gz deploy/SHA256SUMS \
 and `test_readme_install_command_matches_current_version` both guard against this drifting
 again, but check anyway):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.2/deploy/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.3/deploy/bootstrap.sh | sudo bash
 ```
 
 Full procedure in `docs/DEPLOYMENT.md`. Short version for an **existing** install:
@@ -101,8 +104,12 @@ Full procedure in `docs/DEPLOYMENT.md`. Short version for an **existing** instal
    fixed; see `docs/KNOWN_LIMITATIONS.md` §1). Never overwrites existing
    `policy.json`/`nodes.json`/secrets. As of v1.10.2, a successful install run from an
    interactive terminal (including piped `curl | bash`) automatically opens the management
-   menu afterward; a failed install never does.
-5. Run `install-health-check`; confirm it reports `{"ok": true}`.
+   menu afterward; a failed install never does. As of v1.10.3, running as root also
+   automatically installs+enables the 4 read-only core timers into real systemd (opt out:
+   `TIXO_RENEWAL_NO_AUTO_SYSTEMD=1`) — no manual `cp`/`systemctl` steps needed.
+5. Run `install-health-check`; confirm it reports `{"ok": true}` -- as of v1.10.3 this also
+   verifies the 4 core timers are genuinely enabled/active in real systemd, not just that
+   config files parse.
 6. If a Web/Telegram service was running, restart ONLY that service
    (`systemctl restart virt-renewal-web.service` / `...-telegram-bot.service`) — the five
    renewal timers never need restarting for an application code change (they re-exec the
@@ -254,58 +261,69 @@ components.
 ## 16. Closeout references
 
 - `TixoCloud-Final-Development-Archive.zip` — sanitized source + full git history + all
-  documentation (this file included) — see the accompanying closeout report for its exact
-  path/checksum. **This v1.10.2 closeout deliberately does not include a production
-  recovery backup** — none was requested or created; see §17 for how to apply this release
-  to ir1/ir2 safely when the operator chooses to.
+  documentation (this file included) — see the most recent accompanying closeout report for
+  its exact path/checksum (not refreshed as part of the v1.10.3 hardening round, which
+  produced no new archive — see §17 for how to apply this release to ir1/ir2 safely when the
+  operator chooses to). No production recovery backup was requested or created for v1.10.2
+  or v1.10.3.
 
-## 17. Prepared (not executed) ir1/ir2 upgrade procedure for v1.10.2
+## 17. Prepared (not executed) ir1/ir2 upgrade procedure for v1.10.3
 
-Neither host was touched while producing this release. The following is a checklist for an
-operator to run manually, not something this session executed.
+Neither host was touched while producing v1.10.2 or v1.10.3. The following is a checklist
+for an operator to run manually, not something any session executed.
 
-**Important nuance confirmed by real testing during this release (see the closeout
-report):** `update-check`/`update-apply` are themselves *new in v1.10.2* — a host still
-running v1.10.0 or v1.10.1 does not have these commands yet, so it cannot "self-update" to
-v1.10.2 using them. The first hop to v1.10.2 on each host must go through the same
-bootstrap/`install.sh` path used for a fresh install (which is idempotent and
+**Important nuance confirmed by real testing (see each release's own closeout report):**
+`update-check`/`update-apply` were new in v1.10.2; `install-activate-core-timers` and
+`enable-auto-renewal`/`disable-auto-renewal` are new in v1.10.3. A host still running
+v1.10.0 or v1.10.1 (true of both ir1 and ir2 as of this writing) has NONE of these commands
+yet, so it cannot "self-update" using them. The first hop to v1.10.3 on each host must go
+through the same bootstrap/`install.sh` path used for a fresh install (idempotent and
 config-preserving — see `docs/INSTALL_GUIDE.md` → Upgrade). Only *after* a host is running
-v1.10.2 do `update-check`/`update-apply` become available for the *next* release.
+v1.10.3 do `update-check`/`update-apply` become available for the *next* release.
 
-**ir1** (v1.10.0 code on disk, Web + Telegram + TLS + 5 systemd timers + a live SOCKS5 patch
-and existing config/ledger, per the v1.10.1 handover):
+**ir1** (v1.10.0 code on disk, Web + Telegram + TLS + 5 systemd timers — already manually
+activated per the v1.10.1 handover, including the write-capable `apply` timer — and
+existing config/ledger):
 1. Preflight: `tixo-renewal backup` (fresh app-level backup, in addition to whatever infra
    snapshot ir1's owner normally takes), confirm free disk space, confirm
    `systemctl list-timers` shows the expected 5 owned timers before starting.
 2. Update command (from the existing install directory, as root or with
    `TIXO_RENEWAL_INSTALL_DIR` set to ir1's real install path):
    ```
-   curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.2/deploy/bootstrap.sh | sudo bash
+   curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.3/deploy/bootstrap.sh | sudo bash
    ```
-   This re-extracts the v1.10.2 package and runs `install.sh` against the *existing* install
-   directory — idempotent, never overwrites `policy.json`/`nodes.json`/secrets. (Verified
-   during this release: a real v1.10.0-shaped install directory, with its original
-   `policy.json`/`nodes.json`/ledger content, upgraded cleanly to v1.10.2 via this exact
-   mechanism — see the closeout report.)
-3. Post-update verification: `tixo-renewal --status`, confirm `VERSION` reports `1.10.2`;
+   This re-extracts the v1.10.3 package and runs `install.sh` against the *existing* install
+   directory — idempotent, never overwrites `policy.json`/`nodes.json`/secrets. Since ir1's
+   5 timers (including the write-capable one) are ALREADY installed/enabled manually,
+   v1.10.3's automatic core-timer activation step will find them already present and simply
+   re-confirm them (verified idempotent during this release's own testing); it will NOT
+   touch the already-enabled `apply` timer either way, since that one is never auto-managed
+   by `install.sh` regardless of prior state.
+3. Post-update verification: `tixo-renewal --status`, confirm `VERSION` reports `1.10.3`;
    confirm Web (`curl -s localhost:<port>/api/health` or equivalent) and the Telegram bot
    both respond; confirm `systemctl list-timers` still shows the same 5 timers, still
    enabled; confirm `policy.json`/`nodes.json`/secrets/the SOCKS5 patch are byte-identical to
-   pre-update (diff against the pre-update backup).
+   pre-update (diff against the pre-update backup); run `install-health-check` and confirm
+   `{"ok": true}` (this now also checks real systemd state for the 4 read-only timers).
 4. Rollback (only if step 3 fails): restore from the step-1 `tixo-renewal backup`, or from
    whatever infra-level snapshot was taken beforehand, then restart the owned services.
-5. **From this point on** (ir1 now running v1.10.2), future releases beyond v1.10.2 can use
+5. **From this point on** (ir1 now running v1.10.3), future releases beyond v1.10.3 can use
    `tixo-renewal update-check` / `tixo-renewal update-apply` directly — which take their own
    full filesystem backup automatically and auto-roll-back on a failed health check (verified
-   end-to-end during this release, including a genuine induced-failure rollback — see the
-   closeout report).
+   end-to-end during the v1.10.2 release, including a genuine induced-failure rollback).
 
 **ir2** (existing v1.10.1 install, independent Virtualizor environment, no shared
-credentials/ledger with ir1):
-1. Preflight: same as ir1 step 1, scoped to ir2's own install directory and timers.
+credentials/ledger with ir1, and — per the original problem report — the host where the
+manual-systemd-activation pain this release fixes was actually experienced):
+1. Preflight: same as ir1 step 1, scoped to ir2's own install directory and timers. If ir2's
+   first install was never fully completed (per `docs/KNOWN_LIMITATIONS.md` §1/§13), confirm
+   current actual state first (`install-detect`, `install-health-check`) rather than
+   assuming anything about what's already enabled.
 2. Update command: identical to ir1 step 2 (the bootstrap one-liner), run against ir2's own
-   install. (Also verified during this release against a real v1.10.1 install directory —
-   see the closeout report.)
+   install. Unlike ir1, ir2 likely does NOT already have its core timers manually activated
+   — expect `install.sh`'s automatic activation step to do real, visible work here (install
+   + enable all 4 read-only timers for the first time), which is the exact improvement this
+   release is for.
 3. Post-update verification: identical to ir1 step 3, scoped to ir2's own services/timers/
    config. ir2 has no Web/Telegram services active per the v1.10.1 handover — skip those
    checks if still true, but re-verify current state first rather than assuming it hasn't
