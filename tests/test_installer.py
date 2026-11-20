@@ -350,12 +350,73 @@ def test_cmd_install_rollback_restores_with_yes_flag(cli_env, capsys):
     assert "Restored config" in out
 
 
-def test_cmd_install_health_check_ok_after_install(cli_env, capsys):
+def test_cmd_install_health_check_ok_after_install_and_activation(cli_env, capsys, monkeypatch):
+    """v1.10.3: cmd_install_health_check now also checks real systemd state
+    (check_systemd=True). A plain cmd_install() alone does NOT activate any real systemd
+    unit (that's a separate, explicit step -- see test_service_activation.py), so this test
+    simulates the state AFTER that activation step succeeded, via the same
+    service_activation._systemctl mock point every other systemd-aware test in this project
+    uses -- never touching the real host's systemd."""
+    import service_activation as sa
+    monkeypatch.setattr(sa, "_systemctl",
+                         lambda *a, **k: {"ok": True, "stdout": "enabled" if a and a[0] == "is-enabled"
+                                          else ("active" if a and a[0] == "is-active" else ""),
+                                          "stderr": ""})
     renewal_cli.cmd_install(argparse_namespace())
     rc = renewal_cli.cmd_install_health_check(argparse_namespace())
     out = capsys.readouterr().out
     assert rc == 0
     assert '"ok": true' in out
+
+
+def test_cmd_install_health_check_flags_unactivated_core_timers(cli_env, capsys, monkeypatch):
+    """The exact regression this was added to prevent: a fresh install whose core timers
+    were never actually installed/enabled into real systemd must be reported as UNHEALTHY,
+    not silently 'ok' -- this is what would have surfaced the `ir2` problem immediately
+    instead of requiring manual systemctl/journal investigation."""
+    import service_activation as sa
+    monkeypatch.setattr(sa, "_systemctl",
+                         lambda *a, **k: {"ok": False, "stdout": "disabled" if a and a[0] == "is-enabled"
+                                          else "inactive", "stderr": ""})
+    renewal_cli.cmd_install(argparse_namespace())
+    rc = renewal_cli.cmd_install_health_check(argparse_namespace())
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert '"ok": false' in out
+    assert "is not enabled" in out
+
+
+def test_cmd_install_health_check_flags_a_failed_service(cli_env, capsys, monkeypatch):
+    import service_activation as sa
+
+    def fake_systemctl(*args, **kwargs):
+        if args and args[0] == "is-enabled":
+            return {"ok": True, "stdout": "enabled", "stderr": ""}
+        if args and args[0] == "is-active":
+            return {"ok": True, "stdout": "active", "stderr": ""}
+        if args and args[0] == "is-failed":
+            return {"ok": False, "stdout": "failed", "stderr": ""}
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(sa, "_systemctl", fake_systemctl)
+    renewal_cli.cmd_install(argparse_namespace())
+    rc = renewal_cli.cmd_install_health_check(argparse_namespace())
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert '"ok": false' in out
+    assert "FAILED state" in out
+
+
+def test_health_check_direct_call_defaults_to_no_systemd_check(cli_env):
+    """installer.health_check()'s own default (check_systemd=False) must stay unaffected by
+    whatever the real host's systemd state is -- this is the exact function updater.py's
+    apply_update() uses as its own default post-update rollback gate, which must never fail
+    an update just because this particular install never had its timers activated."""
+    renewal_cli.cmd_install(argparse_namespace())
+    result = installer.health_check(cli_env["config_dir"], cli_env["state_dir"])
+    assert result["ok"] is True
+    assert result["problems"] == []
+    assert "systemd" not in result
 
 
 # ---------- menu.action_install wizard (fresh/upgrade/repair dispatch) ---------------------------

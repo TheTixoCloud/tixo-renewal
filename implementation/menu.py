@@ -1317,20 +1317,50 @@ def action_configure_intervals():
               "or copy the files yourself.")
 
 
-def action_toggle_auto_renewal(enable: bool):
-    path = os.path.join(renewal_cli.CONFIG_DIR, "policy.json")
-    import json
-    data = json.loads(Path(path).read_text())
-    data["global_defaults"]["auto_renewal_enabled"] = enable
-    tmp = path + ".tmp"
-    Path(tmp).write_text(json.dumps(data, indent=2) + "\n")
-    os.replace(tmp, path)
-    print(f"auto_renewal_enabled set to {enable}.")
-    if not enable:
-        marker = renewal_cli.WRITE_APPROVAL_MARKER
-        if os.path.exists(marker) and _confirm(f"Also remove {marker} (full write lock-out)?"):
-            os.remove(marker)
-            print("WRITE_APPROVED removed -- all writes now structurally blocked.")
+def action_toggle_auto_renewal(enable: bool, style: "Style" = None):
+    """v1.10.3: this used to only ever flip policy.json's auto_renewal_enabled boolean,
+    leaving production-write authorization (WRITE_APPROVED) and the write-capable apply
+    timer as two SEPARATE, undocumented manual steps -- exactly the confusing,
+    multi-step experience this was rewritten to eliminate (see
+    installer.enable_auto_renewal/disable_auto_renewal's docstrings for the full
+    rationale). All interactive confirmation lives HERE; the actual state changes are a
+    single shared implementation with the CLI's `enable-auto-renewal`/`disable-auto-renewal`
+    commands, so the two surfaces can never drift apart."""
+    import installer as inst
+    style = style or Style(enabled=False)
+
+    if enable:
+        print(f"{style.BOLD}Enabling automatic renewal will:{style.RESET}")
+        print("  1. Create renewal-config/WRITE_APPROVED -- production write capability.")
+        print("  2. Set policy.json global_defaults.auto_renewal_enabled = true.")
+        print("  3. Install and enable the write-capable virt-renewal-apply timer "
+              "(requires root).")
+        print("\nAfter this, VPS instances whose policy marks them eligible will have "
+              "their bandwidth renewal actually WRITTEN to Virtualizor by the timer, "
+              "unattended.")
+        if not _confirm("Grant production-write authorization and enable automatic renewal now?"):
+            print("Cancelled -- no changes made.")
+            return
+        result = inst.enable_auto_renewal(renewal_cli.CONFIG_DIR, renewal_cli.SYSTEMD_OUT_DIR)
+    else:
+        print("Disabling automatic renewal will remove WRITE_APPROVED (production write "
+              "capability), set auto_renewal_enabled=false, and stop/disable the apply "
+              "timer -- always all together. Monitoring, inventory, and all historical "
+              "data are NOT touched.")
+        if not _confirm("Disable automatic renewal and revoke write authorization now?"):
+            print("Cancelled -- no changes made.")
+            return
+        result = inst.disable_auto_renewal(renewal_cli.CONFIG_DIR, renewal_cli.SYSTEMD_OUT_DIR)
+
+    for step in result["steps"]:
+        print(f"  {style.GREEN}-{style.RESET} {step}")
+    for problem in result["problems"]:
+        print(f"  {style.RED}!{style.RESET} {problem}")
+
+    final_color = style.GREEN if result["ok"] else style.RED
+    action_word = "ENABLED" if enable else "DISABLED"
+    print(f"\n{final_color}Automatic renewal {action_word}"
+          f"{'' if result['ok'] else ' WITH PROBLEMS -- see above'}.{style.RESET}")
 
 
 def action_view_logs():
@@ -2613,6 +2643,10 @@ def run_menu():
                     action_configure_remote_agent(style)
                 elif label == "Configure Backup Schedule (optional)":
                     action_configure_backup_schedule(style)
+                elif label == "Enable automatic renewal":
+                    action_toggle_auto_renewal(True, style)
+                elif label == "Disable automatic renewal":
+                    action_toggle_auto_renewal(False, style)
                 elif label == "Check for updates":
                     action_check_updates(style)
                 elif label == "Uninstall":

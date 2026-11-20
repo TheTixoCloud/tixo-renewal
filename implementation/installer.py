@@ -320,9 +320,168 @@ def uninstall_optional_module(module_name: str, config_dir: str, systemd_out_dir
     return report
 
 
-def health_check(config_dir: str, state_dir: str) -> dict:
+# ---------- unified automatic-renewal / production-write activation (v1.10.3) ------------------
+
+WRITE_APPROVAL_MARKER_NAME = "WRITE_APPROVED"
+
+
+def enable_auto_renewal(config_dir: str, systemd_src_dir: str, activate_timer: bool = True) -> dict:
+    """The single, real implementation behind BOTH `renewal_cli.cmd_enable_auto_renewal` and
+    `menu.action_toggle_auto_renewal(True)` -- confirmation is always the CALLER's job (this
+    function performs no interactive prompting itself, matching every other
+    destructive-ish action in this project), but every actual state change that "enabling
+    automatic renewal" is supposed to mean happens HERE, in one place, so the CLI and menu
+    can never drift into doing different subsets of it.
+
+    Before v1.10.3, 'enable automatic renewal' only ever flipped
+    policy.json.global_defaults.auto_renewal_enabled -- it never created WRITE_APPROVED
+    (the operator had to do that by hand, with no guidance on WHEN), and it never touched
+    the `apply` timer at all (an operator who separately found and enabled that timer could
+    end up with a running write-capable service despite never having gone through this
+    confirmation). This function now does all three required steps together:
+      1. Validates nodes.json/policy.json load cleanly (refuses -- returns ok=False --
+         rather than enabling writes against a config known to be broken).
+      2. Creates WRITE_APPROVAL_MARKER_NAME if not already present.
+      3. Sets policy.json's auto_renewal_enabled = True.
+      4. If `activate_timer` and running as root: installs+enables the real, write-capable
+         `virt-renewal-apply` timer (the ONLY unit this project ever auto-activates that can
+         write to Virtualizor -- see service_activation.WRITE_CAPABLE_UNIT's docstring for
+         why this is kept structurally separate from the four read-only core timers).
+         If not root, this step is skipped and reported as such -- config-level
+         authorization still succeeds, but the operator must run
+         `renewal_cli.py install-activate-core-timers`-equivalent for the apply timer
+         themselves (the exact command is included in the report) as root.
+    Returns a report dict; never raises for an expected failure."""
+    report = {"ok": True, "steps": [], "problems": [], "write_approved_created": False,
+              "timer_activated": False, "manual_command": None}
+
+    nodes_path = os.path.join(config_dir, "nodes.json")
+    policy_path = os.path.join(config_dir, "policy.json")
+    try:
+        import nodes as nodes_mod
+        nodes_mod.load_nodes(nodes_path)
+    except Exception as e:
+        report["ok"] = False
+        report["problems"].append(f"nodes.json did not load -- refusing to enable writes: {e}")
+        return report
+
+    try:
+        import policy as pol
+        pol.load_policy_config(policy_path)
+    except Exception as e:
+        report["ok"] = False
+        report["problems"].append(f"policy.json did not load -- refusing to enable writes: {e}")
+        return report
+
+    marker_path = os.path.join(config_dir, WRITE_APPROVAL_MARKER_NAME)
+    if not os.path.exists(marker_path):
+        Path(marker_path).write_text(
+            "Created by enable_auto_renewal() -- production write capability is "
+            "operator-authorized.\n")
+        report["write_approved_created"] = True
+    report["steps"].append(f"WRITE_APPROVED present at {marker_path}")
+
+    import json
+    data = json.loads(Path(policy_path).read_text())
+    data["global_defaults"]["auto_renewal_enabled"] = True
+    tmp = policy_path + ".tmp"
+    Path(tmp).write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, policy_path)
+    report["steps"].append("policy.json global_defaults.auto_renewal_enabled set to true")
+
+    import service_activation as sa
+    if activate_timer:
+        if os.geteuid() == 0:
+            activation = sa.install_and_enable_units(systemd_src_dir, [sa.WRITE_CAPABLE_UNIT])
+            if activation["ok"]:
+                report["timer_activated"] = True
+                report["steps"].append("virt-renewal-apply.timer installed and enabled")
+            else:
+                report["ok"] = False
+                report["problems"].extend(activation["problems"])
+        else:
+            service, timer = sa.WRITE_CAPABLE_UNIT
+            report["manual_command"] = (
+                f"sudo cp {os.path.join(systemd_src_dir, service)} "
+                f"{os.path.join(systemd_src_dir, timer)} /etc/systemd/system/ && "
+                f"sudo systemctl daemon-reload && sudo systemctl enable --now {timer}")
+            report["problems"].append(
+                "not running as root -- the apply timer was NOT installed/enabled; "
+                f"run this yourself: {report['manual_command']}")
+
+    return report
+
+
+def disable_auto_renewal(config_dir: str, systemd_src_dir: str) -> dict:
+    """The single, real implementation behind BOTH `renewal_cli.cmd_disable_auto_renewal`
+    and `menu.action_toggle_auto_renewal(False)`. Documented policy (unlike the pre-v1.10.3
+    behavior, where removing WRITE_APPROVED was an OPTIONAL extra confirmation): disabling
+    automatic renewal ALWAYS revokes write authorization -- there is no supported
+    in-between state where auto_renewal_enabled=false but WRITE_APPROVED still exists,
+    because that combination is exactly what let the apply timer fire in a 'blocked by
+    design' state that looked like a systemd failure on `ir2`. Monitoring/inventory/
+    hostnet/readiness-notifier timers and all historical ledger data are explicitly NOT
+    touched by this function -- only the write path is revoked."""
+    report = {"ok": True, "steps": [], "problems": [], "write_approved_removed": False,
+              "timer_stopped": False}
+
+    policy_path = os.path.join(config_dir, "policy.json")
+    import json
+    try:
+        data = json.loads(Path(policy_path).read_text())
+        data["global_defaults"]["auto_renewal_enabled"] = False
+        tmp = policy_path + ".tmp"
+        Path(tmp).write_text(json.dumps(data, indent=2) + "\n")
+        os.replace(tmp, policy_path)
+        report["steps"].append("policy.json global_defaults.auto_renewal_enabled set to false")
+    except Exception as e:
+        report["ok"] = False
+        report["problems"].append(f"could not update policy.json: {e}")
+
+    marker_path = os.path.join(config_dir, WRITE_APPROVAL_MARKER_NAME)
+    if os.path.exists(marker_path):
+        os.remove(marker_path)
+        report["write_approved_removed"] = True
+        report["steps"].append(f"{WRITE_APPROVAL_MARKER_NAME} removed -- writes structurally blocked again")
+    else:
+        report["steps"].append(f"{WRITE_APPROVAL_MARKER_NAME} was already absent")
+
+    import service_activation as sa
+    if os.geteuid() == 0:
+        deactivation = sa.disable_and_remove_units([sa.WRITE_CAPABLE_UNIT])
+        if deactivation["ok"]:
+            report["timer_stopped"] = True
+            report["steps"].append("virt-renewal-apply.timer stopped, disabled, and removed")
+        else:
+            report["ok"] = False
+            report["problems"].extend(deactivation["problems"])
+    else:
+        report["problems"].append(
+            "not running as root -- could not confirm/stop any real virt-renewal-apply.timer "
+            "that may be installed; if one is, run: sudo systemctl disable --now "
+            "virt-renewal-apply.timer")
+
+    return report
+
+
+def health_check(config_dir: str, state_dir: str, check_systemd: bool = False) -> dict:
     """Consolidated, read-only report of whether the install looks healthy after a change --
-    never restarts or enables anything itself."""
+    never restarts or enables anything itself.
+
+    `check_systemd` defaults to False HERE because this exact function is also
+    `updater.apply_update`'s default post-update rollback gate (see its `health_check_fn`
+    parameter) -- an update must never be rolled back just because an install that predates
+    v1.10.3's automatic timer activation (e.g. a real pre-v1.10.3 `ir1`/`ir2`-shaped install)
+    never had its core timers enabled in the first place; that is an orthogonal, pre-existing
+    condition the updater has no business judging. Callers that DO want the real systemd
+    check -- `cmd_install_health_check`/the menu's install-health-check screen -- pass
+    `check_systemd=True` explicitly. When True, also reports the real, current
+    enabled/active/failed state of every one of this project's own timers via
+    `service_activation.verify_units_status` (still pure read-only: `systemctl
+    is-enabled`/`is-active`/`is-failed`, nothing that changes state) -- added in v1.10.3 so a
+    'the install looks fine' report can no longer be true while a core timer is silently
+    disabled or a service is stuck failed, the exact gap that made the `ir2` installation's
+    problems invisible until an operator went looking for them by hand."""
     report = {"ok": True, "problems": []}
 
     try:
@@ -349,5 +508,26 @@ def health_check(config_dir: str, state_dir: str) -> dict:
         except Exception as e:
             report["ok"] = False
             report["problems"].append(f"{optional} settings did not load: {e}")
+
+    if check_systemd and shutil.which("systemctl"):
+        import service_activation as sa
+        write_approved = os.path.exists(os.path.join(config_dir, "WRITE_APPROVED"))
+        units_to_check = list(sa.CORE_READONLY_UNITS)
+        if write_approved:
+            units_to_check.append(sa.WRITE_CAPABLE_UNIT)
+        systemd_status = sa.verify_units_status(units_to_check)
+        report["systemd"] = systemd_status
+        for timer, status in systemd_status.items():
+            is_core = any(timer == t for _s, t in sa.CORE_READONLY_UNITS)
+            if is_core and status["is_enabled"] != "enabled":
+                report["ok"] = False
+                report["problems"].append(
+                    f"{timer} is not enabled (currently: {status['is_enabled']!r}) -- "
+                    f"it should be, on any install that completed activation")
+            if status["service_is_failed"] == "failed":
+                report["ok"] = False
+                report["problems"].append(
+                    f"{status['service']} is in a FAILED state -- check "
+                    f"'journalctl -u {status['service']}' for the real cause")
 
     return report

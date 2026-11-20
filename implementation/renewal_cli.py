@@ -121,6 +121,11 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# Exit 3 is cmd_apply_due's deliberate 'WRITE_APPROVED missing, refusing by design' exit --
+# declaring it here means systemd reports this run as a normal, non-failed completion
+# instead of a failed unit, so a by-design safety refusal is never visually confused with a
+# genuine crash in `systemctl status`/journalctl (see cmd_apply_due's own docstring).
+SuccessExitStatus=3
 Environment=PYTHONPATH={libdir}
 Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
 ExecStart=/usr/bin/flock -n {lockpath} {python} {cli} apply-due --node self --non-interactive
@@ -978,10 +983,88 @@ def cmd_uninstall_module(args):
 
 
 def cmd_install_health_check(args):
-    """Read-only post-change sanity check -- never restarts or enables anything."""
+    """Read-only post-change sanity check -- never restarts or enables anything. As of
+    v1.10.3 this also verifies the real systemd state of every one of this project's own
+    timers (enabled/active/failed), not just that the config files parse -- see
+    installer.health_check's docstring for why that extra check is opt-in here and not in
+    the updater's own automatic rollback gate."""
     import installer as inst
-    result = inst.health_check(CONFIG_DIR, STATE_DIR)
+    result = inst.health_check(CONFIG_DIR, STATE_DIR, check_systemd=True)
     print(json.dumps(result, indent=2))
+    return 0 if result["ok"] else 1
+
+
+# ---------- automatic systemd activation of the READ-ONLY core timers (v1.10.3) ----------------
+
+def cmd_install_activate_core_timers(args):
+    """Installs and enables the four READ-ONLY core timers (monitor, inventory-sync,
+    hostnet-sync, readiness-notifier) into the real systemd -- copies the unit files
+    `install` already generated under SYSTEMD_OUT_DIR into /etc/systemd/system, runs
+    daemon-reload, then `enable --now` on each timer. Never touches the write-capable
+    `apply` timer (see cmd_enable_auto_renewal for that, which is deliberately separate and
+    requires its own explicit confirmation). This is the exact mechanical step that `ir2`'s
+    installation required by hand, one unit at a time, with some missed entirely -- as of
+    v1.10.3 `install.sh` calls this automatically when run as root (see TIXO_RENEWAL_NO_AUTO_SYSTEMD
+    to opt out)."""
+    if os.geteuid() != 0:
+        print("ERROR: activating real systemd units requires root (to write to "
+              "/etc/systemd/system and call systemctl). Re-run with sudo.")
+        return 1
+    import service_activation as sa
+    result = sa.install_and_enable_units(SYSTEMD_OUT_DIR, sa.CORE_READONLY_UNITS)
+    if result["enabled"]:
+        print(f"Enabled and started: {', '.join(result['enabled'])}")
+    if result["problems"]:
+        print("Problems:")
+        for p in result["problems"]:
+            print(f"  - {p}")
+    print(f"\nCore timer activation {'succeeded' if result['ok'] else 'FAILED'}.")
+    if result["ok"]:
+        print("These four timers are read-only by construction -- none of them can write "
+              "to Virtualizor. Run 'renewal_cli.py install-health-check' any time to verify "
+              "they stay enabled and none has gone into a failed state.")
+    return 0 if result["ok"] else 1
+
+
+# ---------- unified automatic-renewal / production-write authorization (v1.10.3) ---------------
+
+def cmd_enable_auto_renewal(args):
+    """Grants production-write authorization AND flips policy.json's auto_renewal_enabled
+    AND (if root) installs/enables the write-capable apply timer -- all three together, in
+    one confirmed action, via installer.enable_auto_renewal(). Requires --yes (scripted) or
+    interactive confirmation; this is the single most consequential switch in the whole
+    product and must never flip silently."""
+    if not getattr(args, "yes", False):
+        print("This will:")
+        print("  1. Create renewal-config/WRITE_APPROVED (production write capability).")
+        print("  2. Set policy.json global_defaults.auto_renewal_enabled = true.")
+        print("  3. Install and enable the write-capable virt-renewal-apply.timer (requires root).")
+        print("\nAfter this, the apply timer will actually write bandwidth renewals to "
+              "Virtualizor for any VPS its policy marks eligible. Re-run with --yes to confirm.")
+        return 1
+    import installer as inst
+    result = inst.enable_auto_renewal(CONFIG_DIR, SYSTEMD_OUT_DIR)
+    for step in result["steps"]:
+        print(f"  - {step}")
+    for problem in result["problems"]:
+        print(f"  ! {problem}")
+    print(f"\nAutomatic renewal {'ENABLED' if result['ok'] else 'enable FAILED'}.")
+    return 0 if result["ok"] else 1
+
+
+def cmd_disable_auto_renewal(args):
+    """Revokes production-write authorization: removes WRITE_APPROVED, sets
+    auto_renewal_enabled=false, and (if root) stops/disables/removes the apply timer --
+    always together, never a partial state where auto_renewal_enabled=false but
+    WRITE_APPROVED still exists. Monitoring/inventory/hostnet/notifier timers and all
+    historical ledger data are explicitly untouched."""
+    import installer as inst
+    result = inst.disable_auto_renewal(CONFIG_DIR, SYSTEMD_OUT_DIR)
+    for step in result["steps"]:
+        print(f"  - {step}")
+    for problem in result["problems"]:
+        print(f"  ! {problem}")
+    print(f"\nAutomatic renewal {'DISABLED' if result['ok'] else 'disable reported problems'}.")
     return 0 if result["ok"] else 1
 
 
@@ -1406,12 +1489,22 @@ def cmd_apply_due(args):
     auto_renewal_enabled=True AND whose last detection was a plausible, eligible renewal
     candidate, and applies each through the SAME writer safety machinery as `apply` (durable
     operations table, pre/post live verification, never-retry-blind on UNKNOWN). This is what
-    the (unenabled) unattended systemd timer would run. Still requires WRITE_APPROVED; with
-    --non-interactive it also requires credentials already stored via `store-credentials`."""
+    the (unenabled, unless enable-auto-renewal has run) unattended systemd timer would run.
+    Still requires WRITE_APPROVED; with --non-interactive it also requires credentials
+    already stored via `store-credentials`.
+
+    Exit code 3 (not 1) for the 'not approved' case specifically: this command is the
+    ExecStart of the write-capable virt-renewal-apply.service, whose unit file declares
+    `SuccessExitStatus=3` for exactly this reason -- a deliberate, by-design safety refusal
+    must be visually distinguishable in `systemctl status`/journalctl from an actual crash
+    (exit 1, uncaught traceback, etc.); conflating the two was a real, reported source of
+    operator confusion (misread as 'the service is broken' when it was correctly refusing to
+    run unattended without authorization)."""
     if not os.path.exists(WRITE_APPROVAL_MARKER):
-        print("BLOCKED: production write capability is not approved.")
-        print(f"To enable it, the OPERATOR must explicitly create: {WRITE_APPROVAL_MARKER}")
-        return 1
+        print("BLOCKED (by design, not an error): production write capability is not approved.")
+        print(f"To enable it, use the menu's 'Enable automatic renewal' screen, or run: "
+              f"renewal_cli.py enable-auto-renewal --yes")
+        return 3
 
     node = next((n for n in nodes_mod.load_nodes(_node_config_path()) if n.node_id == args.node), None)
     if node is None:
@@ -1580,15 +1673,25 @@ def cmd_virtualizor_info(args):
 def cmd_inventory_sync(args):
     """One read-only, rate-limited, non-overlapping VPS inventory refresh. Never writes to
     Virtualizor, never touches WRITE_APPROVED, never shares a lock/retry-budget with the
-    renewal engine's own apply path."""
+    renewal engine's own apply path.
+
+    Exit 0 (not 1) when credentials simply haven't been stored YET: this command is the
+    ExecStart of the auto-activated (v1.10.3+) virt-renewal-inventory-sync.timer, which runs
+    on every fresh install before an operator has necessarily had the chance to run
+    `store-credentials` -- treating "not configured yet" as a timer/service FAILURE (as this
+    used to) is exactly the "deliberate safety block looks like a crash" problem this
+    project's own design principles explicitly call out (see cmd_apply_due's matching
+    SuccessExitStatus=3 fix for the write-capable timer); the read-only timers get the
+    simpler fix of just not treating this as an error at all, since there is nothing unsafe
+    about it."""
     import inventory as inv_mod
     import inventory_sync as isync_mod
     path = creds_mod.default_credentials_path(CONFIG_DIR, args.node)
     try:
         stored = creds_mod.load_credentials(path)
     except (FileNotFoundError, creds_mod.CredentialSecurityError) as e:
-        print(f"Cannot load stored credentials: {e}")
-        return 1
+        print(f"status=NOT_CONFIGURED (credentials not yet stored: {e})")
+        return 0
     conn = inv_mod.open_db(os.path.join(STATE_DIR, "inventory.sqlite3"))
     result = isync_mod.run_inventory_sync(conn, args.node, stored, STATE_DIR)
     print(f"status={result['status']}")
@@ -1972,6 +2075,26 @@ def main():
 
     sub.add_parser("install-health-check", help="Read-only post-change sanity check"
                    ).set_defaults(func=cmd_install_health_check)
+
+    sub.add_parser(
+        "install-activate-core-timers",
+        help="Root-only: install+enable the 4 read-only core timers into real systemd "
+             "(monitor, inventory-sync, hostnet-sync, readiness-notifier)"
+    ).set_defaults(func=cmd_install_activate_core_timers)
+
+    enable_auto_p = sub.add_parser(
+        "enable-auto-renewal",
+        help="Create WRITE_APPROVED, set auto_renewal_enabled=true, and (if root) "
+             "install+enable the write-capable apply timer -- all together")
+    enable_auto_p.add_argument("--yes", action="store_true",
+                                help="Skip the interactive confirmation (for scripted use)")
+    enable_auto_p.set_defaults(func=cmd_enable_auto_renewal)
+
+    sub.add_parser(
+        "disable-auto-renewal",
+        help="Remove WRITE_APPROVED, set auto_renewal_enabled=false, and (if root) "
+             "stop+disable+remove the apply timer -- always all together"
+    ).set_defaults(func=cmd_disable_auto_renewal)
 
     sub.add_parser("update-check", help="Read-only: current vs. latest GitHub release"
                    ).set_defaults(func=cmd_update_check)

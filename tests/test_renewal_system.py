@@ -592,10 +592,27 @@ def test_store_credentials_writes_secure_file(cli_env, monkeypatch):
     assert loaded.api_pass == "my-api-pass"
 
 
+def test_inventory_sync_exits_zero_when_credentials_not_yet_stored(cli_env, capsys):
+    """Regression for a real bug found while testing v1.10.3's automatic core-timer
+    activation: virt-renewal-inventory-sync.timer is now enabled on every fresh install,
+    which means this command runs before an operator necessarily has had the chance to run
+    store-credentials -- it must report a clear NOT_CONFIGURED status and exit 0, never a
+    failure exit code, or the timer's service would show 'failed' in systemctl/journalctl on
+    every single fresh install until credentials are stored (exactly the kind of false
+    alarm this project's design principles are supposed to prevent)."""
+    renewal_cli.cmd_install(argparse_namespace())
+    rc = renewal_cli.cmd_inventory_sync(argparse_namespace(node="self"))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "NOT_CONFIGURED" in out
+
+
 def test_apply_due_blocked_without_write_approval(cli_env):
+    """Exit code 3 (not 1), deliberately: this is a by-design safety refusal, not a crash --
+    see RENEWAL_SERVICE_UNIT_TEMPLATE's SuccessExitStatus=3 and cmd_apply_due's docstring."""
     renewal_cli.cmd_install(argparse_namespace())
     rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
-    assert rc == 1
+    assert rc == 3
 
 
 def test_apply_due_non_interactive_requires_stored_credentials(cli_env):

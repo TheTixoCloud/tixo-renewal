@@ -120,13 +120,149 @@ def test_built_package_cli_end_to_end_staging_run(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "Upgrade succeeded" in r.stdout
 
+    # install-health-check (v1.10.3+) genuinely checks real systemd state for this
+    # project's own core timers -- before activation, that's correctly UNHEALTHY (none
+    # installed yet), not a false "ok: true". See
+    # test_install_activate_core_timers_real_systemd_round_trip below for the full
+    # activate -> verify -> deactivate cycle against this same real host's systemd.
     r = run("install-health-check")
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert '"ok": true' in r.stdout
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert '"ok": false' in r.stdout
+    assert "is not enabled" in r.stdout
 
     # Re-running install (the idempotent noninteractive path) must never duplicate or error.
     r = run("install")
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+def _real_systemd_usable() -> bool:
+    if os.geteuid() != 0:
+        return False
+    if shutil.which("systemctl") is None:
+        return False
+    try:
+        result = subprocess.run(["systemctl", "daemon-reload"], capture_output=True,
+                                 text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+@pytest.mark.skipif(not os.path.exists(os.path.join(DEPLOY_DIR, "build_package.sh")),
+                     reason="deploy/ not present in this checkout")
+@pytest.mark.skipif(not _real_systemd_usable(),
+                     reason="requires root + a genuinely functional systemd on this host")
+def test_install_activate_core_timers_real_systemd_round_trip(tmp_path):
+    """The one test in this suite that genuinely touches the real host's systemd --
+    deliberately, since `install-activate-core-timers` is exactly the automation that
+    replaces the error-prone manual `systemctl`/file-copy steps `ir2`'s real installation
+    required (see service_activation.py's module docstring). Installs the real built
+    package's real core timers into THIS test-running host's real /etc/systemd/system,
+    verifies they are genuinely enabled+active via `systemctl is-enabled`/`is-active` (not
+    a mock), then ALWAYS removes them again in a finally block, regardless of whether an
+    assertion above it failed -- this test must never leave residue on the host it runs on.
+    Skipped entirely unless running as root with a real, responsive systemd (most CI
+    containers lack a real PID 1 systemd; this sandbox genuinely has one)."""
+    result = subprocess.run(["bash", "build_package.sh"], cwd=DEPLOY_DIR,
+                             capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+    pkg = os.path.join(DEPLOY_DIR, "tixo-renewal-package.tar.gz")
+    extract_dir = tmp_path / "extracted"
+    extract_dir.mkdir()
+    with tarfile.open(pkg) as tf:
+        tf.extractall(extract_dir, filter="data")
+
+    install_dir = tmp_path / "staging-install-real-systemd"
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+    env["TIXO_RENEWAL_NO_AUTO_MENU"] = "1"
+
+    # Run the REAL install.sh, not a direct `renewal_cli.py install` call -- that script is
+    # what actually copies lib/bin into install_dir (cmd_install() alone never does), which
+    # is what makes install_dir/lib a real PYTHONPATH the generated unit files can resolve
+    # against. A direct-subcommand-only test setup (as used by the lighter smoke test above,
+    # which never activates any real unit) would silently generate unit files pointing at a
+    # lib/ directory that was never populated.
+    install_result = subprocess.run(["bash", "install.sh"], cwd=extract_dir,
+                                      capture_output=True, text=True, timeout=60, env=env)
+    assert install_result.returncode == 0, install_result.stdout + install_result.stderr
+
+    cli_path = str(install_dir / "bin" / "renewal_cli.py")
+    env["PYTHONPATH"] = str(install_dir / "lib")
+
+    def run(*args):
+        return subprocess.run([sys.executable, cli_path, *args], capture_output=True,
+                               text=True, timeout=30, env=env)
+
+    core_timers = ("virt-renewal-monitor.timer", "virt-renewal-inventory-sync.timer",
+                   "virt-renewal-hostnet-sync.timer", "virt-renewal-readiness-notifier.timer")
+    core_services = ("virt-renewal-monitor.service", "virt-renewal-inventory-sync.service",
+                      "virt-renewal-hostnet-sync.service", "virt-renewal-readiness-notifier.service")
+
+    # Defensive: a stale 'failed' ActiveState from an unrelated EARLIER run of this same
+    # unit name (systemd caches it until the next completed run or an explicit reset) must
+    # never leak into this test's own assertions.
+    for name in core_services:
+        subprocess.run(["systemctl", "reset-failed", name], capture_output=True, timeout=10)
+
+    try:
+        r = run("install-activate-core-timers")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "Core timer activation succeeded" in r.stdout
+
+        for timer in core_timers:
+            check = subprocess.run(["systemctl", "is-enabled", timer], capture_output=True,
+                                    text=True, timeout=10)
+            assert check.stdout.strip() == "enabled", f"{timer}: {check.stdout!r} {check.stderr!r}"
+            active = subprocess.run(["systemctl", "is-active", timer], capture_output=True,
+                                     text=True, timeout=10)
+            assert active.stdout.strip() == "active", f"{timer}: {active.stdout!r}"
+
+        # Persistence-across-reboot proxy (can't actually reboot in a test): systemd's
+        # [Install] WantedBy=timers.target symlink must exist, which is what makes
+        # `systemctl enable` durable rather than a one-shot in-memory `start`.
+        for timer in core_timers:
+            symlink = f"/etc/systemd/system/timers.target.wants/{timer}"
+            assert os.path.islink(symlink), f"{timer} missing its persistence symlink"
+
+        # Deterministically trigger each service ONCE via `systemctl start` (never rely on
+        # OnBootSec/OnUnitActiveSec timing -- whether a monotonic timer's trigger point is
+        # already in the past at enable time, and therefore fires immediately, depends on
+        # how long this host has been up, which this test must not depend on) and wait for
+        # the oneshot run to actually complete before checking its result.
+        for service in core_services:
+            start = subprocess.run(["systemctl", "start", service], capture_output=True,
+                                    text=True, timeout=15)
+            assert start.returncode == 0, f"{service}: {start.stdout!r} {start.stderr!r}"
+        time.sleep(1)
+        for service in core_services:
+            failed = subprocess.run(["systemctl", "is-failed", service], capture_output=True,
+                                     text=True, timeout=10)
+            assert failed.stdout.strip() != "failed", (
+                f"{service} failed -- journalctl would show: "
+                f"{subprocess.run(['journalctl', '-u', service, '--no-pager', '-n', '15'], capture_output=True, text=True, timeout=10).stdout}")
+
+        # Re-running activation must be idempotent -- never error, never duplicate.
+        r = run("install-activate-core-timers")
+        assert r.returncode == 0, r.stdout + r.stderr
+
+        r = run("install-health-check")
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert '"ok": true' in r.stdout
+    finally:
+        for timer in core_timers:
+            subprocess.run(["systemctl", "disable", "--now", timer], capture_output=True,
+                            text=True, timeout=10)
+        for name in core_timers + core_services:
+            path = os.path.join("/etc/systemd/system", name)
+            if os.path.exists(path):
+                os.remove(path)
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True, timeout=10)
+        for timer in core_timers:
+            leftover = subprocess.run(["systemctl", "is-enabled", timer], capture_output=True,
+                                       text=True, timeout=10)
+            assert leftover.returncode != 0, f"{timer} was not actually cleaned up"
 
 
 @pytest.mark.skipif(not os.path.exists(os.path.join(DEPLOY_DIR, "build_package.sh")),
