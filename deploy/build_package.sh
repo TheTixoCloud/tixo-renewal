@@ -21,7 +21,7 @@ for f in engine.py models.py storage.py policy.py policy_integration.py local_so
          telegram_config.py telegram_bot.py reports.py host_time.py web_auth.py audit_log.py \
          web_config.py web_server.py relay_worker.py agent_config.py agent_server.py \
          backup_config.py installer.py traffic_format.py charts.py updater.py \
-         uninstaller.py service_activation.py; do
+         uninstaller.py service_activation.py first_renewal_validation.py; do
   cp -f "$IMPL/$f" "$HERE/lib/$f"
 done
 cp -f "$IMPL/renewal_cli.py" "$HERE/bin/renewal_cli.py"

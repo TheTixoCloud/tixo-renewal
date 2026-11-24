@@ -138,6 +138,73 @@ def disable_and_remove_units(unit_pairs) -> dict:
     return report
 
 
+def install_and_enable_persistent_service(systemd_src_dir: str, service_name: str) -> dict:
+    """v1.10.11: the long-running-daemon counterpart of install_and_enable_units() -- for
+    the optional modules (Telegram bot, Web Control Center, relay worker, remote agent)
+    whose generated unit is a single persistent `.service` with NO paired `.timer` (they
+    are meant to run continuously, not periodically). `systemctl enable --now` on the
+    SERVICE ITSELF is the correct, idempotent equivalent here (a timer's own [Install]
+    section is why install_and_enable_units() deliberately enables the TIMER, never the
+    service, for periodic jobs -- a persistent daemon has no timer to enable instead).
+    Same safety conventions as install_and_enable_units(): never raises for an expected
+    failure, always returns a report."""
+    report = {"ok": True, "copied": [], "enabled": False, "problems": []}
+    src = os.path.join(systemd_src_dir, service_name)
+    if not os.path.exists(src):
+        report["ok"] = False
+        report["problems"].append(f"missing generated unit file: {src}")
+        return report
+    dest = os.path.join(SYSTEMD_UNIT_DIR, service_name)
+    shutil.copy2(src, dest)
+    report["copied"].append(service_name)
+
+    reload_result = _systemctl("daemon-reload")
+    if not reload_result["ok"]:
+        report["ok"] = False
+        report["problems"].append(f"systemctl daemon-reload failed: {reload_result['stderr']!r}")
+        return report
+
+    enable_result = _systemctl("enable", "--now", service_name)
+    if not enable_result["ok"]:
+        report["ok"] = False
+        report["problems"].append(
+            f"failed to enable/start {service_name}: {enable_result['stderr']!r}")
+    else:
+        report["enabled"] = True
+    return report
+
+
+def disable_and_remove_persistent_service(service_name: str) -> dict:
+    """Stops+disables, then removes the unit file -- idempotent, same shape as
+    disable_and_remove_units() but for a single service with no paired timer."""
+    report = {"ok": True, "stopped": False, "removed": False, "problems": []}
+    service_path = os.path.join(SYSTEMD_UNIT_DIR, service_name)
+    if os.path.exists(service_path):
+        result = _systemctl("disable", "--now", service_name)
+        if not result["ok"]:
+            report["ok"] = False
+            report["problems"].append(f"failed to disable {service_name}: {result['stderr']!r}")
+        else:
+            report["stopped"] = True
+        os.remove(service_path)
+        report["removed"] = True
+    _systemctl("daemon-reload")
+    return report
+
+
+def verify_persistent_service_status(service_name: str) -> dict:
+    """Read-only: enabled/active/failed snapshot of a single persistent service. Never
+    modifies anything."""
+    enabled = _systemctl("is-enabled", service_name)
+    active = _systemctl("is-active", service_name)
+    failed = _systemctl("is-failed", service_name)
+    return {
+        "is_enabled": enabled["stdout"] or enabled["stderr"],
+        "is_active": active["stdout"] or active["stderr"],
+        "is_failed": failed["stdout"] or failed["stderr"],
+    }
+
+
 def verify_units_status(unit_pairs) -> dict:
     """Read-only health snapshot of each (service, timer) pair: whether the timer is
     enabled (persists across reboot), whether it's currently active (loaded and waiting/

@@ -542,6 +542,21 @@ def test_uninstall_optional_module_rejects_unknown_module(cli_env):
                                               renewal_cli.SYSTEMD_OUT_DIR)
 
 
+def _mock_systemctl_for_uninstall(monkeypatch, tmp_path, pre_existing_unit: str = None):
+    """Shared helper: uninstall_optional_module() now ALWAYS real-disables systemd state
+    (v1.10.11, extended from backup_schedule-only in v1.10.10) -- every test below must
+    redirect SYSTEMD_UNIT_DIR to a disposable path and mock _systemctl, never touching the
+    real host's /etc/systemd/system, same convention as every other systemd-aware test in
+    this project."""
+    import service_activation as sa
+    disposable = tmp_path / "fake-etc-systemd-system"
+    disposable.mkdir(exist_ok=True)
+    if pre_existing_unit:
+        (disposable / pre_existing_unit).write_text("# fake unit\n")
+    monkeypatch.setattr(sa, "SYSTEMD_UNIT_DIR", str(disposable))
+    monkeypatch.setattr(sa, "_systemctl", lambda *a, **k: {"ok": True, "stdout": "", "stderr": ""})
+
+
 @pytest.mark.parametrize("module_name,settings_module,settings_loader,unit_name", [
     ("telegram", "telegram_config", "load_telegram_settings", "virt-renewal-telegram-bot.service"),
     ("web", "web_config", "load_web_settings", "virt-renewal-web.service"),
@@ -549,9 +564,10 @@ def test_uninstall_optional_module_rejects_unknown_module(cli_env):
 ])
 def test_uninstall_optional_module_disables_and_removes_unit(cli_env, module_name,
                                                                 settings_module, settings_loader,
-                                                                unit_name):
+                                                                unit_name, monkeypatch, tmp_path):
     renewal_cli.cmd_install(argparse_namespace())  # generates the systemd units
     assert os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, unit_name))
+    _mock_systemctl_for_uninstall(monkeypatch, tmp_path, pre_existing_unit=unit_name)
 
     import importlib
     mod = importlib.import_module(settings_module)
@@ -567,12 +583,16 @@ def test_uninstall_optional_module_disables_and_removes_unit(cli_env, module_nam
     assert result["secrets_purged"] is False
     assert unit_name in result["units_removed"]
     assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, unit_name))
+    # v1.10.11: the REAL systemd service, not just the generated template, must be
+    # genuinely stopped/disabled too.
+    assert result["systemd_disabled"] is True
 
     reloaded = getattr(mod, settings_loader)(cli_env["config_dir"])
     assert reloaded.enabled is False
 
 
-def test_uninstall_optional_module_keeps_secrets_by_default(cli_env):
+def test_uninstall_optional_module_keeps_secrets_by_default(cli_env, monkeypatch, tmp_path):
+    _mock_systemctl_for_uninstall(monkeypatch, tmp_path)
     import telegram_config as tc
     secrets_path = tc.default_secrets_path(cli_env["config_dir"])
     tc.store_telegram_secrets(secrets_path, bot_token="123:ABC")
@@ -581,7 +601,8 @@ def test_uninstall_optional_module_keeps_secrets_by_default(cli_env):
     assert os.path.exists(secrets_path)
 
 
-def test_uninstall_optional_module_purges_secrets_when_requested(cli_env):
+def test_uninstall_optional_module_purges_secrets_when_requested(cli_env, monkeypatch, tmp_path):
+    _mock_systemctl_for_uninstall(monkeypatch, tmp_path)
     import telegram_config as tc
     secrets_path = tc.default_secrets_path(cli_env["config_dir"])
     tc.store_telegram_secrets(secrets_path, bot_token="123:ABC")
@@ -592,7 +613,8 @@ def test_uninstall_optional_module_purges_secrets_when_requested(cli_env):
     assert not os.path.exists(secrets_path)
 
 
-def test_uninstall_optional_module_never_touches_core_renewal_config(cli_env):
+def test_uninstall_optional_module_never_touches_core_renewal_config(cli_env, monkeypatch, tmp_path):
+    _mock_systemctl_for_uninstall(monkeypatch, tmp_path)
     renewal_cli.cmd_install(argparse_namespace())
     nodes_path = os.path.join(cli_env["config_dir"], "nodes.json")
     before = open(nodes_path).read()
@@ -603,7 +625,8 @@ def test_uninstall_optional_module_never_touches_core_renewal_config(cli_env):
     assert os.path.exists(os.path.join(cli_env["state_dir"], "test-node.sqlite3"))
 
 
-def test_cmd_uninstall_module_cli(cli_env, capsys):
+def test_cmd_uninstall_module_cli(cli_env, capsys, monkeypatch, tmp_path):
+    _mock_systemctl_for_uninstall(monkeypatch, tmp_path)
     renewal_cli.cmd_install(argparse_namespace())
     rc = renewal_cli.cmd_uninstall_module(
         argparse_namespace(module="telegram", purge_secrets=False))

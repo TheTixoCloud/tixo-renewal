@@ -20,7 +20,7 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.10.10"
+VERSION = "1.10.11"
 
 # Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
 # apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
@@ -163,7 +163,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart={python} {libdir}/readiness_notifier.py --db {workdir}/shadow-monitor-state/{db_filename} --node {node_id} --policy-config {workdir}/renewal-config/policy.json --notified-state {workdir}/shadow-monitor-state/readiness-notified.json --alert-log {workdir}/shadow-monitor-state/readiness-alerts.log
+ExecStart={python} {libdir}/readiness_notifier.py --db {workdir}/shadow-monitor-state/{db_filename} --node {node_id} --policy-config {workdir}/renewal-config/policy.json --notified-state {workdir}/shadow-monitor-state/readiness-notified.json --alert-log {workdir}/shadow-monitor-state/readiness-alerts.log --config-dir {workdir}/renewal-config --state-dir {workdir}/shadow-monitor-state --systemd-out-dir {workdir}/systemd
 WorkingDirectory={workdir}
 User={user}
 """
@@ -886,6 +886,14 @@ def cmd_backup_scheduled_run(args):
         verification = backup_mod.verify_backup_archive(archive)
         if not verification["ok"]:
             print(f"WARNING: backup archive failed integrity verification: {verification}")
+            # v1.10.11: this is the ONE automatic backup path with nobody interactively
+            # watching it -- an integrity failure must be pushed, not just logged where an
+            # operator would need to go looking for it (see readiness_notifier.py's
+            # send_telegram_alert, the same best-effort push every other automatic
+            # notification in this project now uses).
+            import readiness_notifier as rn
+            rn.send_telegram_alert(
+                CONFIG_DIR, f"BACKUP INTEGRITY FAILED: {os.path.basename(archive)} -- {verification}")
 
         final_path = archive
         if settings.encrypt:
@@ -1229,6 +1237,31 @@ def cmd_doctor(args):
     print("\n== Writer state ==")
     write_approved = os.path.exists(WRITE_APPROVAL_MARKER)
     print(f"  WRITE_APPROVED: {'present' if write_approved else 'absent (structurally blocked)'}")
+
+    # v1.10.11: distinct from every section above -- those report SOFTWARE/SERVICE health
+    # and CONFIGURATION readiness; this reports whether a REAL financial write has actually
+    # happened yet and, if so, whether it was verified correct. Never conflate the two.
+    print("\n== First live renewal validation ==")
+    import first_renewal_validation as frv
+    for node in nodes:
+        outcomes = frv.load_outcomes(CONFIG_DIR, node.node_id)
+        if outcomes:
+            latest = outcomes[-1]
+            verdict = "VERIFIED OK" if latest["verified_ok"] else "NEEDS REVIEW"
+            print(f"  {node.node_id}: {verdict} -- vpsid={latest['vpsid']} "
+                  f"expected={latest['expected_quota_gb']}GB "
+                  f"actual={latest['actual_quota_gb']}GB "
+                  f"status={latest['write_status']} at {latest['recorded_at']}")
+            if not latest["verified_ok"]:
+                problems.append(f"first live renewal for node {node.node_id} needs review "
+                                 f"(operation_id={latest['operation_id']}) -- see "
+                                 f"`resolve-operation`")
+        elif frv.is_armed(CONFIG_DIR, node.node_id):
+            print(f"  {node.node_id}: ARMED -- auto-renewal authorized, waiting for the "
+                  f"first real renewal to occur and be recorded; nothing to verify yet.")
+        else:
+            print(f"  {node.node_id}: not armed (auto-renewal has not yet been authorized "
+                  f"for this node, or it was authorized before v1.10.11)")
 
     print("\n== Summary ==")
     if problems:
@@ -1647,6 +1680,8 @@ def cmd_apply(args):
     )
     conn.close()
     print(f"Result: {result}")
+    _record_first_renewal_validation_if_armed(
+        args.node, int(args.vpsid), args.period_key, args.new_quota_gb, result)
     if result["status"] != "APPLIED":
         print("Not confirmed as applied -- see `resolve-operation` to investigate before any retry.")
         return 1
@@ -1768,6 +1803,38 @@ def cmd_inspect_vps(args):
 
 # ---------- apply-due (the unattended-renewal entry point; still fully gated) -------------------
 
+def _record_first_renewal_validation_if_armed(node_id: str, vpsid: int, period_key: str,
+                                                 expected_quota_gb, result: dict) -> None:
+    """Best-effort: records the first-live-renewal outcome (no-op if not armed for this
+    node -- see first_renewal_validation.py) and pushes a Telegram notification if
+    configured, same transport the scheduled-backup delivery already uses. NEVER raises --
+    a notification-delivery problem must never be mistaken for a problem with the renewal
+    itself, which writer.apply_renewal() has already fully and independently decided by
+    the time this runs."""
+    try:
+        import first_renewal_validation as frv
+        record = frv.record_first_outcome(CONFIG_DIR, node_id, vpsid, period_key,
+                                            expected_quota_gb, result)
+        if record is None:
+            return
+        text = frv.build_notification_text(record)
+        print(text)
+        try:
+            import telegram_config as tgc
+            import telegram_bot as tbot
+            tg_settings = tgc.load_telegram_settings(CONFIG_DIR)
+            if tg_settings.enabled and tg_settings.admin_ids:
+                secrets_obj = tgc.load_telegram_secrets(tgc.default_secrets_path(CONFIG_DIR))
+                transport = tbot.build_transport(tg_settings, secrets_obj)
+                for admin_id in tg_settings.admin_ids:
+                    transport.call("sendMessage", {"chat_id": admin_id, "text": text})
+        except Exception:
+            pass  # Telegram delivery is best-effort; the durable JSON record above is what matters
+    except Exception as e:
+        print(f"WARNING: first-renewal-validation recording failed (non-fatal, the "
+              f"renewal result above is unaffected): {e}")
+
+
 def cmd_apply_due(args):
     """Scans one node's most recent dry-run data for VPS whose resolved policy has
     auto_renewal_enabled=True AND whose last detection was a plausible, eligible renewal
@@ -1866,6 +1933,12 @@ def cmd_apply_due(args):
                 deferred.append((vpsid, result))
             else:
                 applied.append((vpsid, result))
+                # v1.10.11: ONLY a real, completed write attempt (not a locked/deferred
+                # non-attempt) can be "the first live renewal" -- see
+                # first_renewal_validation.py's module docstring. This NEVER alters
+                # `result`; it only observes and durably records it.
+                _record_first_renewal_validation_if_armed(
+                    args.node, vpsid, period_key, preview["proposed_new_quota_gb"], result)
             time.sleep(API_CALL_SPACING_SECONDS)  # this attempt touched the real API
         except Exception as e:
             skipped.append((vpsid, f"ERROR: {e}"))

@@ -525,6 +525,31 @@ def test_cmd_backup_scheduled_run_records_audit_event(tmp_path, capsys):
     assert any(e["action"] == "backup_full_created" for e in events)
 
 
+def test_cmd_backup_scheduled_run_pushes_alert_on_integrity_failure(tmp_path, capsys, monkeypatch):
+    """v1.10.11: the scheduled backup is the one automatic path with nobody interactively
+    watching it -- an integrity failure must be PUSHED (reusing readiness_notifier's same
+    best-effort Telegram transport), not just printed to a log an operator would need to
+    go looking for."""
+    import renewal_cli
+    import backup_config as bcfg
+    import readiness_notifier as rn
+    _configure_cli_dirs(renewal_cli, tmp_path)
+    bcfg.save_backup_schedule_settings(renewal_cli.CONFIG_DIR,
+                                         bcfg.BackupScheduleSettings(enabled=True))
+    monkeypatch.setattr(backup, "verify_backup_archive",
+                         lambda archive: {"ok": False, "error": "corrupt tar"})
+    pushed = []
+    monkeypatch.setattr(rn, "send_telegram_alert", lambda config_dir, text: pushed.append(text))
+
+    class _Args:
+        pass
+    renewal_cli.cmd_backup_scheduled_run(_Args())
+    out = capsys.readouterr().out
+    assert "WARNING: backup archive failed integrity verification" in out
+    assert len(pushed) == 1
+    assert "BACKUP INTEGRITY FAILED" in pushed[0]
+
+
 def test_cmd_backup_scheduled_run_telegram_delivery_skipped_when_bot_disabled(tmp_path, capsys):
     import renewal_cli
     import backup_config as bcfg

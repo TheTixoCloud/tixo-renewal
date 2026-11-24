@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from decimal import Decimal
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -1496,6 +1497,76 @@ def test_action_configure_backup_schedule_activation_failure_is_reported_not_hid
     monkeypatch.setattr("builtins.input", lambda *a: next(answers))
 
     menu.action_configure_backup_schedule(menu.Style(enabled=False))
+
+    out = capsys.readouterr().out
+    assert "FAILED" in out
+    assert "NOT actually running" in out
+
+
+# ---------- v1.10.11: persistent-service modules must ALSO really activate ----------
+
+def test_action_configure_telegram_bot_enable_actually_activates_real_systemd(
+        monkeypatch, capsys, tmp_path):
+    """Extends the v1.10.10 backup-timer fix to the persistent-service optional modules
+    (Telegram bot, Web Control Center, relay worker, remote agent) -- these have a single
+    Type=simple/Restart=always .service with NO paired .timer, so the real-activation step
+    is `systemctl enable --now` on the service itself (service_activation.
+    install_and_enable_persistent_service), not a timer. Never touches the real host's
+    /etc/systemd/system -- SYSTEMD_UNIT_DIR is redirected to a disposable path."""
+    menu.renewal_cli.CONFIG_DIR = str(tmp_path / "renewal-config")
+    menu.renewal_cli.SYSTEMD_OUT_DIR = str(tmp_path / "systemd")
+    os.makedirs(menu.renewal_cli.CONFIG_DIR)
+    os.makedirs(menu.renewal_cli.SYSTEMD_OUT_DIR)
+    # action_configure_telegram_bot writes the unit via renewal_cli.write_systemd_units()
+    # normally (through cmd_install) -- here we only need the ONE unit file this test cares
+    # about to exist under SYSTEMD_OUT_DIR, for install_and_enable_persistent_service to copy.
+    Path(os.path.join(menu.renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-telegram-bot.service")
+         ).write_text("[Unit]\nDescription=fake\n[Service]\nExecStart=/bin/true\n")
+
+    import service_activation as sa
+    disposable_systemd_dir = tmp_path / "fake-etc-systemd-system"
+    disposable_systemd_dir.mkdir()
+    monkeypatch.setattr(sa, "SYSTEMD_UNIT_DIR", str(disposable_systemd_dir))
+    monkeypatch.setattr(sa, "_systemctl",
+                         lambda *a, **k: {"ok": True,
+                                           "stdout": "enabled" if a and a[0] == "is-enabled"
+                                           else ("active" if a and a[0] == "is-active" else ""),
+                                           "stderr": ""})
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    # mode(""), admins(""), viewers(""), enable("y"), reports("n"), set-token("n"),
+    # save-confirm("y"), connectivity-test("n") -- in that exact prompt order.
+    answers = iter(["", "", "", "y", "n", "n", "y", "n"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+
+    menu.action_configure_telegram_bot(menu.Style(enabled=False))
+
+    out = capsys.readouterr().out
+    assert "activated" in out.lower()
+    assert (disposable_systemd_dir / "virt-renewal-telegram-bot.service").exists()
+    assert menu.tgc.load_telegram_settings(menu.renewal_cli.CONFIG_DIR).enabled is True
+
+
+def test_action_configure_telegram_bot_activation_failure_is_reported_not_hidden(
+        monkeypatch, capsys, tmp_path):
+    menu.renewal_cli.CONFIG_DIR = str(tmp_path / "renewal-config")
+    menu.renewal_cli.SYSTEMD_OUT_DIR = str(tmp_path / "systemd")
+    os.makedirs(menu.renewal_cli.CONFIG_DIR)
+    os.makedirs(menu.renewal_cli.SYSTEMD_OUT_DIR)
+    Path(os.path.join(menu.renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-telegram-bot.service")
+         ).write_text("[Unit]\nDescription=fake\n[Service]\nExecStart=/bin/true\n")
+
+    import service_activation as sa
+    monkeypatch.setattr(sa, "SYSTEMD_UNIT_DIR", str(tmp_path / "fake-etc-systemd-system"))
+    os.makedirs(str(tmp_path / "fake-etc-systemd-system"))
+    monkeypatch.setattr(sa, "_systemctl",
+                         lambda *a, **k: {"ok": False, "stdout": "", "stderr": "nope"})
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    answers = iter(["", "", "", "y", "n", "n", "y", "n"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+
+    menu.action_configure_telegram_bot(menu.Style(enabled=False))
 
     out = capsys.readouterr().out
     assert "FAILED" in out

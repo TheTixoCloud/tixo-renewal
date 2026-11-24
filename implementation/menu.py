@@ -2198,6 +2198,52 @@ def action_view_emergency_grants(style: Style):
               f"`resolve-operation` if a ledger operation was created but is stuck.{style.RESET}")
 
 
+def _activate_or_deactivate_persistent_service(style: Style, service_name: str, enabled: bool,
+                                                  run_command_hint: str) -> None:
+    """v1.10.11: real systemd activation for the optional long-running-daemon modules
+    (Telegram bot, Web Control Center, relay worker, remote agent) -- the persistent-
+    service counterpart of action_configure_backup_schedule's v1.10.10 fix. These units
+    have Type=simple/Restart=always and NO paired timer (see renewal_cli.py's
+    TELEGRAM_BOT_SERVICE_UNIT_TEMPLATE and siblings), so `systemctl enable --now` on the
+    service itself -- not a timer -- is the correct real-activation step (see
+    service_activation.install_and_enable_persistent_service's docstring). Always
+    VERIFIES via systemctl before claiming success, same discipline as the backup-timer
+    fix: never report 'saved' as if it meant 'running'."""
+    import service_activation as sa
+    if enabled:
+        if os.geteuid() != 0:
+            print(f"{style.YELLOW}Saved, but activating the real systemd service requires "
+                  f"root -- re-run as root (or sudo) to actually enable it, or start it "
+                  f"yourself with `{run_command_hint}`. Until then this is config-only and "
+                  f"nothing is running.{style.RESET}")
+            return
+        result = sa.install_and_enable_persistent_service(renewal_cli.SYSTEMD_OUT_DIR, service_name)
+        if not result["ok"]:
+            print(f"{style.RED}FAILED to activate {service_name}:{style.RESET}")
+            for p in result["problems"]:
+                print(f"  - {p}")
+            print(f"Settings were saved, but it is NOT actually running. You can also start "
+                  f"it manually with `{run_command_hint}`.")
+            return
+        status = sa.verify_persistent_service_status(service_name)
+        if status["is_enabled"] != "enabled" or status["is_active"] != "active":
+            print(f"{style.RED}Activation command succeeded but verification shows "
+                  f"{service_name} is not genuinely enabled/active (enabled="
+                  f"{status['is_enabled']}, active={status['is_active']}) -- treating this "
+                  f"as FAILED, not success.{style.RESET}")
+            return
+        print(f"Saved AND activated: {service_name} is enabled and running (verified via "
+              f"systemctl, not just a generated template).")
+    else:
+        result = sa.disable_and_remove_persistent_service(service_name)
+        if not result["ok"]:
+            print(f"{style.RED}FAILED to disable {service_name}:{style.RESET}")
+            for p in result["problems"]:
+                print(f"  - {p}")
+            return
+        print(f"Saved. {service_name} stopped and disabled.")
+
+
 def action_configure_telegram_bot(style: Style):
     """Configures the optional Telegram bot (v1.8.0 Part 3) -- DISABLED and DIRECT mode by
     default, exactly matching the required defaults. This action only writes local settings/
@@ -2309,6 +2355,9 @@ def action_configure_telegram_bot(style: Style):
         return
     tgc.save_telegram_settings(renewal_cli.CONFIG_DIR, new_settings)
     print("Saved.")
+    _activate_or_deactivate_persistent_service(
+        style, "virt-renewal-telegram-bot.service", new_settings.enabled,
+        "tixo-renewal telegram-bot-run")
 
     if _confirm("Run a connectivity test now? (sends a real getMe call to Telegram)"):
         try:
@@ -2403,7 +2452,9 @@ def action_configure_web(style: Style):
         print("Cancelled.")
         return
     wcfg.save_web_settings(renewal_cli.CONFIG_DIR, new_settings)
-    print(f"Saved. Start it with: tixo-renewal web-run (only works while enabled).")
+    print("Saved.")
+    _activate_or_deactivate_persistent_service(
+        style, "virt-renewal-web.service", new_settings.enabled, "tixo-renewal web-run")
 
 
 def action_configure_relay_worker(style: Style):
@@ -2447,7 +2498,10 @@ def action_configure_relay_worker(style: Style):
         print("Cancelled.")
         return
     tgc.save_relay_worker_settings(renewal_cli.CONFIG_DIR, new_settings)
-    print("Saved. Start it with: tixo-renewal relay-worker-run (only works while enabled).")
+    print("Saved.")
+    _activate_or_deactivate_persistent_service(
+        style, "virt-renewal-relay-worker.service", new_settings.enabled,
+        "tixo-renewal relay-worker-run")
 
 
 def action_configure_remote_agent(style: Style):
@@ -2498,7 +2552,9 @@ def action_configure_remote_agent(style: Style):
         print("Cancelled.")
         return
     ac.save_agent_settings(renewal_cli.CONFIG_DIR, new_settings)
-    print("Saved. Start it with: tixo-renewal agent-run (only works while enabled).")
+    print("Saved.")
+    _activate_or_deactivate_persistent_service(
+        style, "virt-renewal-agent.service", new_settings.enabled, "tixo-renewal agent-run")
 
 
 def action_configure_backup_schedule(style: Style):

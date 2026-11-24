@@ -12,7 +12,7 @@
 set -euo pipefail
 
 REPO="TheTixoCloud/tixo-renewal"
-TAG="${TIXO_RENEWAL_VERSION:-v1.10.10}"
+TAG="${TIXO_RENEWAL_VERSION:-v1.10.11}"
 ASSET="tixo-renewal-package.tar.gz"
 BASE_URL="https://github.com/$REPO/releases/download/$TAG"
 

@@ -494,19 +494,19 @@ def uninstall_optional_module(module_name: str, config_dir: str, systemd_out_dir
             os.remove(unit_path)
             report["units_removed"].append(unit)
 
-    # backup_schedule is the one optional module whose unit pair menu.py's
-    # action_configure_backup_schedule can genuinely ACTIVATE in real systemd (see its
-    # v1.10.10 fix) -- so disabling it here must be equally real, not leave a live timer
-    # running against a config that now says disabled=False. The other optional modules
-    # (telegram/web/relay_worker/agent) only ever generate a plain .service TEMPLATE for the
-    # operator to install themselves; this project never auto-activates those, so there is
-    # no live systemd state for this function to real-disable on their behalf (yet).
+    # Every optional module's menu screen can now genuinely ACTIVATE real systemd state
+    # (backup_schedule's timer since v1.10.10; telegram/web/relay_worker/agent's persistent
+    # services since v1.10.11 -- see _activate_or_deactivate_persistent_service in menu.py)
+    # -- so disabling here must be equally real in every case, never leave a live
+    # service/timer running against a config that now says disabled=False.
+    import service_activation as sa
     if module_name == "backup_schedule":
-        import service_activation as sa
         sa_result = sa.disable_and_remove_units([units])
-        report["systemd_disabled"] = sa_result["ok"]
-        if sa_result["problems"]:
-            report["systemd_problems"] = sa_result["problems"]
+    else:
+        sa_result = sa.disable_and_remove_persistent_service(units[0])
+    report["systemd_disabled"] = sa_result["ok"]
+    if sa_result["problems"]:
+        report["systemd_problems"] = sa_result["problems"]
 
     return report
 
@@ -593,6 +593,16 @@ def enable_auto_renewal(config_dir: str, systemd_src_dir: str, activate_timer: b
             "Created by enable_auto_renewal() -- production write capability is "
             "operator-authorized.\n")
         report["write_approved_created"] = True
+        # v1.10.11: arm first-renewal-validation for every node -- ONLY on a genuinely NEW
+        # authorization (write_approved_created, not a no-op re-run against an
+        # already-approved node), so re-running this doesn't re-arm and incorrectly treat a
+        # LATER renewal as "the first" again. See first_renewal_validation.py's module
+        # docstring for what this does and does not do.
+        import first_renewal_validation as frv
+        import nodes as nodes_mod
+        for node in nodes_mod.load_nodes(nodes_path):
+            frv.arm(config_dir, node.node_id)
+        report["steps"].append("first-renewal-validation armed for every configured node")
     report["steps"].append(f"WRITE_APPROVED present at {marker_path}")
 
     import json

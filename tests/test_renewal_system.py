@@ -808,6 +808,66 @@ def test_apply_due_applies_only_policy_eligible_vps(cli_env, monkeypatch):
     conn.close()
 
 
+def test_first_renewal_validation_end_to_end_through_real_enable_auto_renewal_and_apply_due(
+        cli_env, monkeypatch, capsys):
+    """v1.10.11 end-to-end: enable-auto-renewal (the REAL installer.enable_auto_renewal(),
+    not a hand-set marker) arms first-renewal-validation; the first real APPLIED write that
+    cmd_apply_due produces afterward must be durably recorded as VERIFIED OK and surfaced in
+    `doctor`'s report -- without this module altering anything about the write itself (same
+    APPLIED status, same requested_new_quota_gb, as the existing
+    test_apply_due_applies_only_policy_eligible_vps this is adapted from)."""
+    renewal_cli.cmd_install(argparse_namespace())
+    import credentials as creds_mod
+    creds_path = creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, "test-node")
+    creds_mod.store_credentials(creds_path, "https://example.invalid", "k", "p")
+
+    import installer as inst
+    enable_result = inst.enable_auto_renewal(renewal_cli.CONFIG_DIR, renewal_cli.SYSTEMD_OUT_DIR,
+                                               activate_timer=False)
+    assert enable_result["write_approved_created"] is True
+
+    import first_renewal_validation as frv
+    assert frv.is_armed(renewal_cli.CONFIG_DIR, "test-node") is True
+
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+    monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: datetime(2026, 10, 15, 9, 31, tzinfo=timezone.utc).isoformat())
+    monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+        {"vpsid": 42, "created_epoch": created_epoch, "quota_gb": Decimal("1000"), "used_gb": Decimal("900")}])
+    renewal_cli.cmd_dry_run(argparse_namespace())
+    monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: datetime(2026, 10, 15, 10, 1, tzinfo=timezone.utc).isoformat())
+    monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+        {"vpsid": 42, "created_epoch": created_epoch, "quota_gb": Decimal("1000"), "used_gb": Decimal("1")}])
+    renewal_cli.cmd_dry_run(argparse_namespace())
+
+    import writer as writer_mod, time as time_mod, local_source as ls
+    monkeypatch.setattr(writer_mod, "call_managevps_api", lambda *a, **k: {"raw": "ok"})
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    reads = iter([Decimal("1"), Decimal("100"), Decimal("100")])
+    monkeypatch.setattr(ls, "fetch_single_vps_quota", lambda vpsid: next(reads))
+
+    rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
+    assert rc == 0
+
+    outcomes = frv.load_outcomes(renewal_cli.CONFIG_DIR, "test-node")
+    assert len(outcomes) == 1
+    assert outcomes[0]["verified_ok"] is True
+    assert outcomes[0]["write_status"] == "APPLIED"
+    assert outcomes[0]["expected_quota_gb"] == "100"
+    # Armed marker must be consumed -- a SECOND renewal later must never be re-recorded as "the first".
+    assert frv.is_armed(renewal_cli.CONFIG_DIR, "test-node") is False
+
+    capsys.readouterr()  # discard apply-due's own output
+    renewal_cli.cmd_doctor(argparse_namespace())
+    out = capsys.readouterr().out
+    assert "First live renewal validation" in out
+    assert "VERIFIED OK" in out
+    # A verified-ok first renewal must never itself be listed as a problem (unrelated
+    # service-health problems, e.g. core timers not activated in this test fixture, are
+    # expected and orthogonal -- see test_cmd_install_health_check_flags_unactivated_core_
+    # timers for that same, separate concern).
+    assert "needs review" not in out.lower()
+
+
 def test_apply_due_one_vps_exception_does_not_block_other_eligible_vps(cli_env, monkeypatch):
     """v1.2 CRITICAL reliability fix: a real end-to-end proof that an exception processing
     vpsid 42 (simulated network error) never aborts the batch -- vpsid 43's independently
