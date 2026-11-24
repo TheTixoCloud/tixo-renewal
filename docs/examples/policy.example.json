@@ -2,7 +2,7 @@
   "schema_version": 1,
   "global_defaults": {
     "initial_allocation_gb": "100",
-    "monthly_grant_gb": "100",
+    "monthly_grant_gb": "0",
     "carryover_enabled": true,
     "carryover_cap_gb": null,
     "billing_anchor": "verified_creation",

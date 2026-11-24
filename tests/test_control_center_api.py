@@ -142,7 +142,9 @@ def test_renewal_overview_reports_write_approved_and_policy(tmp_path):
     result = api.get_renewal_overview(config_dir, state_dir)
     assert result["write_approved"] is False
     assert result["policy_ok"] is True
-    assert result["monthly_grant_gb"] == "100"
+    # Default monthly gift is 0 (carry-over of purchased bandwidth, not a bonus grant) --
+    # see policy.BUILTIN_DEFAULT_MONTHLY_GB's docstring.
+    assert result["monthly_grant_gb"] == "0"
 
 
 # ---------- get_emergency_policy_overview -----------------------------------------------------

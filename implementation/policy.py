@@ -20,8 +20,20 @@ SCHEMA_VERSION = 1
 # The only place a global fallback number is allowed to be hardcoded. Per-host/per-VPS
 # overrides, once this module is in use, are what actually govern production -- this value
 # only applies if the operator never configures anything at all (fresh install default).
+#
+# BUILTIN_DEFAULT_MONTHLY_GB is 0, not a nonzero "gift" (reverted from an earlier
+# BUILTIN_DEFAULT_MONTHLY_GB=100 default): the production business model is carry-over of
+# PURCHASED, unused bandwidth into the next period -- compute_renewal_quota() already
+# implements `remaining + monthly_grant_gb`, so any nonzero default here would silently
+# hand every fresh install a monthly bonus the operator never asked for. An operator who
+# wants a gift can still configure one explicitly (--env TIXO_RENEWAL_MONTHLY_BASE_GB at
+# install time, or editing policy.json directly, or the menu's "Configure monthly gift"
+# screen) -- the feature remains fully supported, just opt-in rather than on-by-default.
+# This is a fresh-install DEFAULT ONLY: it is write_default_policy_config()'s fallback when
+# no value is given, and that function is itself idempotent (never overwrites an existing
+# policy.json) -- it cannot retroactively alter any already-configured customer's balance.
 BUILTIN_DEFAULT_INITIAL_GB = Decimal("100")
-BUILTIN_DEFAULT_MONTHLY_GB = Decimal("100")
+BUILTIN_DEFAULT_MONTHLY_GB = Decimal("0")
 
 
 @dataclass(frozen=True)

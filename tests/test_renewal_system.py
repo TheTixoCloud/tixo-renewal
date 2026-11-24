@@ -660,7 +660,7 @@ def test_apply_due_applies_only_policy_eligible_vps(cli_env, monkeypatch):
     import writer as writer_mod, time as time_mod
     monkeypatch.setattr(writer_mod, "call_managevps_api", lambda *a, **k: {"raw": "ok"})
     monkeypatch.setattr(time_mod, "sleep", lambda s: None)  # skip the real settle delay in tests
-    reads = iter([Decimal("1"), Decimal("200"), Decimal("200")])  # pre-write, post-write, confirm
+    reads = iter([Decimal("1"), Decimal("100"), Decimal("100")])  # pre-write, post-write, confirm
     import local_source as ls
     monkeypatch.setattr(ls, "fetch_single_vps_quota", lambda vpsid: next(reads))
 
@@ -670,7 +670,7 @@ def test_apply_due_applies_only_policy_eligible_vps(cli_env, monkeypatch):
     op = conn.execute("SELECT status, requested_new_quota_gb FROM operations WHERE vpsid=42").fetchone()
     assert op is not None
     assert op[0] == "APPLIED"
-    assert op[1] == "200"  # 100 remaining + 100 monthly grant
+    assert op[1] == "100"  # 100 remaining + 0 monthly grant (default gift is 0)
     conn.close()
 
 
@@ -705,7 +705,7 @@ def test_apply_due_one_vps_exception_does_not_block_other_eligible_vps(cli_env, 
     import writer as writer_mod, time as time_mod, local_source as ls
     monkeypatch.setattr(writer_mod, "call_managevps_api", lambda *a, **k: {"raw": "ok"})
     monkeypatch.setattr(time_mod, "sleep", lambda s: None)
-    reads43 = iter([Decimal("1"), Decimal("200"), Decimal("200")])
+    reads43 = iter([Decimal("1"), Decimal("100"), Decimal("100")])  # 100 remaining + 0 gift
 
     def flaky_quota_read(vpsid):
         if vpsid == 42:
@@ -1036,7 +1036,7 @@ def test_apply_due_non_interactive_never_calls_input_or_getpass(cli_env, monkeyp
     import writer as writer_mod, local_source as ls, time as time_mod
     monkeypatch.setattr(writer_mod, "call_managevps_api", lambda *a, **k: {"raw": '{"done":1}', "parsed": {"done": 1}})
     monkeypatch.setattr(time_mod, "sleep", lambda s: None)  # skip the real settle delay in tests
-    reads = iter([Decimal("1"), Decimal("200"), Decimal("200")])
+    reads = iter([Decimal("1"), Decimal("100"), Decimal("100")])  # 100 remaining + 0 gift
     monkeypatch.setattr(ls, "fetch_single_vps_quota", lambda v: next(reads))
 
     rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))

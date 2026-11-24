@@ -42,10 +42,12 @@ It never touches the write-capable `apply` timer.
 ## Step 4 — Configure your real policy (ON the Virtualizor host)
 
 Edit `/opt/tixo-renewal/renewal-config/policy.json` (see
-`docs/examples/policy.example.json`). Ships with a safe default: 100 GB initial / 100 GB
-monthly / unlimited carryover / **`auto_renewal_enabled: false`** globally. Nothing is ever
-applied automatically until you explicitly turn this on, at whichever level (global/host/VPS)
-makes sense for you.
+`docs/examples/policy.example.json`). Ships with a safe default: 100 GB initial / **0 GB
+monthly gift** (carry-over of purchased, unused bandwidth is the business model -- not a
+recurring bonus grant; configure a nonzero gift explicitly if you want one) / unlimited
+carryover / **`auto_renewal_enabled: false`** globally. Nothing is ever applied
+automatically until you explicitly turn this on, at whichever level (global/host/VPS) makes
+sense for you.
 
 ```bash
 export TIXO_RENEWAL_INSTALL_DIR=/opt/tixo-renewal

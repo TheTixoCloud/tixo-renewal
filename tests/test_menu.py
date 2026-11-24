@@ -215,7 +215,8 @@ def test_collect_dashboard_data_reports_policy_and_write_approved(tmp_path):
     data = menu.collect_dashboard_data(config_dir, state_dir)
     assert data["policy_ok"] is True
     assert data["write_approved"] is True
-    assert data["monthly_grant_gb"] == "100"
+    # Default monthly gift is 0 -- see policy.BUILTIN_DEFAULT_MONTHLY_GB's docstring.
+    assert data["monthly_grant_gb"] == "0"
     assert "self" in data["nodes"]
     assert data["per_node"]["self"]["initialized"] is False  # no sqlite3 file created yet
 
