@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "implementation
 
 import alerts
 import backup as backup_mod
+import installer
 import nodes as nodes_mod
 import renewal_cli
 import shadow_monitor as sm
@@ -1479,6 +1480,82 @@ def test_cmd_update_apply_full_cli_flow_preserves_config_and_restarts_active_ser
     restarted_units = {c[2] for c in restart_cmds}
     assert "virt-renewal-web.service" in restarted_units
     assert "virt-renewal-telegram-bot.service" in restarted_units
+
+
+def test_update_apply_regenerates_a_stale_global_wrapper(cli_env, monkeypatch, tmp_path, capsys):
+    """REAL regression, confirmed directly on the actual IR1 production host after a real
+    v1.10.5 -> v1.10.6 upgrade via `update-apply`: `renewal_cli.VERSION` correctly reported
+    the new release, but `tixo-renewal doctor` still launched the interactive menu, because
+    update-apply's entire upgrade path is pure Python and never regenerated the global
+    wrapper script -- it was still the ORIGINAL fresh-install wrapper (unconditionally
+    exec'ing menu.py), untouched since the very first install.
+
+    Reproduces the exact stale-wrapper state found on ir1, then runs the REAL
+    `cmd_update_apply` CLI command (not a direct call to installer.upgrade(), to prove the
+    fix reaches all the way through the real upgrade entry point), and proves the wrapper
+    is regenerated with the current dispatch-aware content -- never left stale again."""
+    import hashlib
+    import tarfile
+    import updater
+
+    # is_host_local inside cmd_install checks the REAL environment variable (not just
+    # renewal_cli.WORKSPACE_ROOT, which cli_env already monkeypatches) -- must set it for
+    # real here, exactly as deploy/install.sh does on a genuine host-local deployment,
+    # or the wrapper-writing code path this test exists to exercise never even runs.
+    monkeypatch.setenv("TIXO_RENEWAL_INSTALL_DIR", renewal_cli.WORKSPACE_ROOT)
+    disposable_wrapper = str(tmp_path / "fake-usr-local-bin" / "tixo-renewal")
+    os.makedirs(os.path.dirname(disposable_wrapper))
+    monkeypatch.setattr(installer, "GLOBAL_WRAPPER_PATH", disposable_wrapper)
+
+    renewal_cli.cmd_install(argparse_namespace())
+    assert os.path.exists(disposable_wrapper), "a fresh install must write the wrapper"
+    assert "renewal_cli.py" in open(disposable_wrapper).read()
+
+    # Overwrite it with the EXACT pre-fix content found stale on ir1: unconditional menu.py,
+    # no dispatch logic, no awareness of renewal_cli.py's subcommands at all.
+    stale_content = (
+        "#!/bin/bash\n"
+        f'export TIXO_RENEWAL_INSTALL_DIR="{renewal_cli.WORKSPACE_ROOT}"\n'
+        f'export PYTHONPATH="{renewal_cli.WORKSPACE_ROOT}/lib:{renewal_cli.WORKSPACE_ROOT}/bin"\n'
+        f'exec "/usr/bin/python3" "{renewal_cli.WORKSPACE_ROOT}/lib/menu.py" "$@"\n'
+    )
+    Path(disposable_wrapper).write_text(stale_content)
+    os.chmod(disposable_wrapper, 0o755)
+
+    src = tmp_path / "pkg-src"
+    (src / "lib" / "static").mkdir(parents=True)
+    (src / "bin").mkdir(parents=True)
+    (src / "lib" / "renewal_cli.py").write_text('VERSION = "99.0.0"\n')
+    (src / "bin" / "renewal_cli.py").write_text("# bin stub\n")
+    tarball = tmp_path / "tixo-renewal-package.tar.gz"
+    with tarfile.open(tarball, "w:gz") as tf:
+        tf.add(src / "lib", arcname="lib")
+        tf.add(src / "bin", arcname="bin")
+    digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
+    sums = tmp_path / "SHA256SUMS"
+    sums.write_text(f"{digest}  {updater.ASSET_NAME}\n")
+
+    def fake_fetch(tag=None):
+        return {"ok": True, "tag": "v99.0.0", "version": "99.0.0", "notes": "",
+                "assets": {updater.ASSET_NAME: "fake://pkg", updater.CHECKSUMS_NAME: "fake://sums"},
+                "error": None}
+
+    def fake_download(url, dest_path, timeout=60.0, max_bytes=None):
+        import shutil as _shutil
+        _shutil.copy2(str(tarball) if "pkg" in url else str(sums), dest_path)
+
+    monkeypatch.setattr(updater, "fetch_release_info", fake_fetch)
+    monkeypatch.setattr(updater, "download_file", fake_download)
+    monkeypatch.setattr(renewal_cli.subprocess, "run",
+                         lambda cmd, *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+
+    rc = renewal_cli.cmd_update_apply(argparse_namespace(version=None, yes=True, force=False))
+    assert rc == 0, capsys.readouterr().out
+
+    regenerated = open(disposable_wrapper).read()
+    assert regenerated != stale_content, "wrapper was NOT regenerated -- the exact ir1 bug"
+    assert "renewal_cli.py" in regenerated
+    assert '"${1:-}"' in regenerated or "case" in regenerated  # real dispatch logic present
 
 
 def test_cmd_update_apply_refuses_without_yes_or_confirmation(cli_env, monkeypatch, capsys):

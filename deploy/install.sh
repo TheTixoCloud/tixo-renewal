@@ -151,52 +151,33 @@ elif [ "$(id -u)" -eq 0 ]; then
     ACTIVATED_CORE_TIMERS=1
   else
     echo "WARNING: automatic core-timer activation reported problems (see above). The"
-    echo "install itself still succeeded -- run 'renewal_cli.py install-activate-core-timers'"
-    echo "yourself to retry, or 'renewal_cli.py install-health-check' to see current status."
+    echo "install itself still succeeded -- run 'sudo tixo-renewal install-activate-core-timers'"
+    echo "yourself to retry, or 'tixo-renewal doctor' to see current status."
   fi
 else
   echo
   echo "Not running as root -- skipped automatic core-timer activation (requires writing to"
   echo "/etc/systemd/system). Re-run as root, or run yourself later:"
-  echo "  sudo renewal_cli.py install-activate-core-timers"
+  echo "  sudo tixo-renewal install-activate-core-timers"
 fi
 
-# Global `tixo-renewal` command -> ONE unified entry point (v1.10.6+):
-#   - no arguments:  launches the interactive management menu (unchanged behavior)
-#   - any arguments: dispatched to renewal_cli.py's real scriptable subcommands, with
-#     PYTHONPATH/TIXO_RENEWAL_INSTALL_DIR already correctly set -- this is what makes
-#     `tixo-renewal status`/`tixo-renewal install-health-check`/`tixo-renewal backup`/etc.
-#     work as genuine global commands, instead of requiring the operator to manually
-#     export PYTHONPATH and invoke renewal_cli.py by its full path (a real, reported gap:
-#     every piece of this project's own documentation told operators to run
-#     `renewal_cli.py <command>` as if it were already a global command, when no such
-#     global binary existed at all before this fix).
-# Only attempted if /usr/local/bin is writable (root, or a writable custom prefix); never
-# fatal if not -- the operator can always run menu.py/renewal_cli.py directly.
+# Global `tixo-renewal` command: v1.10.7+, this is now written by `renewal_cli.py install`
+# itself (installer.write_global_wrapper(), called from cmd_install()) -- NOT by this
+# script. This used to be a second, bash-only implementation of the exact same dispatch
+# logic, written ONLY here and never touched again by any upgrade path (update-apply's
+# entire upgrade flow is pure Python and never re-invoked install.sh) -- that drift is
+# EXACTLY what caused a real, confirmed production regression on ir1: VERSION correctly
+# reported the new release after an upgrade, but the wrapper script on disk was still the
+# stale one from the original fresh install, so `tixo-renewal doctor` kept launching the
+# menu regardless of which release was actually installed. Having exactly one
+# implementation, called on every install AND every upgrade, is the actual fix -- not
+# remembering to keep two copies in sync.
 WRAPPER_PATH="/usr/local/bin/tixo-renewal"
-if [ -w "$(dirname "$WRAPPER_PATH")" ] || [ "$(id -u)" -eq 0 ]; then
-  cat > "$WRAPPER_PATH" <<WRAPPER_EOF
-#!/bin/bash
-export TIXO_RENEWAL_INSTALL_DIR="$INSTALL_DIR"
-export PYTHONPATH="$INSTALL_DIR/lib:$INSTALL_DIR/bin"
-# menu.py itself already handles --status/--version/--cli as special noninteractive flags
-# (documented, pre-existing, tested) -- those three, and the no-argument case, still go to
-# menu.py. Any OTHER argument is a real renewal_cli.py subcommand name (status, backup,
-# install-health-check, readiness, doctor, logs, enable-auto-renewal, ...).
-case "\${1:-}" in
-  ""|"--status"|"--version"|"--cli")
-    exec "$PYTHON_BIN" "$INSTALL_DIR/lib/menu.py" "\$@"
-    ;;
-  *)
-    exec "$PYTHON_BIN" "$INSTALL_DIR/bin/renewal_cli.py" "\$@"
-    ;;
-esac
-WRAPPER_EOF
-  chmod +x "$WRAPPER_PATH"
-  echo "Installed global command: $WRAPPER_PATH"
+if [ -x "$WRAPPER_PATH" ]; then
+  echo "Global command: $WRAPPER_PATH"
 else
-  echo "Could not write to /usr/local/bin (not root) -- skipped installing the global"
-  echo "'tixo-renewal' command. Run the menu directly instead:"
+  echo "Could not (re)install the global 'tixo-renewal' command (see the 'install' output"
+  echo "above for the exact reason). Run the menu directly instead:"
   echo "  TIXO_RENEWAL_INSTALL_DIR=$INSTALL_DIR PYTHONPATH=$INSTALL_DIR/lib $PYTHON_BIN $INSTALL_DIR/lib/menu.py"
 fi
 
@@ -212,20 +193,20 @@ echo "  $INSTALL_DIR/renewal-config/policy.json   (bandwidth policy -- starts SA
 echo "  $INSTALL_DIR/renewal-config/nodes.json    (this host, mode=local)"
 echo
 echo "Dry-run (read-only, safe to run any time):"
-echo "  TIXO_RENEWAL_INSTALL_DIR=$INSTALL_DIR PYTHONPATH=$INSTALL_DIR/lib $PYTHON_BIN $INSTALL_DIR/bin/renewal_cli.py dry-run"
+echo "  tixo-renewal dry-run"
 echo
 if [ "$ACTIVATED_CORE_TIMERS" -eq 1 ]; then
   echo "The 4 read-only core timers (monitor, inventory-sync, hostnet-sync, readiness-notifier)"
   echo "are now installed, enabled, and running -- verify any time with:"
-  echo "  tixo-renewal --status   # or: renewal_cli.py install-health-check"
+  echo "  tixo-renewal doctor   # or: tixo-renewal health-check / tixo-renewal readiness"
 else
   echo "To activate the 4 READ-ONLY core timers (never writes anything), as root:"
-  echo "  sudo renewal_cli.py install-activate-core-timers"
+  echo "  sudo tixo-renewal install-activate-core-timers"
 fi
 echo
 echo "Production WRITE capability (the 5th timer, 'apply') remains permanently blocked until"
 echo "you deliberately grant it -- from the menu: 'Enable automatic renewal', or:"
-echo "  renewal_cli.py enable-auto-renewal --yes"
+echo "  tixo-renewal enable-auto-renewal --yes"
 echo "...and even then, every write still re-verifies live state immediately before/after."
 echo
 echo "Optional modules (ALL disabled by default; each needs its own explicit enable step"

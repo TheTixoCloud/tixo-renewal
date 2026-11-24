@@ -41,7 +41,7 @@ tests/                  Full pytest suite (1300+ tests)
 docs/                   This handover + architecture/API/CLI/schema reference +
                         release notes + deployment/backup/security docs
 systemd/, deploy/systemd-notifier/   Example generated unit files (git-tracked references;
-                        the real ones are generated fresh by `renewal_cli.py install`)
+                        the real ones are generated fresh by `tixo-renewal install`)
 ```
 
 ## 4. Development environment setup
@@ -122,7 +122,7 @@ Full procedure in `docs/DEPLOYMENT.md`. Short version for an **existing** instal
 Two different backup formats exist — know which one you have (see
 `docs/ARCHITECTURE.md` → "Backup formats", `docs/BACKUP_AND_RESTORE.md`):
 - **`backup-full` / Web `/backups` archive** (databases + non-secret config only): restore
-  via `renewal_cli.py install-rollback --backup-file <name> --yes` (safety-copies current
+  via `tixo-renewal install-rollback --backup-file <name> --yes` (safety-copies current
   state first) or `rollback --node N --backup-file F --yes` for a single node's ledger.
 - **A full raw filesystem tar** (everything, including secrets — the kind used for this
   project's own pre-deployment safety backups): `tar -xzf <backup>.tar.gz -C /` after first
@@ -134,7 +134,7 @@ Two different backup formats exist — know which one you have (see
 
 See `docs/CLI_REFERENCE.md` (generated from the real `--help` output) for every command.
 Interactive menu: `tixo-renewal` (installed globally by `install.sh`) or
-`python3 lib/menu.py` directly. Non-interactive: `renewal_cli.py <command> [args]`.
+`python3 lib/menu.py` directly. Non-interactive: `tixo-renewal <command> [args]`.
 
 ## 10. How Web and Telegram authentication work
 
@@ -173,7 +173,7 @@ over `/etc/systemd/system/`).
 
 ## 13. How to avoid modifying customer VPSs accidentally
 
-- The ONLY code path that can write a quota change is `renewal_cli.py apply --execute`,
+- The ONLY code path that can write a quota change is `tixo-renewal apply --execute`,
   gated behind `renewal-config/WRITE_APPROVED` existing (a file you create manually, once,
   deliberately) plus interactive confirmation (or `--non-interactive`, which still requires
   `--execute`).

@@ -50,18 +50,16 @@ automatically until you explicitly turn this on, at whichever level (global/host
 sense for you.
 
 ```bash
-export TIXO_RENEWAL_INSTALL_DIR=/opt/tixo-renewal
-export PYTHONPATH=/opt/tixo-renewal/lib
-python3 /opt/tixo-renewal/bin/renewal_cli.py policy-validate
-python3 /opt/tixo-renewal/bin/renewal_cli.py policy-show
+tixo-renewal policy-validate
+tixo-renewal policy-show
 ```
 
 ## Step 5 — Read-only verification (ON the Virtualizor host)
 
 ```bash
-python3 /opt/tixo-renewal/bin/renewal_cli.py dry-run
-python3 /opt/tixo-renewal/bin/renewal_cli.py preview --node self --vpsid <id>
-python3 /opt/tixo-renewal/bin/renewal_cli.py status
+tixo-renewal dry-run
+tixo-renewal preview --node self --vpsid <id>
+tixo-renewal status
 ```
 
 Run these repeatedly, for real, against real VPS data, before trusting any number they
@@ -74,12 +72,12 @@ is only needed if you set `TIXO_RENEWAL_NO_AUTO_SYSTEMD=1` during install, or ar
 as a non-root user:
 
 ```bash
-sudo renewal_cli.py install-activate-core-timers
+sudo tixo-renewal install-activate-core-timers
 ```
 
 Installs and enables all 4 READ-ONLY core timers (monitor, inventory-sync, hostnet-sync,
 readiness-notifier) -- none of them can call `apply`/`apply-due`, by construction. Safe to
-re-run (idempotent). Verify any time with `renewal_cli.py install-health-check`.
+re-run (idempotent). Verify any time with `tixo-renewal install-health-check`.
 
 ## Production write activation
 
@@ -89,16 +87,16 @@ steps 1–6 above creates write capability.
 ## Backup / rollback (ON the Virtualizor host)
 
 ```bash
-python3 /opt/tixo-renewal/bin/renewal_cli.py backup
-python3 /opt/tixo-renewal/bin/renewal_cli.py rollback --node self --backup-file <name> --yes
+tixo-renewal backup
+tixo-renewal rollback --node self --backup-file <name> --yes
 ```
 
 ## Updating to a newer release (ON the Virtualizor host, v1.10.2+)
 
 ```bash
 cd /opt/tixo-renewal
-python3 bin/renewal_cli.py update-check          # read-only
-python3 bin/renewal_cli.py update-apply --yes    # backs up first; auto-rolls-back on failure
+tixo-renewal update-check          # read-only
+tixo-renewal update-apply --yes    # backs up first; auto-rolls-back on failure
 ```
 
 See `docs/INSTALL_GUIDE.md` for the full behavior (what's preserved, what triggers a
@@ -109,8 +107,8 @@ see `FUTURE_DEVELOPMENT_HANDOVER.md` for the prepared, host-specific checklist.
 
 ```bash
 cd /opt/tixo-renewal   # or wherever install.sh reported
-python3 bin/renewal_cli.py uninstall-preview            # read-only, shows what would happen
-python3 bin/renewal_cli.py uninstall          # keeps ledger/config
-python3 bin/renewal_cli.py uninstall --purge  # removes everything local (requires typing
+tixo-renewal uninstall-preview            # read-only, shows what would happen
+tixo-renewal uninstall          # keeps ledger/config
+tixo-renewal uninstall --purge  # removes everything local (requires typing
                                                # 'PURGE ALL TIXOCLOUD DATA' when prompted)
 ```

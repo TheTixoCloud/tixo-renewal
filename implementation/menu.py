@@ -1256,7 +1256,7 @@ def action_install(style: Style):
         for problem in health["problems"]:
             print(f"  - {problem}")
         print("If this change should be undone, use:")
-        print("  renewal_cli.py install-rollback --backup-file <the pre-change backup "
+        print("  tixo-renewal install-rollback --backup-file <the pre-change backup "
               "printed above> --yes")
 
 
@@ -2403,7 +2403,7 @@ def action_configure_web(style: Style):
         print("Cancelled.")
         return
     wcfg.save_web_settings(renewal_cli.CONFIG_DIR, new_settings)
-    print(f"Saved. Start it with: renewal_cli.py web-run (only works while enabled).")
+    print(f"Saved. Start it with: tixo-renewal web-run (only works while enabled).")
 
 
 def action_configure_relay_worker(style: Style):
@@ -2447,7 +2447,7 @@ def action_configure_relay_worker(style: Style):
         print("Cancelled.")
         return
     tgc.save_relay_worker_settings(renewal_cli.CONFIG_DIR, new_settings)
-    print("Saved. Start it with: renewal_cli.py relay-worker-run (only works while enabled).")
+    print("Saved. Start it with: tixo-renewal relay-worker-run (only works while enabled).")
 
 
 def action_configure_remote_agent(style: Style):
@@ -2498,7 +2498,7 @@ def action_configure_remote_agent(style: Style):
         print("Cancelled.")
         return
     ac.save_agent_settings(renewal_cli.CONFIG_DIR, new_settings)
-    print("Saved. Start it with: renewal_cli.py agent-run (only works while enabled).")
+    print("Saved. Start it with: tixo-renewal agent-run (only works while enabled).")
 
 
 def action_configure_backup_schedule(style: Style):

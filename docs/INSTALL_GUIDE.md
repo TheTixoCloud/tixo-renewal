@@ -7,7 +7,7 @@ those.
 
 **Verification status:** everything in this guide is verified by real, local, automated
 tests (unit tests calling the functions directly, and end-to-end tests that build the real
-package and run `renewal_cli.py` as a genuine subprocess against a disposable directory).
+package and run `tixo-renewal` as a genuine subprocess against a disposable directory).
 Nothing here has been run against a real production Virtualizor host.
 
 ## Fresh installation
@@ -30,7 +30,7 @@ What it does (and nothing more):
   their unit files into `/etc/systemd/system`, runs `daemon-reload`, then
   `enable --now` each one. None of these four can write to Virtualizor by construction.
   Opt out with `TIXO_RENEWAL_NO_AUTO_SYSTEMD=1` for full manual control (or run it later
-  yourself: `sudo renewal_cli.py install-activate-core-timers`, safe to re-run). Skipped
+  yourself: `sudo tixo-renewal install-activate-core-timers`, safe to re-run). Skipped
   automatically (never fatal) when not running as root.
 - The write-capable `apply` timer is **never** touched by `install.sh`, under any
   circumstance — see "Automatic renewal and production-write authorization" below.
@@ -53,8 +53,8 @@ steps: creating `renewal-config/WRITE_APPROVED` by hand, editing `policy.json`'s
 These are now ONE confirmed action:
 
 ```bash
-renewal_cli.py enable-auto-renewal          # interactive confirmation
-renewal_cli.py enable-auto-renewal --yes    # scripted use
+tixo-renewal enable-auto-renewal          # interactive confirmation
+tixo-renewal enable-auto-renewal --yes    # scripted use
 ```
 
 This creates `WRITE_APPROVED`, sets `auto_renewal_enabled=true`, and (if run as root)
@@ -65,7 +65,7 @@ automatic renewal" screen does exactly the same thing, with an explanation print
 To reverse it -- always all together, never partially:
 
 ```bash
-renewal_cli.py disable-auto-renewal
+tixo-renewal disable-auto-renewal
 ```
 
 This removes `WRITE_APPROVED`, sets `auto_renewal_enabled=false`, and (if root)
@@ -75,7 +75,7 @@ ledger data are explicitly untouched.
 ## Existing-installation detection
 
 ```bash
-renewal_cli.py install-detect
+tixo-renewal install-detect
 ```
 
 Read-only. Reports `{"existing": true/false, "has_nodes": ..., "has_policy": ...,
@@ -86,7 +86,7 @@ right path.
 ## Upgrade
 
 ```bash
-renewal_cli.py install-upgrade
+tixo-renewal install-upgrade
 ```
 
 - Backs up config + state to a full archive **first** (printed path).
@@ -99,7 +99,7 @@ renewal_cli.py install-upgrade
 ## Repair
 
 ```bash
-renewal_cli.py install-repair
+tixo-renewal install-repair
 ```
 
 Same backup-first discipline as upgrade, plus:
@@ -122,8 +122,8 @@ combined "reconfigure everything" screen:
 ## Safe uninstall of ONE optional module (without touching anything else)
 
 ```bash
-renewal_cli.py uninstall-module --module telegram        # keeps the stored bot token
-renewal_cli.py uninstall-module --module web --purge-secrets   # also deletes web/users.json etc.
+tixo-renewal uninstall-module --module telegram        # keeps the stored bot token
+tixo-renewal uninstall-module --module web --purge-secrets   # also deletes web/users.json etc.
 ```
 
 Valid `--module` values: `telegram`, `web`, `relay_worker`, `agent`, `backup_schedule`.
@@ -133,10 +133,10 @@ systemd unit file. Never touches the core install, any other module, or historic
 ## Checking for and applying updates (v1.10.2+)
 
 ```bash
-renewal_cli.py update-check              # read-only: current vs. latest GitHub release
-renewal_cli.py update-apply              # interactive confirmation required
-renewal_cli.py update-apply --yes        # scripted use
-renewal_cli.py update-apply --version 1.10.2 --yes   # a specific version instead of latest
+tixo-renewal update-check              # read-only: current vs. latest GitHub release
+tixo-renewal update-apply              # interactive confirmation required
+tixo-renewal update-apply --yes        # scripted use
+tixo-renewal update-apply --version 1.10.2 --yes   # a specific version instead of latest
 ```
 
 `update-apply` re-fetches the target release, downloads and checksum-verifies the package
@@ -152,12 +152,12 @@ success.
 ## Full uninstall (the whole local install)
 
 ```bash
-renewal_cli.py uninstall-preview               # read-only: shows exactly what would happen
-renewal_cli.py uninstall-preview --purge       # same, for purge mode
-renewal_cli.py uninstall                       # standard: removes app code + app-owned
+tixo-renewal uninstall-preview               # read-only: shows exactly what would happen
+tixo-renewal uninstall-preview --purge       # same, for purge mode
+tixo-renewal uninstall                       # standard: removes app code + app-owned
                                                 # systemd units; KEEPS renewal-config/,
                                                 # shadow-monitor-state/, and backups/
-renewal_cli.py uninstall --purge               # full purge: ALSO removes config/secrets/
+tixo-renewal uninstall --purge               # full purge: ALSO removes config/secrets/
                                                 # databases/ledgers (not backups/ unless
                                                 # --delete-backups is also given) -- requires
                                                 # typing 'PURGE ALL TIXOCLOUD DATA' when
@@ -182,7 +182,7 @@ template files with the current defaults.
 ## Rollback after a failed upgrade/repair
 
 ```bash
-renewal_cli.py install-rollback --backup-file <the archive upgrade/repair printed> --yes
+tixo-renewal install-rollback --backup-file <the archive upgrade/repair printed> --yes
 ```
 
 - Integrity-verifies the backup archive **before** touching anything.

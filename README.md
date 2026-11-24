@@ -104,11 +104,9 @@ tar -xzf tixo-renewal-package.tar.gz -C /root/renewal-package
 cd /root/renewal-package
 bash install.sh
 
-export TIXO_RENEWAL_INSTALL_DIR=/opt/tixo-renewal
-export PYTHONPATH=/opt/tixo-renewal/lib
-python3 /opt/tixo-renewal/bin/renewal_cli.py dry-run
-python3 /opt/tixo-renewal/bin/renewal_cli.py policy-show
-python3 /opt/tixo-renewal/bin/renewal_cli.py status
+tixo-renewal dry-run
+tixo-renewal policy-show
+tixo-renewal status
 ```
 
 None of the commands above ever write to Virtualizor. See `docs/DEPLOYMENT.md` for the full

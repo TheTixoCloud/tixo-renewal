@@ -21,6 +21,70 @@ import subprocess
 from pathlib import Path
 
 
+# ---------- global wrapper script (v1.10.7) -----------------------------------------------------
+
+# CONFIRMED REAL PRODUCTION REGRESSION (found on the actual IR1 host, 2026-11-24, during a
+# real v1.10.5 -> v1.10.6 upgrade via `update-apply`): the global `/usr/local/bin/tixo-renewal`
+# wrapper script's dispatch logic (no args / --status / --version / --cli -> menu.py,
+# anything else -> renewal_cli.py) previously existed ONLY as a bash heredoc inside
+# deploy/install.sh -- a fresh install wrote it once, but update-apply's entire upgrade path
+# is pure Python (download/verify/backup/swap lib+bin/run installer.upgrade()/health-check)
+# and NEVER called into install.sh again, so the wrapper script on disk was simply never
+# touched by any upgrade. On IR1, `renewal_cli.VERSION` correctly reported "1.10.6" (the
+# Python code really was upgraded) while the wrapper script's mtime and content were still
+# from the ORIGINAL v1.10.5 fresh install -- `tixo-renewal doctor` kept launching the
+# interactive menu because the only wrapper that existed on disk still unconditionally did
+# exactly that, regardless of what version of menu.py/renewal_cli.py it happened to invoke.
+#
+# Fix: this is now the ONE place the wrapper's content is ever generated, called from BOTH
+# cmd_install() (fresh install, replacing install.sh's own former bash heredoc entirely --
+# no second implementation to drift out of sync again) AND installer.upgrade() (every
+# upgrade path: install-upgrade, the menu's install wizard, and update-apply's
+# run_install_upgrade_fn, which all go through upgrade() -> cmd_install() already).
+GLOBAL_WRAPPER_PATH = "/usr/local/bin/tixo-renewal"
+
+GLOBAL_WRAPPER_TEMPLATE = """#!/bin/bash
+export TIXO_RENEWAL_INSTALL_DIR="{install_dir}"
+export PYTHONPATH="{install_dir}/lib:{install_dir}/bin"
+# menu.py itself already handles --status/--version/--cli as special noninteractive flags
+# (documented, pre-existing, tested) -- those three, and the no-argument case, go to
+# menu.py. Any OTHER argument is a real renewal_cli.py subcommand name (status, backup,
+# install-health-check, readiness, doctor, logs, enable-auto-renewal, ...).
+case "${{1:-}}" in
+  ""|"--status"|"--version"|"--cli")
+    exec "{python_bin}" "{install_dir}/lib/menu.py" "$@"
+    ;;
+  *)
+    exec "{python_bin}" "{install_dir}/bin/renewal_cli.py" "$@"
+    ;;
+esac
+"""
+
+
+def write_global_wrapper(install_dir: str, python_bin: str = None,
+                           wrapper_path: str = None) -> dict:
+    """(Re)writes the global `tixo-renewal` wrapper script -- idempotent, always overwrites
+    with the CURRENT correct content regardless of what (if anything) was there before, so
+    an upgrade can never leave a stale wrapper behind the way the real regression above did.
+    Never fatal if the target directory isn't writable (e.g. not root) -- returns
+    {"written": False, "reason": ...} instead of raising, matching this module's existing
+    convention for every other installer step that requires root."""
+    import sys as _sys
+    wrapper_path = wrapper_path or GLOBAL_WRAPPER_PATH
+    python_bin = python_bin or _sys.executable
+    target_dir = os.path.dirname(wrapper_path)
+    if not (os.access(target_dir, os.W_OK) or os.geteuid() == 0):
+        return {"written": False,
+                "reason": f"{target_dir} is not writable and this process is not root"}
+    content = GLOBAL_WRAPPER_TEMPLATE.format(
+        install_dir=os.path.abspath(install_dir), python_bin=python_bin)
+    tmp = wrapper_path + ".tmp"
+    Path(tmp).write_text(content)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, wrapper_path)
+    return {"written": True, "path": wrapper_path}
+
+
 # ---------- installation-state detection --------------------------------------------------------
 
 def detect_installation_state(config_dir: str, state_dir: str) -> dict:

@@ -515,6 +515,19 @@ def cmd_install(args):
     service_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-monitor.service")
     timer_path = os.path.join(SYSTEMD_OUT_DIR, "virt-renewal-monitor.timer")
 
+    # v1.10.7: (re)write the global `tixo-renewal` wrapper HERE, in Python, on EVERY call --
+    # fresh install AND every upgrade path (cmd_install_upgrade/the menu install
+    # wizard/update-apply all call installer.upgrade(), which itself calls this same
+    # cmd_install()) -- so the wrapper can never again go stale relative to the actual
+    # installed code the way it did in the real, confirmed v1.10.5->v1.10.6 production
+    # regression on ir1. Only attempted for a real host-local deployment (matching the same
+    # is_host_local gate the node-config default above already uses) -- never for the
+    # dev-server's own multi-node SSH setup.
+    wrapper_result = {"written": False, "reason": "not a host-local deployment"}
+    if is_host_local:
+        import installer as inst
+        wrapper_result = inst.write_global_wrapper(WORKSPACE_ROOT)
+
     print("Install complete (idempotent -- safe to re-run).")
     print(f"  State dir:   {STATE_DIR}")
     print(f"  Node config: {os.path.join(CONFIG_DIR, 'nodes.json')}")
@@ -532,6 +545,19 @@ def cmd_install(args):
           f"enabled by this installer): {os.path.join(SYSTEMD_OUT_DIR, 'virt-renewal-apply.service')}")
     print("It still refuses to run without WRITE_APPROVED, and `store-credentials` must be run")
     print("by you first -- no credentials are ever created or stored automatically.")
+
+    if wrapper_result["written"]:
+        print(f"\nGlobal command (re)installed: {wrapper_result['path']}")
+        print("  tixo-renewal           -> interactive menu")
+        print("  tixo-renewal <command> -> any renewal_cli.py subcommand, e.g. 'status', "
+              "'doctor', 'backup' -- PYTHONPATH/TIXO_RENEWAL_INSTALL_DIR already set")
+    elif is_host_local:
+        print(f"\nCould not (re)install the global 'tixo-renewal' command: "
+              f"{wrapper_result['reason']}. Run every command with the full path and "
+              f"PYTHONPATH set manually, e.g.:")
+        print(f"  TIXO_RENEWAL_INSTALL_DIR={WORKSPACE_ROOT} "
+              f"PYTHONPATH={WORKSPACE_ROOT}/lib:{WORKSPACE_ROOT}/bin "
+              f"python3 {WORKSPACE_ROOT}/bin/renewal_cli.py status")
 
     import installer as inst
     legacy = inst.detect_legacy_bandwidth_automation()
@@ -900,7 +926,7 @@ def cmd_rollback(args):
         print("Available backups:")
         for f in backup_mod.list_backups(BACKUP_DIR):
             print(f"  {f}")
-        print("\nUsage: renewal_cli.py rollback --node <node_id> --backup-file <filename> --yes")
+        print("\nUsage: tixo-renewal rollback --node <node_id> --backup-file <filename> --yes")
         return 1
     node = next((n for n in nodes_mod.load_nodes(_node_config_path()) if n.node_id == args.node), None)
     if node is None:
@@ -1310,7 +1336,7 @@ def cmd_update_check(args):
         print("\nAn update is available.")
         if result["notes"]:
             print("\nRelease notes:\n" + result["notes"])
-        print(f"\nTo apply: renewal_cli.py update-apply --yes   (or use the menu's "
+        print(f"\nTo apply: tixo-renewal update --yes   (or use the menu's "
               f"'Check for updates' screen for an interactive confirmation)")
     else:
         print("\nAlready up to date.")
@@ -1400,7 +1426,8 @@ def cmd_update_apply(args):
             print(f"  {svc}: WARNING -- could not restart automatically ({e}). "
                   f"Restart it manually: sudo systemctl restart {svc}")
 
-    print("\nRe-run 'renewal_cli.py install-health-check' or reopen the menu to verify.")
+    print("\nRe-run 'tixo-renewal doctor' (or 'tixo-renewal health-check', or reopen the "
+          "menu) to verify.")
     return 0
 
 
