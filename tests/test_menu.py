@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "implementation
 
 import menu
 import policy as pol
+import installer
 
 
 # ---------- parse_gift_gb ---------------------------------------------------------------
@@ -35,6 +36,34 @@ def test_parse_gift_gb_rejects_negative():
 def test_parse_gift_gb_rejects_non_numeric():
     with pytest.raises(ValueError):
         menu.parse_gift_gb("not-a-number")
+
+
+def test_action_configure_gift_writes_validated_value_to_policy_json(tmp_path, monkeypatch, capsys):
+    """action_configure_gift() itself (the input()->policy.json write glue, as opposed to
+    parse_gift_gb()'s already-tested validation) had zero test coverage until this round's
+    final audit -- this is a direct financial business rule (the monthly renewal gift), not
+    cosmetic menu glue."""
+    import policy as pol_mod
+    menu.renewal_cli.CONFIG_DIR = str(tmp_path)
+    policy_path = tmp_path / "policy.json"
+    pol_mod.write_default_policy_config(str(policy_path))
+    monkeypatch.setattr("builtins.input", lambda *a: "250")
+    menu.action_configure_gift()
+    cfg = pol_mod.load_policy_config(str(policy_path))
+    assert cfg.global_defaults.monthly_grant_gb == Decimal("250")
+    assert "250" in capsys.readouterr().out
+
+
+def test_action_configure_gift_rejects_invalid_input_without_writing(tmp_path, monkeypatch, capsys):
+    import policy as pol_mod
+    menu.renewal_cli.CONFIG_DIR = str(tmp_path)
+    policy_path = tmp_path / "policy.json"
+    pol_mod.write_default_policy_config(str(policy_path))
+    before = policy_path.read_text()
+    monkeypatch.setattr("builtins.input", lambda *a: "-5")
+    menu.action_configure_gift()
+    assert policy_path.read_text() == before  # untouched on rejection
+    assert "Rejected" in capsys.readouterr().out
 
 
 def test_parse_gift_gb_rejects_injection_shaped_input():
@@ -199,6 +228,107 @@ def test_action_check_updates_apply_called_with_yes_to_avoid_double_confirmation
     monkeypatch.setattr(menu.os, "execv", lambda *a: None)
     menu.action_check_updates(menu.Style(enabled=False))
     assert captured_args["args"].yes is True
+
+
+# ---------- action_toggle_auto_renewal (previously untested at the menu layer) ------------------
+# The single most consequential switch in the whole product -- never tested directly at the
+# menu layer before this round's final audit, including the v1.10.5 legacy-write-conflict
+# confirmation branch, which had ZERO test coverage anywhere until now.
+
+def _no_legacy_conflict(monkeypatch):
+    monkeypatch.setattr(installer, "detect_legacy_bandwidth_automation",
+                         lambda: {"found_active": [], "found_disabled": [],
+                                  "active_write_capable": False})
+
+
+def _legacy_write_conflict(monkeypatch):
+    monkeypatch.setattr(installer, "detect_legacy_bandwidth_automation",
+                         lambda: {"found_active": ["virt-carryover-auto"], "found_disabled": [],
+                                  "active_write_capable": True})
+
+
+def test_action_toggle_auto_renewal_enable_declined_never_calls_enable(monkeypatch, capsys):
+    _no_legacy_conflict(monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    called = []
+    monkeypatch.setattr(installer, "enable_auto_renewal", lambda *a, **k: called.append(1))
+    menu.action_toggle_auto_renewal(True)
+    assert called == []
+    assert "Cancelled" in capsys.readouterr().out
+
+
+def test_action_toggle_auto_renewal_enable_confirmed_no_legacy_conflict(monkeypatch, capsys):
+    _no_legacy_conflict(monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    captured = {}
+    def fake_enable(config_dir, systemd_dir, override_legacy_write_conflict=False):
+        captured["override"] = override_legacy_write_conflict
+        return {"ok": True, "steps": ["did it"], "problems": []}
+    monkeypatch.setattr(installer, "enable_auto_renewal", fake_enable)
+    menu.action_toggle_auto_renewal(True, menu.Style(enabled=False))
+    assert captured["override"] is False
+    assert "did it" in capsys.readouterr().out
+
+
+def test_action_toggle_auto_renewal_enable_legacy_conflict_declined_at_risk_ack_never_enables(monkeypatch, capsys):
+    """The FIRST confirmation (acknowledging the specific double-write risk) must be
+    answered separately from the second (the general enable confirmation) -- declining the
+    first must cancel immediately, never falling through to ask the second."""
+    _legacy_write_conflict(monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    called = []
+    monkeypatch.setattr(installer, "enable_auto_renewal", lambda *a, **k: called.append(1))
+    menu.action_toggle_auto_renewal(True, menu.Style(enabled=False))
+    assert called == []
+    out = capsys.readouterr().out
+    assert "Cancelled" in out
+    assert "virt-carryover-auto" in out
+
+
+def test_action_toggle_auto_renewal_enable_legacy_conflict_override_confirmed_passes_override_true(monkeypatch, capsys):
+    """Both the risk-acknowledgement AND the final enable confirmation must be answered 'y'
+    before override_legacy_write_conflict=True is ever passed through."""
+    _legacy_write_conflict(monkeypatch)
+    answers = iter(["y", "y"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    captured = {}
+    def fake_enable(config_dir, systemd_dir, override_legacy_write_conflict=False):
+        captured["override"] = override_legacy_write_conflict
+        return {"ok": True, "steps": [], "problems": []}
+    monkeypatch.setattr(installer, "enable_auto_renewal", fake_enable)
+    menu.action_toggle_auto_renewal(True, menu.Style(enabled=False))
+    assert captured["override"] is True
+
+
+def test_action_toggle_auto_renewal_enable_legacy_conflict_ack_yes_then_final_no_never_enables(monkeypatch, capsys):
+    """Acknowledging the risk but then declining the FINAL confirmation must still cancel --
+    the risk acknowledgement alone is never sufficient to enable anything."""
+    _legacy_write_conflict(monkeypatch)
+    answers = iter(["y", "n"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+    called = []
+    monkeypatch.setattr(installer, "enable_auto_renewal", lambda *a, **k: called.append(1))
+    menu.action_toggle_auto_renewal(True, menu.Style(enabled=False))
+    assert called == []
+    assert "Cancelled" in capsys.readouterr().out
+
+
+def test_action_toggle_auto_renewal_disable_declined_never_calls_disable(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda *a: "n")
+    called = []
+    monkeypatch.setattr(installer, "disable_auto_renewal", lambda *a, **k: called.append(1))
+    menu.action_toggle_auto_renewal(False)
+    assert called == []
+    assert "Cancelled" in capsys.readouterr().out
+
+
+def test_action_toggle_auto_renewal_disable_confirmed_calls_disable(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda *a: "y")
+    called = []
+    monkeypatch.setattr(installer, "disable_auto_renewal",
+                         lambda *a, **k: called.append(1) or {"ok": True, "steps": [], "problems": []})
+    menu.action_toggle_auto_renewal(False, menu.Style(enabled=False))
+    assert called == [1]
 
 
 # ---------- dashboard data collection / rendering -----------------------------------------
