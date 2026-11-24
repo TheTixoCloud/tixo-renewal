@@ -9,10 +9,10 @@ them.
 ## One-command install (Ubuntu 24.04 + Virtualizor)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.6/deploy/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.7/deploy/bootstrap.sh | sudo bash
 ```
 
-This is pinned to the `v1.10.6` release tag (never a mutable branch), downloads the release
+This is pinned to the `v1.10.7` release tag (never a mutable branch), downloads the release
 tarball and its published `SHA256SUMS` from that *same* immutable release, verifies the
 checksum locally, then runs `install.sh`. When run from an interactive terminal (including a
 piped `curl | bash`, via `/dev/tty`), a successful install automatically opens the management
@@ -24,7 +24,7 @@ tixo-renewal           # interactive menu: dashboard, credentials, gift/interval
 tixo-renewal --status  # noninteractive status, for scripts/cron/monitoring
 ```
 
-**v1.10.6+: one unified global command.** `tixo-renewal` with no arguments (or `--status`/
+**v1.10.7+: one unified global command.** `tixo-renewal` with no arguments (or `--status`/
 `--version`/`--cli`) opens the menu as above; `tixo-renewal <anything else>` dispatches
 directly to the full scriptable CLI, with `PYTHONPATH`/`TIXO_RENEWAL_INSTALL_DIR` already
 set correctly -- no manual environment setup or full-path invocation needed:
@@ -132,16 +132,16 @@ zero-vs-unset guarantees).
 `tixo-renewal` menu wraps the common ones (including "Enable/Disable automatic renewal",
 "Check for updates", and "Uninstall") in a guided interface.
 
-**One-command install also activates monitoring (v1.10.6+).** When run as root,
+**One-command install also activates monitoring (v1.10.7+).** When run as root,
 `install.sh` automatically installs and enables the 4 READ-ONLY core timers (monitor,
 inventory-sync, hostnet-sync, readiness-notifier) into real systemd — no manual
 `cp`/`systemctl` steps required. None of these four can write to Virtualizor by
 construction. Opt out with `TIXO_RENEWAL_NO_AUTO_SYSTEMD=1`, or run
 `install-activate-core-timers` yourself later (idempotent). Verify current state any time
-with `install-health-check`, which (as of v1.10.6) also reports real systemd
+with `install-health-check`, which (as of v1.10.7) also reports real systemd
 enabled/active/failed status, not just that config files parse.
 
-**Production-write authorization is one confirmed action (v1.10.6+).** `enable-auto-renewal`
+**Production-write authorization is one confirmed action (v1.10.7+).** `enable-auto-renewal`
 creates `WRITE_APPROVED`, sets `policy.json`'s `auto_renewal_enabled=true`, and installs the
 write-capable `apply` timer — all together, never partially. `disable-auto-renewal` always
 reverses all three together. The menu's "Enable/Disable automatic renewal" screens do the
