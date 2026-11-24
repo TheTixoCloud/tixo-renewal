@@ -115,6 +115,46 @@ def ensure_operations_schema(conn) -> None:
         if "duplicate column" not in str(e).lower():
             raise
 
+    # CRITICAL real duplicate-renewal fix (found and proven during the v1.10.4 engineering
+    # mission, 2026-11-24): apply_renewal()'s own dedup check (find_any_prior_operation, a
+    # plain SELECT) and its claim (record_operation_start, a SEPARATE INSERT transaction)
+    # were NOT atomic -- two genuinely concurrent processes (e.g. a manually-invoked
+    # `apply-due` run overlapping with the systemd-timer-triggered one, which bypasses the
+    # unit's own `flock` wrapper entirely since that lock is only applied to the generated
+    # systemd ExecStart line, never inside the Python code itself) could both pass the
+    # SELECT, then both successfully INSERT a row for the IDENTICAL (node_id, vpsid,
+    # period_key) -- there was no UNIQUE constraint stopping that -- and both proceed to
+    # issue a real write to Virtualizor for the SAME renewal period. Reproduced directly
+    # (two separate sqlite3 connections to the same file, racing the exact two statements)
+    # before this fix existed; see test_writer.py's
+    # test_concurrent_apply_renewal_for_the_same_period_key_is_never_double_applied for the
+    # permanent regression test. This UNIQUE index turns the fix into one the DATABASE
+    # itself enforces (the only thing that can truly make check-then-insert atomic across
+    # processes) rather than relying on apply-level sequencing alone; apply_renewal() now
+    # also explicitly catches the resulting sqlite3.IntegrityError as "someone else claimed
+    # this period first," never letting it surface as an uncaught exception.
+    #
+    # Best-effort migration for an existing database that might already (from before this
+    # fix existed) contain genuine duplicate (node_id, vpsid, period_key) rows: CREATE
+    # UNIQUE INDEX would itself raise on top of pre-existing duplicate data. That is NOT
+    # swallowed silently -- it is a real, pre-existing data integrity problem an operator
+    # must investigate (most likely via `resolve-operation`) -- but it must also never crash
+    # every single command that calls this function (effectively the whole application) on
+    # startup, so the failure is caught and surfaced as a clear, one-time stderr warning
+    # rather than an unhandled exception.
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_operations_unique_period "
+            "ON operations(node_id, vpsid, period_key)")
+    except sqlite3.IntegrityError as e:
+        import sys as _sys
+        print(f"WARNING: could not create the duplicate-prevention unique index on "
+              f"operations(node_id, vpsid, period_key) -- this database already contains "
+              f"conflicting duplicate rows: {e}. Duplicate-renewal protection is NOT fully "
+              f"enforced by the database until this is resolved manually (inspect and "
+              f"resolve the conflicting rows, e.g. via `resolve-operation`, then restart).",
+              file=_sys.stderr)
+
 
 def find_any_prior_operation(conn, node_id: str, vpsid: int, period_key: str):
     """Returns any prior operation for this (node, vpsid, period_key), regardless of status.
@@ -203,13 +243,23 @@ def find_deferred_operation_for_vpsid(conn, node_id: str, vpsid: int):
 
 def record_operation_start(conn, operation_id: str, node_id: str, vpsid: int, period_key: str,
                             requested_new_quota_gb) -> None:
+    """Raises sqlite3.IntegrityError (caller's job to handle -- see apply_renewal) if the
+    UNIQUE index on (node_id, vpsid, period_key) rejects this insert because another,
+    genuinely concurrent process already claimed this period first. Always rolls back
+    cleanly on ANY failure so `conn` is never left mid-transaction -- a caller that catches
+    the IntegrityError and keeps using the same connection (as apply_renewal does, to
+    immediately re-query the winning row) must get a connection back in a clean state."""
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("BEGIN")
-    conn.execute(
-        "INSERT INTO operations (operation_id, node_id, vpsid, period_key, requested_new_quota_gb, "
-        "status, created_at, updated_at) VALUES (?,?,?,?,?, 'IN_PROGRESS', ?, ?)",
-        (operation_id, node_id, vpsid, period_key, str(requested_new_quota_gb), now, now),
-    )
+    try:
+        conn.execute(
+            "INSERT INTO operations (operation_id, node_id, vpsid, period_key, requested_new_quota_gb, "
+            "status, created_at, updated_at) VALUES (?,?,?,?,?, 'IN_PROGRESS', ?, ?)",
+            (operation_id, node_id, vpsid, period_key, str(requested_new_quota_gb), now, now),
+        )
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     conn.execute("COMMIT")
 
 
@@ -565,7 +615,21 @@ def apply_renewal(conn, node_id: str, vpsid: int, period_key: str, new_quota_gb,
                         "seconds_remaining": write_cooldown_seconds - elapsed}
 
     operation_id = f"{node_id}:{vpsid}:{period_key}:{int(time.time())}"
-    record_operation_start(conn, operation_id, node_id, vpsid, period_key, new_quota_gb)
+    try:
+        record_operation_start(conn, operation_id, node_id, vpsid, period_key, new_quota_gb)
+    except sqlite3.IntegrityError:
+        # The UNIQUE index on (node_id, vpsid, period_key) just did its job: another,
+        # genuinely concurrent process won the race and claimed this period between our
+        # find_any_prior_operation() check above and this INSERT -- this is the exact
+        # TOCTOU window that check-then-insert alone cannot close; the database constraint
+        # is what actually makes this atomic. Report it exactly like the ordinary
+        # already-claimed case, never as an uncaught exception, and never proceed to call
+        # the live write API ourselves.
+        existing = find_any_prior_operation(conn, node_id, vpsid, period_key)
+        return {"status": "BLOCKED_UNRESOLVED_PRIOR_OPERATION",
+                "operation_id": existing[0] if existing else None,
+                "prior_status": existing[1] if existing else None,
+                "detail": "lost a concurrent race to claim this period_key"}
     return _execute_write_and_verify(conn, operation_id, vpsid, new_quota_gb, creds, http_post,
                                       confirm_read_delay_seconds, sleep_fn, read_live_quota_fn)
 

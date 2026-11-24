@@ -128,6 +128,115 @@ def test_duplicate_run_same_period_is_blocked_while_unresolved(conn, tmp_path):
     assert second["operation_id"] == first["operation_id"]
 
 
+def test_concurrent_claim_race_is_blocked_by_the_database_itself(tmp_path):
+    """REAL duplicate-renewal bug, found and reproduced during the v1.10.4 engineering
+    mission (2026-11-24): apply_renewal()'s dedup check (find_any_prior_operation, a plain
+    SELECT) and its claim (record_operation_start, a separate INSERT) were not atomic. Two
+    genuinely concurrent processes -- e.g. a manually-invoked `apply-due` overlapping with
+    the systemd-timer-triggered one, which bypasses the unit's own `flock` entirely since
+    that lock is applied only in the generated ExecStart line, never inside this code --
+    could both pass the SELECT before either INSERTed, then both successfully insert a row
+    for the IDENTICAL (node_id, vpsid, period_key) and both proceed to write to Virtualizor
+    for the SAME renewal period.
+
+    This test drives the exact interleaving a true race would produce, using TWO separate
+    sqlite3 connections to the SAME database file (SQLite's locking is file-based, not
+    connection-based, so this is a faithful simulation of two separate OS processes) --
+    not apply_renewal()'s own sequencing (which, called normally twice in a row, would
+    always have its own SELECT see the first call's already-committed row and never
+    actually exercise this race window at all). Before the UNIQUE index existed, both
+    low-level INSERTs below succeeded -- reproduced live against the pre-fix code during
+    this mission, see the commit message. With the fix, the second INSERT raises
+    sqlite3.IntegrityError."""
+    db_path = str(tmp_path / "ops.sqlite3")
+    conn_a = sqlite3.connect(db_path)
+    w.ensure_operations_schema(conn_a)
+    conn_b = sqlite3.connect(db_path)
+
+    # Both "processes" check first and (correctly, at this point in real time) see nothing.
+    assert w.find_any_prior_operation(conn_a, "n1", 42, "shared-period") is None
+    assert w.find_any_prior_operation(conn_b, "n1", 42, "shared-period") is None
+
+    # Process A wins the race to claim it.
+    w.record_operation_start(conn_a, "op-A", "n1", 42, "shared-period", Decimal("100"))
+
+    # Process B, having ALREADY passed its own check above before A won, now attempts the
+    # exact same claim -- the database itself (not application sequencing) must refuse it.
+    with pytest.raises(sqlite3.IntegrityError):
+        w.record_operation_start(conn_b, "op-B", "n1", 42, "shared-period", Decimal("100"))
+
+    rows = conn_a.execute(
+        "SELECT operation_id FROM operations WHERE node_id='n1' AND vpsid=42 AND period_key='shared-period'"
+    ).fetchall()
+    assert rows == [("op-A",)]  # exactly one row claimed this period -- never two
+
+    # conn_b must be left in a clean, usable state after losing the race (no stuck
+    # transaction from the rolled-back INSERT) -- prove it by using it normally afterward.
+    assert w.find_any_prior_operation(conn_b, "n1", 42, "shared-period") == ("op-A", "IN_PROGRESS")
+
+    conn_a.close()
+    conn_b.close()
+
+
+def test_apply_renewal_converts_a_lost_claim_race_into_a_clean_blocked_result(conn, tmp_path, monkeypatch):
+    """apply_renewal() itself, not just the low-level primitives, must convert the
+    sqlite3.IntegrityError from a lost claim race into the same clean
+    BLOCKED_UNRESOLVED_PRIOR_OPERATION result as any other already-claimed case -- never an
+    uncaught exception, and never a second call to the live API. Simulates the race by
+    having record_operation_start raise IntegrityError on this call (as it genuinely would
+    if another process's INSERT had just won), as if another process's row had already
+    landed in the database between our own find_any_prior_operation check and our own
+    INSERT attempt."""
+    marker = approved_marker(tmp_path)
+
+    real_record_start = w.record_operation_start
+    winning_op_id = "n1:42:shared-period:9999999999"
+
+    def losing_record_start(c, operation_id, node_id, vpsid, period_key, requested_new_quota_gb):
+        # Simulate the other process's row landing in the database JUST before our INSERT.
+        real_record_start(c, winning_op_id, node_id, vpsid, period_key, requested_new_quota_gb)
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: simulated lost race")
+
+    monkeypatch.setattr(w, "record_operation_start", losing_record_start)
+
+    result = w.apply_renewal(conn, "n1", 42, "shared-period", Decimal("100"), CREDS, marker,
+                              confirm=True, read_live_quota_fn=lambda v: Decimal("100"),
+                              http_post=lambda *a, **k: pytest.fail(
+                                  "must never call the live API after losing a claim race"))
+    assert result["status"] == "BLOCKED_UNRESOLVED_PRIOR_OPERATION"
+    assert result["operation_id"] == winning_op_id
+
+
+def test_schema_migration_survives_pre_existing_duplicate_period_key_rows(tmp_path):
+    """If a database somehow already contains duplicate (node_id, vpsid, period_key) rows
+    from BEFORE this fix existed (the exact pre-fix bug this mission found), creating the
+    new UNIQUE index must not crash -- every single CLI command calls ensure_operations_schema
+    at startup, so a hard crash here would take down the entire application for a database
+    that most needs operator attention, not a crash loop. It must print a clear warning
+    instead and leave the existing (broken) data exactly as it was for manual review."""
+    db_path = str(tmp_path / "ops.sqlite3")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(w.OPERATIONS_SCHEMA)
+    now = "2026-11-24T00:00:00+00:00"
+    conn.execute(
+        "INSERT INTO operations (operation_id, node_id, vpsid, period_key, requested_new_quota_gb, "
+        "status, created_at, updated_at) VALUES ('op-1','n1',42,'dup-period','100','APPLIED',?,?)",
+        (now, now))
+    conn.execute(
+        "INSERT INTO operations (operation_id, node_id, vpsid, period_key, requested_new_quota_gb, "
+        "status, created_at, updated_at) VALUES ('op-2','n1',42,'dup-period','100','APPLIED',?,?)",
+        (now, now))
+    conn.commit()
+
+    w.ensure_operations_schema(conn)  # must not raise, despite the pre-existing duplicate
+
+    rows = conn.execute(
+        "SELECT operation_id FROM operations WHERE node_id='n1' AND vpsid=42 AND period_key='dup-period'"
+    ).fetchall()
+    assert len(rows) == 2  # untouched -- this function never deletes data, only warns
+    conn.close()
+
+
 def test_duplicate_run_same_period_blocked_after_applied(conn, tmp_path):
     """REGRESSION: after a successful APPLIED, a second apply for the same (node, vpsid,
     period_key) must be blocked. Previously, find_unresolved_operation() excluded APPLIED
