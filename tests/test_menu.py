@@ -351,6 +351,29 @@ def test_collect_dashboard_data_reports_policy_and_write_approved(tmp_path):
     assert data["per_node"]["self"]["initialized"] is False  # no sqlite3 file created yet
 
 
+def test_collect_dashboard_data_includes_readiness_counts_distinct_from_service_health(tmp_path):
+    """v1.10.6: the dashboard must surface financial-engine readiness (COLLECTING_BASELINE/
+    MONITORING/REVIEW_REQUIRED) SEPARATELY from service/timer health -- a node can be
+    perfectly healthy at the service level while every VPS is still collecting its first
+    observations, and that must never be hidden or conflated with a service problem."""
+    config_dir = str(tmp_path / "renewal-config")
+    state_dir = str(tmp_path / "shadow-monitor-state")
+    os.makedirs(config_dir)
+    os.makedirs(state_dir)
+    pol.write_default_policy_config(os.path.join(config_dir, "policy.json"))
+    import nodes as nodes_mod
+    nodes_mod.write_default_config(os.path.join(config_dir, "nodes.json"),
+                                    nodes=[nodes_mod.NodeConfig("self", mode="local", db_filename="self.sqlite3")])
+    import shadow_monitor as sm_mod
+    conn = sm_mod.open_db(os.path.join(state_dir, "self.sqlite3"))
+    sm_mod.ingest_poll(conn, [{"vpsid": 1, "created_epoch": 1700000000,
+                               "quota_gb": Decimal("100"), "used_gb": Decimal("10")}],
+                        sm_mod.utcnow_iso())
+    conn.close()
+    data = menu.collect_dashboard_data(config_dir, state_dir)
+    assert data["per_node"]["self"]["readiness_counts"] == {"COLLECTING_BASELINE": 1}
+
+
 def test_render_dashboard_shows_disabled_auto_renewal_without_crashing():
     data = {"policy_ok": True, "monthly_grant_gb": "100", "auto_renewal_enabled": False,
             "write_approved": False, "per_node": {}, "timers": {}}

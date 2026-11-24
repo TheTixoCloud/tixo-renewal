@@ -371,7 +371,16 @@ def collect_dashboard_data(config_dir: str, state_dir: str) -> dict:
                 "SELECT vpsid, period_key, status FROM operations WHERE status IN "
                 "('API_REPORTED_ERROR','UNKNOWN_NEEDS_VERIFICATION') ORDER BY created_at DESC LIMIT 20"
             ).fetchall()
+            policy_for_readiness = None
+            try:
+                policy_for_readiness = pol.load_policy_config(os.path.join(config_dir, "policy.json"))
+            except Exception:
+                pass
+            readiness_buckets = renewal_cli._per_vps_readiness(conn, n.node_id, policy_for_readiness)
             conn.close()
+            readiness_counts = {}
+            for bucket in readiness_buckets.values():
+                readiness_counts[bucket] = readiness_counts.get(bucket, 0) + 1
             per_node[n.node_id] = {
                 "initialized": True,
                 "last_poll_at": checkpoint[0] if checkpoint else None,
@@ -380,6 +389,11 @@ def collect_dashboard_data(config_dir: str, state_dir: str) -> dict:
                 "deferred": deferred_rows,
                 "deferred_expired": expired_rows,
                 "failed_or_uncertain": failed_rows,
+                # v1.10.6: financial-engine readiness, DISTINCT from service/timer health
+                # above -- a node can be perfectly healthy at the service level while every
+                # VPS is still COLLECTING_BASELINE (normal immediately after a fresh
+                # install). Never let a clean service-health view imply renewal is safe.
+                "readiness_counts": readiness_counts,
             }
         data["per_node"] = per_node
     except Exception as e:
@@ -436,6 +450,21 @@ def render_dashboard(data: dict, style: Style, display_tz: str = "UTC") -> str:
         lines.append(f"    Last poll: {format_local_time(last_poll, display_tz) if last_poll else 'never'}")
         lines.append(f"    Operations: {info['operations_total']} total, "
                       f"{info['operations_unresolved']} unresolved")
+        counts = info.get("readiness_counts") or {}
+        if counts:
+            collecting = counts.get("COLLECTING_BASELINE", 0)
+            review = counts.get("REVIEW_REQUIRED", 0)
+            monitoring = counts.get("MONITORING", 0)
+            pending = counts.get("RENEWAL_CANDIDATE_PENDING_REVIEW", 0)
+            unlimited = counts.get("MANUAL_ONLY_UNLIMITED", 0)
+            review_color = style.RED if review else style.DIM
+            lines.append(f"    Financial-engine readiness (distinct from service health "
+                         f"above): {style.GREEN}{monitoring} monitoring{style.RESET}, "
+                         f"{style.YELLOW}{collecting} collecting baseline{style.RESET}, "
+                         f"{review_color}{review} review required{style.RESET}"
+                         + (f", {style.YELLOW}{pending} pending renewal confirmation{style.RESET}" if pending else "")
+                         + (f", {unlimited} unlimited (excluded)" if unlimited else "")
+                         + " -- see 'readiness' for per-VPS detail.")
         deferred = info.get("deferred") or []
         if deferred:
             lines.append(f"    {style.YELLOW}Deferred (backup/restore/migration lock, will "
