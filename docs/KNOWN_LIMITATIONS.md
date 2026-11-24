@@ -158,3 +158,32 @@ verified target (Ubuntu 24.04); a full renewal-state-machine audit beyond what t
 pre-existing test suite already covers (timezone/leap-year/month-end edge cases were not
 independently re-verified this round). See the v1.10.3 closeout report for the exact,
 itemized final status.
+
+## 14. v1.10.4: real duplicate-renewal race found and fixed; production investigation blocked at the network level
+
+During a follow-up mission specifically scoped to verify duplicate-renewal safety, a real,
+reproducible bug was found in `writer.apply_renewal()`: the dedup check and the claim were
+two separate, non-atomic SQL statements, so two genuinely concurrent processes could both
+pass the check and both insert a claim row for the identical `(node_id, vpsid, period_key)`
+-- meaning both would proceed to write to Virtualizor for the SAME renewal period. This was
+directly reproduced (two sqlite3 connections to one file, racing the exact two statements)
+before being fixed with a UNIQUE index + IntegrityError handling; the matching race in
+`retry_deferred_renewal()` was fixed the same way. See `docs/RELEASE_NOTES_v1.10.4.md` for
+full detail. The default monthly gift was also corrected from 100 GB to 0 GB to match the
+actual carry-over business model (see that release's own notes).
+
+**Production investigation (Phase Two of that mission) was attempted and found blocked**,
+not by missing credentials but by network connectivity: the engineering environment used
+had no route at all (confirmed via `nc`/`curl`, while general internet access worked fine)
+to either `ir1.tixocloud.com` or the pinned, previously-trusted `87.107.114.194` endpoint
+for `ir1`. Separately, and independent of that network block: `ir1.tixocloud.com`'s SSH
+host key had changed from what was previously trusted in `known_hosts` -- this was correctly
+NOT bypassed (no `StrictHostKeyChecking=no`, no edited `known_hosts`) since there was no way
+to verify out-of-band from within that environment whether this reflects a legitimate host
+rebuild/DNS change or something adversarial. **This must be resolved by an operator with
+direct access before any future automated or manual SSH connection to that hostname** --
+either confirm the new key against the actual current host configuration, or investigate
+why it changed. No endpoint for `ir2` was ever found configured anywhere in the available
+project configuration (no SSH alias, no documented hostname/IP) -- guessing one was
+correctly avoided rather than attempted. No production investigation, baseline snapshot, or
+deployment was therefore possible this round; all work was repository-level only.
