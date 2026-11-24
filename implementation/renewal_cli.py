@@ -20,7 +20,7 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.10.11"
+VERSION = "1.10.12"
 
 # Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
 # apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
@@ -729,8 +729,29 @@ def cmd_status(args):
         pending = [d for d in detections if d["status"] == "PLAUSIBLE_RESET_CANDIDATE_NEEDS_HUMAN_CONFIRMATION"]
         frozen = [d for d in detections if d["status"] == "FROZEN_FOR_REVIEW"]
         manual_unlimited = [d for d in detections if d["status"] == "MANUAL_ONLY_UNLIMITED"]
+        pending_backlog = sm.list_pending_renewals(conn)
+        # Fix for a real reported confusion during the IR1 incident: `status` used to lump
+        # EVERY FROZEN_FOR_REVIEW entry together, including the single most common
+        # steady-state case (usage simply grew; `readiness` already correctly reports this
+        # as MONITORING, "nothing to worry about") alongside genuinely ambiguous ones --
+        # making an entirely healthy fleet look identical to one with real unresolved
+        # problems. Split the same way `readiness`'s bucketing already does (engine_kind),
+        # so `status` and `readiness` can no longer appear to contradict each other for the
+        # same underlying state.
+        ordinary_kinds = ("NOT_A_RENEWAL", "DUPLICATE_RENEWAL_PERIOD")
+        ordinary_frozen = [d for d in frozen
+                            if d.get("engine_kind") in ordinary_kinds
+                            or "fewer than two observations" in d.get("reason", "")]
+        genuinely_ambiguous = [d for d in frozen if d not in ordinary_frozen]
         print(f"  Plausible candidates awaiting operator confirmation: {len(pending)}")
-        print(f"  Frozen-for-review entries: {len(frozen)}")
+        print(f"  Frozen-for-review entries: {len(frozen)} total "
+              f"({len(ordinary_frozen)} ordinary/no-action-needed -- see `readiness` for the "
+              f"same state reported as MONITORING/COLLECTING_BASELINE; "
+              f"{len(genuinely_ambiguous)} genuinely ambiguous, worth a human glance)")
+        if pending_backlog:
+            print(f"  Durably pending renewals awaiting the next apply cycle (already "
+                  f"detected, recomputed fresh against current policy each time): "
+                  f"{len(pending_backlog)}")
         print(f"  Manual-only (unlimited bandwidth, permanently excluded): {len(manual_unlimited)}")
         write_blocked = not os.path.exists(WRITE_APPROVAL_MARKER)
         print(f"  Write capability: {'BLOCKED (no approval marker)' if write_blocked else 'APPROVED -- apply command enabled'}")
@@ -1885,6 +1906,22 @@ def cmd_apply_due(args):
     checkpoint = conn.execute("SELECT first_poll_at FROM monitor_checkpoints WHERE id=1").fetchone()
     vpsids = [r[0] for r in conn.execute("SELECT DISTINCT vpsid FROM identities")]
 
+    # CRITICAL durability fix (v1.10.12 -- real production incident, IR1, 2026-11-24): the
+    # live 2-snapshot-window baseline below (_renewal_baseline_for_vpsid) only ever sees a
+    # reset if apply-due happens to run within ~2 poll cycles of it. Three real VPS were
+    # correctly flagged by detect_renewal_candidates at detection time, but by the time
+    # auto-renewal was authorized ~40 minutes later, the live window had already slid past
+    # the reset entirely -- 0 attempted, every cycle, forever. The durable backlog
+    # (shadow_monitor.list_pending_renewals) is what the earlier detection ALREADY
+    # persisted; consulting it FIRST means a delayed authorization, a missed apply cycle,
+    # a restart, or an upgrade can never cause a correctly-detected renewal to be silently
+    # lost -- it is recomputed fresh against whatever policy is CURRENT right now (never a
+    # stale cached number from detection time), then handed to the exact same writer safety
+    # machinery as any other renewal.
+    pending_backlog = {}
+    for pending in sm.list_pending_renewals(conn):
+        pending_backlog.setdefault(pending["vpsid"], []).append(pending)
+
     applied, skipped, deferred = [], [], []
     for vpsid in vpsids:
         # CRITICAL: one VPS's exception (network blip, unexpected API shape, etc.) must never
@@ -1905,21 +1942,33 @@ def cmd_apply_due(args):
                 continue
 
             ident = conn.execute("SELECT created_epoch FROM identities WHERE vpsid=?", (vpsid,)).fetchone()
-            # apply-due must NEVER act on a hypothetical "as if renewed right now" baseline --
-            # only a REAL observed reset pattern (two snapshots: quota unchanged, usage dropped)
-            # is eligible for actual application. See _renewal_baseline_for_vpsid()'s docstring
-            # for the exact bug this guards against (using post-drop usage as the pre-drop value).
-            baseline = _renewal_baseline_for_vpsid(conn, vpsid)
-            if baseline is None:
-                skipped.append((vpsid, "NO_OBSERVED_RESET_PATTERN"))
-                continue
-            old_quota, old_used, event_ts = baseline
+            # Durable backlog takes precedence over the live, easily-outrun sliding window --
+            # see the comment above pending_backlog's construction.
+            backlog_entry = pending_backlog.get(vpsid, [None])[0]
+            if backlog_entry is not None:
+                old_quota, old_used, event_ts = (backlog_entry["old_quota_gb"],
+                                                   backlog_entry["old_used_gb"], backlog_entry["event_ts"])
+                backlog_period_key = backlog_entry["period_key"]
+            else:
+                # apply-due must NEVER act on a hypothetical "as if renewed right now"
+                # baseline -- only a REAL observed reset pattern (two snapshots: quota
+                # unchanged, usage dropped) is eligible for actual application. See
+                # _renewal_baseline_for_vpsid()'s docstring for the exact bug this guards
+                # against (using post-drop usage as the pre-drop value).
+                baseline = _renewal_baseline_for_vpsid(conn, vpsid)
+                if baseline is None:
+                    skipped.append((vpsid, "NO_OBSERVED_RESET_PATTERN"))
+                    continue
+                old_quota, old_used, event_ts = baseline
+                backlog_period_key = None
             preview = pi.preview_renewal(
                 cfg, args.node, vpsid, verified_created_epoch=ident[0] if ident else None,
                 node_first_poll_at=checkpoint[0] if checkpoint else None,
                 old_quota=old_quota, old_used=old_used, event_ts=event_ts,
             )
             if preview["status"] != "PLAUSIBLE_RENEWAL_CANDIDATE":
+                if backlog_period_key:
+                    sm.mark_renewal_consumed(conn, backlog_period_key, new_status="SUPERSEDED_NOT_ELIGIBLE")
                 skipped.append((vpsid, preview["status"]))
                 continue
             period_index = renewal_period_index(preview["anchor_epoch"], event_ts)
@@ -1929,6 +1978,13 @@ def cmd_apply_due(args):
                 WRITE_APPROVAL_MARKER, confirm=True,
                 read_live_quota_fn=lambda v: ls.fetch_single_vps_quota(v),
             )
+            if backlog_period_key:
+                # Consumed REGARDLESS of outcome -- the operations table (and, for
+                # DEFERRED_LOCKED, retry_deferred_renewal's own separate mechanism, checked
+                # at the top of this loop) is now the authoritative record for this period;
+                # the backlog's only job was getting it discovered, never a second dedup
+                # authority.
+                sm.mark_renewal_consumed(conn, backlog_period_key, new_status="CONSUMED")
             if result["status"] == "DEFERRED_LOCKED":
                 deferred.append((vpsid, result))
             else:
@@ -1955,6 +2011,64 @@ def cmd_apply_due(args):
 
 
 # ---------- resolve-operation (manual, read-only investigation of an UNKNOWN operation) --------
+
+def cmd_reconcile_stale_renewals(args):
+    """v1.10.12 recovery tool, built directly from the real IR1 incident (2026-11-24,
+    vpsid 62/63/64): a renewal flagged by a version of this software BEFORE the durable
+    baseline fix existed has no old_quota_gb/old_used_gb/event_ts recorded, so the
+    (now-fixed) automatic apply_due backlog correctly has nothing to act on for it. This
+    command finds exactly those rows, recovers the original baseline from the full
+    snapshot HISTORY (never deleted, unlike the live 2-snapshot window that lost it), and
+    -- ONLY with --backfill -- writes that recovered baseline back into the LOCAL ledger.
+
+    Read-only by default (no --backfill): reports what it found and what WOULD be
+    backfilled, changes nothing. NEVER writes to Virtualizor, NEVER touches the
+    `operations` table, and NEVER decides a quota -- backfilling only makes the entry
+    visible to apply_due's normal backlog scan, which then independently recomputes the
+    quota fresh against whatever policy is current and applies it through the exact same
+    safety machinery (pre/post live verification, exactly-once) as any other renewal."""
+    node = next((n for n in nodes_mod.load_nodes(_node_config_path()) if n.node_id == args.node), None)
+    if node is None:
+        print(f"Unknown node: {args.node}")
+        return 1
+    conn = sm.open_db(node.db_path(STATE_DIR))
+    stale = sm.find_stale_flagged_renewals_missing_baseline(conn)
+    if not stale:
+        print("No stale (pre-v1.10.12, baseline-less) flagged renewals found.")
+        conn.close()
+        return 0
+
+    backfilled, unrecoverable = [], []
+    for entry in stale:
+        recovered = sm.recover_stale_flagged_baseline(conn, entry["vpsid"], entry["recorded_at"])
+        if recovered is None:
+            unrecoverable.append(entry)
+            print(f"vpsid={entry['vpsid']} period_key={entry['period_key']}: "
+                  f"COULD NOT recover a baseline from snapshot history -- needs manual "
+                  f"investigation, not touched.")
+            continue
+        print(f"vpsid={entry['vpsid']} period_key={entry['period_key']}: recovered "
+              f"old_quota_gb={recovered['old_quota_gb']} old_used_gb={recovered['old_used_gb']} "
+              f"event_ts={recovered['event_ts']}"
+              + (" -- BACKFILLED" if getattr(args, "backfill", False) else " (dry-run, not written -- re-run with --backfill)"))
+        if getattr(args, "backfill", False):
+            sm.backfill_renewal_baseline(conn, entry["period_key"], recovered["old_quota_gb"],
+                                           recovered["old_used_gb"], recovered["event_ts"])
+            backfilled.append(entry)
+    conn.close()
+
+    if getattr(args, "backfill", False):
+        print(f"\nBackfilled {len(backfilled)} of {len(stale)} stale renewal(s). "
+              f"{len(unrecoverable)} could not be recovered automatically.")
+        if backfilled:
+            print("Run `apply-due` (or wait for its timer) to process the now-visible "
+                  "backlog -- nothing is applied by this command itself.")
+    else:
+        print(f"\n{len(stale) - len(unrecoverable)} of {len(stale)} stale renewal(s) can be "
+              f"recovered. Re-run with --backfill to write the recovered baseline (still "
+              f"never writes to Virtualizor or applies anything).")
+    return 0
+
 
 def cmd_resolve_operation(args):
     """Lists unresolved (IN_PROGRESS / UNKNOWN_NEEDS_VERIFICATION) operations for a node, and
@@ -2681,6 +2795,16 @@ def main():
     resolve_p.add_argument("--resolution", choices=["APPLIED", "FAILED"])
     resolve_p.add_argument("--verified-quota-gb")
     resolve_p.set_defaults(func=cmd_resolve_operation)
+
+    reconcile_p = sub.add_parser(
+        "reconcile-stale-renewals",
+        help="Recover pre-v1.10.12 flagged renewals missing a durable baseline (read-only "
+             "unless --backfill); see cmd_reconcile_stale_renewals's docstring")
+    reconcile_p.add_argument("--node", required=True)
+    reconcile_p.add_argument("--backfill", action="store_true",
+                              help="actually write the recovered baseline (still never "
+                                   "applies anything or touches Virtualizor)")
+    reconcile_p.set_defaults(func=cmd_reconcile_stale_renewals)
 
     args = ap.parse_args()
     try:

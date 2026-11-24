@@ -91,11 +91,42 @@ CREATE TABLE IF NOT EXISTS monitor_checkpoints (
 """
 
 
+def _ensure_renewal_checkpoints_baseline_columns(conn: sqlite3.Connection) -> None:
+    """CRITICAL durability fix (v1.10.12 -- real production incident, IR1, 2026-11-24):
+    renewal_checkpoints used to record ONLY the period_key/event_id of a flagged candidate,
+    never the actual old_quota_gb/old_used_gb/event_ts baseline that PRODUCED it. Detection
+    (detect_renewal_candidates) only ever looks at the two MOST RECENT snapshots -- correct
+    for catching a reset the moment it happens, but once a few more poll cycles pass (e.g.
+    while waiting for an operator to authorize auto-renewal, or simply because the apply
+    timer didn't happen to run in the next 10 minutes), that 2-snapshot window slides past
+    the reset entirely and the event becomes permanently invisible to apply_due's OWN
+    baseline detector (_renewal_baseline_for_vpsid, which has the exact same 2-snapshot-
+    window limitation) -- even though the full snapshot history still contains it. Three
+    real VPS (62/63/64) hit exactly this: flagged correctly at detection time, but by the
+    time automatic renewal was authorized ~40 minutes later, apply_due could no longer see
+    the reset at all and silently skipped all three every cycle thereafter ("0 attempted").
+
+    These three new columns make the baseline durable: ADD COLUMN (idempotent -- SQLite has
+    no "ADD COLUMN IF NOT EXISTS", so the duplicate-column error is swallowed, same
+    convention as writer.ensure_operations_schema's own migration)."""
+    for ddl in (
+        "ALTER TABLE renewal_checkpoints ADD COLUMN old_quota_gb TEXT",
+        "ALTER TABLE renewal_checkpoints ADD COLUMN old_used_gb TEXT",
+        "ALTER TABLE renewal_checkpoints ADD COLUMN event_ts TEXT",
+    ):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+
+
 def open_db(path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, isolation_level=None)  # explicit transaction control below
     conn.execute("PRAGMA journal_mode=WAL;")  # durable, crash-safe commits
     conn.executescript(SCHEMA)
+    _ensure_renewal_checkpoints_baseline_columns(conn)
     import writer as _writer  # local import avoids a hard dependency cycle at module load time
     _writer.ensure_operations_schema(conn)
     return conn
@@ -210,14 +241,117 @@ def _load_granted_periods(conn: sqlite3.Connection) -> dict:
 
 
 def _persist_granted_period(conn: sqlite3.Connection, period_key: str, vpsid: int,
-                             created_epoch: int, period_index: int, eid: str, status: str, as_of: str):
+                             created_epoch: int, period_index: int, eid: str, status: str, as_of: str,
+                             old_quota_gb=None, old_used_gb=None, event_ts: str = None):
     conn.execute("BEGIN")
     conn.execute(
         "INSERT OR REPLACE INTO renewal_checkpoints "
-        "(period_key, vpsid, created_epoch, period_index, granted_event_signature, status, recorded_at) "
-        "VALUES (?,?,?,?,?,?,?)",
-        (period_key, vpsid, created_epoch, period_index, eid, status, as_of),
+        "(period_key, vpsid, created_epoch, period_index, granted_event_signature, status, "
+        "recorded_at, old_quota_gb, old_used_gb, event_ts) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (period_key, vpsid, created_epoch, period_index, eid, status, as_of,
+         str(old_quota_gb) if old_quota_gb is not None else None,
+         str(old_used_gb) if old_used_gb is not None else None, event_ts),
     )
+    conn.execute("COMMIT")
+
+
+def list_pending_renewals(conn: sqlite3.Connection, status: str = "FLAGGED") -> list[dict]:
+    """The durable backlog cmd_apply_due consults BEFORE falling back to the live (and
+    easily-outrun) 2-snapshot-window detector -- see
+    _ensure_renewal_checkpoints_baseline_columns's docstring for why this exists. Returns
+    only rows that still have a durable baseline recorded (old_quota_gb/old_used_gb/
+    event_ts) -- a pre-v1.10.12 row created before this fix existed has NULL baseline
+    columns and is correctly excluded here (nothing this function can safely act on; see
+    the recovery-procedure docs for how to backfill those from snapshot history)."""
+    out = []
+    for row in conn.execute(
+        "SELECT period_key, vpsid, created_epoch, period_index, old_quota_gb, old_used_gb, event_ts "
+        "FROM renewal_checkpoints WHERE status=? AND old_quota_gb IS NOT NULL "
+        "AND old_used_gb IS NOT NULL AND event_ts IS NOT NULL", (status,)
+    ):
+        period_key, vpsid, created_epoch, period_index, old_quota_gb, old_used_gb, event_ts = row
+        out.append({
+            "period_key": period_key, "vpsid": vpsid, "created_epoch": created_epoch,
+            "period_index": period_index, "old_quota_gb": Decimal(old_quota_gb),
+            "old_used_gb": Decimal(old_used_gb), "event_ts": event_ts,
+        })
+    return out
+
+
+def mark_renewal_consumed(conn: sqlite3.Connection, period_key: str, new_status: str = "CONSUMED") -> None:
+    """Marks a backlog entry as handed to the real write path (writer.apply_renewal), so
+    list_pending_renewals never offers it again -- REGARDLESS of whether that write
+    succeeded, needs review, or failed. The authoritative record of the write's own outcome
+    is writer.py's `operations` table (APPLIED/UNKNOWN_NEEDS_VERIFICATION/FAILED), which
+    already has its own independent, atomic exactly-once guard; this flag only stops the
+    backlog SCANNER from re-offering an already-attempted entry on the next cycle -- it
+    never bypasses or duplicates that guard."""
+    conn.execute("BEGIN")
+    conn.execute("UPDATE renewal_checkpoints SET status=? WHERE period_key=?",
+                 (new_status, period_key))
+    conn.execute("COMMIT")
+
+
+def find_stale_flagged_renewals_missing_baseline(conn: sqlite3.Connection) -> list[dict]:
+    """Read-only: finds FLAGGED renewal_checkpoints rows created BEFORE v1.10.12 existed --
+    these predate the durable-baseline columns entirely (NULL old_quota_gb/old_used_gb/
+    event_ts), so list_pending_renewals() correctly excludes them from the automatic
+    backlog (there is nothing stored yet for it to safely act on). The real IR1 incident's
+    three affected VPS are in exactly this state after upgrading -- this is the discovery
+    half of their recovery path; see recover_stale_flagged_baseline() for the other half."""
+    out = []
+    for row in conn.execute(
+        "SELECT period_key, vpsid, created_epoch, period_index, recorded_at "
+        "FROM renewal_checkpoints WHERE status='FLAGGED' AND "
+        "(old_quota_gb IS NULL OR old_used_gb IS NULL OR event_ts IS NULL)"
+    ):
+        period_key, vpsid, created_epoch, period_index, recorded_at = row
+        out.append({"period_key": period_key, "vpsid": vpsid, "created_epoch": created_epoch,
+                     "period_index": period_index, "recorded_at": recorded_at})
+    return out
+
+
+def recover_stale_flagged_baseline(conn: sqlite3.Connection, vpsid: int, recorded_at: str):
+    """Read-only recovery of the baseline a pre-v1.10.12 FLAGGED row never durably stored:
+    the full snapshot HISTORY (never deleted, unlike the live 2-snapshot detection window)
+    still contains the original reset -- this scans it for the quota-unchanged/usage-
+    dropped pair whose timestamp is closest to (and no later than) `recorded_at`, the exact
+    moment detection originally flagged this period. Returns
+    {"old_quota_gb", "old_used_gb", "event_ts"} or None if no such pair exists (e.g. a
+    FLAGGED row that genuinely has no corresponding drop in history -- should not happen in
+    practice, but this function never guesses; the caller must treat None as 'cannot
+    recover automatically, needs manual investigation')."""
+    rows = list(conn.execute(
+        "SELECT captured_at, quota_gb, used_gb FROM snapshots WHERE vpsid=? ORDER BY captured_at",
+        (vpsid,)
+    ))
+    best = None
+    for i in range(1, len(rows)):
+        prev_ts, prev_q, prev_u = rows[i - 1]
+        curr_ts, curr_q, curr_u = rows[i]
+        if Decimal(curr_q) == Decimal(prev_q) and Decimal(curr_u) < Decimal(prev_u):
+            if curr_ts <= recorded_at:
+                best = (prev_q, prev_u, curr_ts)  # keep the LATEST qualifying pair <= recorded_at
+    if best is None:
+        return None
+    old_quota_gb, old_used_gb, event_ts = best
+    return {"old_quota_gb": Decimal(old_quota_gb), "old_used_gb": Decimal(old_used_gb),
+            "event_ts": event_ts}
+
+
+def backfill_renewal_baseline(conn: sqlite3.Connection, period_key: str,
+                                old_quota_gb, old_used_gb, event_ts: str) -> None:
+    """Writes a recovered baseline into an existing FLAGGED row -- NEVER touches
+    Virtualizor, NEVER writes to the `operations` table, only fills in local metadata this
+    project's own prior version failed to record. Once backfilled, the row becomes visible
+    to list_pending_renewals() and gets processed by the NEXT apply_due cycle through the
+    exact same fresh-recompute + pre/post-live-verification + exactly-once machinery as
+    any other renewal -- this function itself decides and applies nothing."""
+    conn.execute("BEGIN")
+    conn.execute(
+        "UPDATE renewal_checkpoints SET old_quota_gb=?, old_used_gb=?, event_ts=? WHERE period_key=?",
+        (str(old_quota_gb), str(old_used_gb), event_ts, period_key))
     conn.execute("COMMIT")
 
 
@@ -343,7 +477,9 @@ def detect_renewal_candidates(conn: sqlite3.Connection, node_id: str = None,
                 period_index = renewal_period_index(verified_epochs[p.vpsid], p.reset_after_ts)
                 _persist_granted_period(conn, p.renewal_period_key, p.vpsid,
                                          verified_epochs[p.vpsid], period_index, p.event_id,
-                                         "FLAGGED", utcnow_iso())
+                                         "FLAGGED", utcnow_iso(),
+                                         old_quota_gb=p.old_quota_gb, old_used_gb=p.old_used_gb,
+                                         event_ts=p.reset_after_ts)
         else:
             # Everything else -- unverified eligibility, duplicate renewal period, ambiguous
             # quota overlap, not-a-renewal, etc. -- is reported as FROZEN_FOR_REVIEW per the

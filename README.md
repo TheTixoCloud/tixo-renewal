@@ -9,10 +9,10 @@ them.
 ## One-command install (Ubuntu 24.04 + Virtualizor)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.11/deploy/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.12/deploy/bootstrap.sh | sudo bash
 ```
 
-This is pinned to the `v1.10.11` release tag (never a mutable branch), downloads the release
+This is pinned to the `v1.10.12` release tag (never a mutable branch), downloads the release
 tarball and its published `SHA256SUMS` from that *same* immutable release, verifies the
 checksum locally, then runs `install.sh`. When run from an interactive terminal (including a
 piped `curl | bash`, via `/dev/tty`), a successful install automatically opens the management

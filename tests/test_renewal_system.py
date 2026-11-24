@@ -1822,3 +1822,311 @@ def test_cmd_update_apply_noop_when_already_up_to_date_without_force(cli_env, mo
     assert called == []
     out = capsys.readouterr().out
     assert "nothing to do" in out
+
+
+def test_p0_incident_durable_backlog_recovers_a_delayed_authorization_renewal(cli_env, monkeypatch):
+    """Reproduces the exact real IR1 production incident (2026-11-24): three VPS had a
+    genuine reset correctly detected and flagged by the readiness notifier while
+    monthly_grant_gb was (temporarily) 0, but auto-renewal wasn't authorized until roughly
+    40 minutes later -- by then, many more 5-minute polls had already moved the live
+    2-snapshot window past the reset, and apply_due's own baseline detector could no
+    longer see it at all (0 attempted, forever, confirmed directly on IR1). The operator
+    also corrected monthly_grant_gb to 100 in that same window. Uses vpsid 62's REAL
+    recorded numbers (quota 3058 GB, used 2093.93 -> 0.18 GB) and the REAL expected
+    outcome (1065 GB -- the CURRENT policy's 100GB grant, never the stale 965 GB value
+    that was only correct at the moment of detection, under the since-corrected policy)."""
+    renewal_cli.cmd_install(argparse_namespace())
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+
+    policy_path = renewal_cli._policy_config_path()
+
+    def set_monthly_grant(value):
+        data = json.loads(open(policy_path).read())
+        data["global_defaults"]["monthly_grant_gb"] = value
+        open(policy_path, "w").write(json.dumps(data))
+
+    set_monthly_grant("0")  # matches policy.json's real content at detection time
+
+    import credentials as creds_mod
+    creds_mod.store_credentials(
+        creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, "test-node"),
+        "https://example.invalid", "k", "p")
+
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+
+    def poll_at(ts, used):
+        monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: ts.isoformat())
+        monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+            {"vpsid": 62, "created_epoch": created_epoch, "quota_gb": Decimal("3058"),
+             "used_gb": Decimal(str(used))}])
+        renewal_cli.cmd_dry_run(argparse_namespace())
+
+    # Pre-reset, then the real observed drop -- dry-run's own detect_renewal_candidates
+    # call fires right after ingesting the second poll, exactly like the real notifier did.
+    poll_at(datetime(2026, 10, 15, 9, 58, tzinfo=timezone.utc), "2093.93")
+    poll_at(datetime(2026, 10, 15, 10, 3, tzinfo=timezone.utc), "0.18")
+
+    db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT status, old_quota_gb, old_used_gb FROM renewal_checkpoints WHERE vpsid=62"
+    ).fetchone()
+    conn.close()
+    assert row is not None, "the renewal was never flagged/persisted at all"
+    assert row[0] == "FLAGGED"
+    assert row[1] == "3058" and row[2] == "2093.93"  # the durable baseline, correctly captured
+
+    # Many more ordinary polls pass (usage growing normally again) -- simulating the delay
+    # before authorization on IR1. By the end, the live 2-snapshot window no longer shows
+    # ANY drop for vpsid 62.
+    t = datetime(2026, 10, 15, 10, 3, tzinfo=timezone.utc)
+    used = Decimal("0.18")
+    for _ in range(10):
+        t += timedelta(minutes=5)
+        used += Decimal("0.8")
+        poll_at(t, str(used))
+
+    conn = sm.open_db(db_path)
+    assert renewal_cli._renewal_baseline_for_vpsid(conn, 62) is None, (
+        "the live baseline detector should no longer see the reset at all at this point "
+        "-- this IS the real bug; the durable backlog is what must recover it")
+    conn.close()
+
+    # Operator corrects the policy (0 -> 100), then authorizes automatic renewal -- matching
+    # the real IR1 timeline.
+    set_monthly_grant("100")
+    open(renewal_cli.WRITE_APPROVAL_MARKER, "w").write("approved")
+    data = json.loads(open(policy_path).read())
+    data["global_defaults"]["auto_renewal_enabled"] = True
+    open(policy_path, "w").write(json.dumps(data))
+
+    import writer as writer_mod, time as time_mod, local_source as ls
+    monkeypatch.setattr(writer_mod, "call_managevps_api", lambda *a, **k: {"raw": "ok"})
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    reads = iter([used, Decimal("1065"), Decimal("1065")])  # pre-write, post-write, confirm
+    monkeypatch.setattr(ls, "fetch_single_vps_quota", lambda vpsid: next(reads))
+
+    rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
+    assert rc == 0
+
+    conn = sqlite3.connect(db_path)
+    op = conn.execute(
+        "SELECT status, requested_new_quota_gb FROM operations WHERE vpsid=62").fetchone()
+    conn.close()
+    assert op is not None, (
+        "vpsid 62's durably-flagged renewal was never processed -- the exact IR1 bug")
+    assert op[0] == "APPLIED"
+    assert op[1] == "1065", (
+        f"must be 964.07 (remaining) + the CURRENT 100GB grant = 1065 -- never the stale "
+        f"965 that was only correct under the since-corrected 0GB grant (got {op[1]})")
+
+    # Exactly-once: the backlog entry is consumed, and a second apply-due run must never
+    # re-apply or duplicate anything.
+    conn = sm.open_db(db_path)
+    assert sm.list_pending_renewals(conn) == []
+    conn.close()
+    rc2 = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
+    assert rc2 == 0
+    conn = sqlite3.connect(db_path)
+    count = conn.execute("SELECT COUNT(*) FROM operations WHERE vpsid=62").fetchone()[0]
+    conn.close()
+    assert count == 1
+
+
+def test_pending_renewal_backlog_survives_a_fresh_process_restart(cli_env, monkeypatch):
+    """Durability requirement, explicit: a detected-but-unconsumed renewal must survive a
+    restart/upgrade -- not just stay in memory within one process. Closes the connection
+    entirely and opens a genuinely NEW one (same simulation every other durability test in
+    this project uses for 'as if the process restarted') to prove the backlog entry is
+    read back correctly from disk, not from any in-memory cache."""
+    renewal_cli.cmd_install(argparse_namespace())
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+
+    def poll_at(ts, used):
+        monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: ts.isoformat())
+        monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+            {"vpsid": 99, "created_epoch": created_epoch, "quota_gb": Decimal("1000"),
+             "used_gb": Decimal(str(used))}])
+        renewal_cli.cmd_dry_run(argparse_namespace())
+
+    poll_at(datetime(2026, 10, 15, 9, 58, tzinfo=timezone.utc), "900")
+    poll_at(datetime(2026, 10, 15, 10, 3, tzinfo=timezone.utc), "1")
+
+    db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
+    # Simulate a process restart: a genuinely new connection/open_db call, not the same
+    # Python object cmd_dry_run used above.
+    fresh_conn = sm.open_db(db_path)
+    pending = sm.list_pending_renewals(fresh_conn)
+    fresh_conn.close()
+    assert len(pending) == 1
+    assert pending[0]["vpsid"] == 99
+    assert pending[0]["old_quota_gb"] == Decimal("1000")
+    assert pending[0]["old_used_gb"] == Decimal("900")
+
+
+def test_apply_due_backlog_entry_excluded_by_policy_is_superseded_not_applied(cli_env, monkeypatch):
+    """Fail-closed requirement: if policy changes to EXCLUDE a VPS between detection and
+    the authorized apply cycle, the durable backlog must never blindly apply the old
+    proposal -- it must recompute fresh against current policy, see EXCLUDED, and mark the
+    entry superseded (never retried, never silently applied) rather than writing anything."""
+    renewal_cli.cmd_install(argparse_namespace())
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    import credentials as creds_mod
+    creds_mod.store_credentials(
+        creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, "test-node"),
+        "https://example.invalid", "k", "p")
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+
+    def poll_at(ts, used):
+        monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: ts.isoformat())
+        monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+            {"vpsid": 77, "created_epoch": created_epoch, "quota_gb": Decimal("1000"),
+             "used_gb": Decimal(str(used))}])
+        renewal_cli.cmd_dry_run(argparse_namespace())
+
+    poll_at(datetime(2026, 10, 15, 9, 58, tzinfo=timezone.utc), "900")
+    poll_at(datetime(2026, 10, 15, 10, 3, tzinfo=timezone.utc), "1")
+
+    policy_path = renewal_cli._policy_config_path()
+    data = json.loads(open(policy_path).read())
+    data["global_defaults"]["auto_renewal_enabled"] = True
+    data["vps_overrides"]["test-node:77"] = {"excluded": True}
+    open(policy_path, "w").write(json.dumps(data))
+    open(renewal_cli.WRITE_APPROVAL_MARKER, "w").write("approved")
+
+    db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
+    rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
+    assert rc == 0
+
+    conn = sqlite3.connect(db_path)
+    op = conn.execute("SELECT COUNT(*) FROM operations WHERE vpsid=77").fetchone()[0]
+    assert op == 0, "an excluded VPS must never receive a real write, even from the backlog"
+    conn.close()
+    conn = sm.open_db(db_path)
+    assert sm.list_pending_renewals(conn) == []  # removed from the backlog, never retried
+    status = conn.execute(
+        "SELECT status FROM renewal_checkpoints WHERE vpsid=77").fetchone()[0]
+    conn.close()
+    assert status == "SUPERSEDED_NOT_ELIGIBLE"
+
+
+def test_reconcile_stale_renewals_recovers_a_pre_fix_flagged_row_and_backfill_lets_apply_due_finish_it(
+        cli_env, monkeypatch, capsys):
+    """Reproduces the EXACT state the real IR1 database is actually in after upgrading:
+    renewal_checkpoints rows for vpsid 62/63/64 were flagged by code that predates the
+    durable-baseline columns entirely -- old_quota_gb/old_used_gb/event_ts are NULL, so
+    the (now-fixed) automatic backlog correctly has nothing to act on. This test inserts
+    exactly that pre-fix row shape directly (bypassing _persist_granted_period, which would
+    never produce a NULL-baseline row post-fix), confirms the dry-run report, then
+    confirms --backfill makes it real: visible to the backlog, and processed correctly
+    (including exactly-once) by the very next apply_due run."""
+    renewal_cli.cmd_install(argparse_namespace())
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    import credentials as creds_mod
+    creds_mod.store_credentials(
+        creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, "test-node"),
+        "https://example.invalid", "k", "p")
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+
+    def poll_at(ts, used):
+        monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: ts.isoformat())
+        monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+            {"vpsid": 62, "created_epoch": created_epoch, "quota_gb": Decimal("3058"),
+             "used_gb": Decimal(str(used))}])
+        renewal_cli.cmd_dry_run(argparse_namespace())
+
+    # Real IR1 drop, then enough ordinary growth that the live window loses it -- same
+    # setup as the main P0 test, but here simulating an install that was ALREADY on
+    # pre-fix code when the drop happened (hence no durable baseline was ever recorded).
+    poll_at(datetime(2026, 10, 15, 9, 58, tzinfo=timezone.utc), "2093.93")
+    poll_at(datetime(2026, 10, 15, 10, 3, tzinfo=timezone.utc), "0.18")
+    t = datetime(2026, 10, 15, 10, 3, tzinfo=timezone.utc)
+    used = Decimal("0.18")
+    for _ in range(5):
+        t += timedelta(minutes=5)
+        used += Decimal("0.8")
+        poll_at(t, str(used))
+
+    db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
+    # Simulate the pre-fix row shape: wipe the baseline this run's (already-fixed) code
+    # would have recorded, reproducing exactly what a REAL pre-upgrade database has.
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE renewal_checkpoints SET old_quota_gb=NULL, old_used_gb=NULL, event_ts=NULL "
+                 "WHERE vpsid=62")
+    conn.commit()
+    conn.close()
+
+    conn = sm.open_db(db_path)
+    assert sm.list_pending_renewals(conn) == []  # correctly invisible to the automatic backlog
+    conn.close()
+
+    # Dry-run (no --backfill): reports the recovery, changes nothing.
+    rc = renewal_cli.cmd_reconcile_stale_renewals(argparse_namespace(node="test-node", backfill=False))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "recovered old_quota_gb=3058 old_used_gb=2093.93" in out
+    assert "not written" in out
+    conn = sm.open_db(db_path)
+    assert sm.list_pending_renewals(conn) == []  # still untouched
+    conn.close()
+
+    # --backfill: now it's real.
+    renewal_cli.cmd_reconcile_stale_renewals(argparse_namespace(node="test-node", backfill=True))
+    conn = sm.open_db(db_path)
+    pending = sm.list_pending_renewals(conn)
+    conn.close()
+    assert len(pending) == 1
+    assert pending[0]["old_quota_gb"] == Decimal("3058")
+    assert pending[0]["old_used_gb"] == Decimal("2093.93")
+
+    # Policy correction + authorization (matching the real timeline), then the next
+    # apply_due run finishes the recovery, using the CURRENT policy, correctly.
+    policy_path = renewal_cli._policy_config_path()
+    data = json.loads(open(policy_path).read())
+    data["global_defaults"]["monthly_grant_gb"] = "100"
+    data["global_defaults"]["auto_renewal_enabled"] = True
+    open(policy_path, "w").write(json.dumps(data))
+    open(renewal_cli.WRITE_APPROVAL_MARKER, "w").write("approved")
+
+    import writer as writer_mod, time as time_mod, local_source as ls
+    monkeypatch.setattr(writer_mod, "call_managevps_api", lambda *a, **k: {"raw": "ok"})
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    reads = iter([used, Decimal("1065"), Decimal("1065")])
+    monkeypatch.setattr(ls, "fetch_single_vps_quota", lambda vpsid: next(reads))
+
+    rc = renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
+    assert rc == 0
+    conn = sqlite3.connect(db_path)
+    op = conn.execute("SELECT status, requested_new_quota_gb FROM operations WHERE vpsid=62").fetchone()
+    conn.close()
+    assert op == ("APPLIED", "1065")
+
+
+def test_status_distinguishes_ordinary_from_genuinely_ambiguous_frozen_entries(
+        cli_env, monkeypatch, capsys):
+    """Fixes a real reported confusion from the IR1 incident: `status` used to report
+    every FROZEN_FOR_REVIEW entry identically, including plain ordinary usage growth --
+    the single most common steady-state case, which `readiness` already correctly calls
+    MONITORING ('nothing to worry about'). An entirely healthy fleet showing N
+    'Frozen-for-review entries' looked indistinguishable from one with N real unresolved
+    problems. This VPS has ordinary growth (quota unchanged, usage only ever increased) --
+    must be reported as the ordinary case, with zero genuinely-ambiguous entries."""
+    renewal_cli.cmd_install(argparse_namespace())
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+
+    def poll_at(ts, used):
+        monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: ts.isoformat())
+        monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+            {"vpsid": 55, "created_epoch": created_epoch, "quota_gb": Decimal("1000"),
+             "used_gb": Decimal(str(used))}])
+        renewal_cli.cmd_dry_run(argparse_namespace())
+
+    poll_at(datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc), "10")
+    poll_at(datetime(2026, 11, 1, 0, 30, tzinfo=timezone.utc), "20")  # ordinary growth
+
+    capsys.readouterr()
+    renewal_cli.cmd_status(argparse_namespace())
+    out = capsys.readouterr().out
+    assert "1 total" in out
+    assert "1 ordinary/no-action-needed" in out
+    assert "0 genuinely ambiguous" in out
