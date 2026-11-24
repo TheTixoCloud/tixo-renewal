@@ -1008,6 +1008,212 @@ def cmd_install_health_check(args):
     return 0 if result["ok"] else 1
 
 
+# ---------- readiness / doctor / logs (v1.10.6: unified operational visibility) -----------------
+
+# A VPS whose only "problem" is still accumulating its first two observations is NOT a
+# financial-accounting concern -- it is normal, self-resolving first-run behavior (every
+# fresh install starts here; the next poll clears it automatically). Everything else
+# detect_renewal_candidates() can report IS a genuine thing an operator should look at
+# (identity conflict, a too-wide observation gap, or an actual candidate awaiting
+# confirmation). This mapping is the ONLY new classification logic here -- the underlying
+# per-VPS facts all come from the existing, already-tested shadow_monitor/engine state
+# machine, never reimplemented.
+READINESS_COLLECTING_BASELINE = "COLLECTING_BASELINE"
+READINESS_REVIEW_REQUIRED = "REVIEW_REQUIRED"
+READINESS_RENEWAL_CANDIDATE_PENDING = "RENEWAL_CANDIDATE_PENDING_REVIEW"
+READINESS_MANUAL_ONLY_UNLIMITED = "MANUAL_ONLY_UNLIMITED"
+READINESS_MONITORING = "MONITORING"
+
+
+def _per_vps_readiness(conn, node_id, policy_config) -> dict:
+    """Read-only. Returns {vpsid: readiness_bucket} for every vpsid this node has ever
+    recorded a snapshot for, by calling the existing, already-tested
+    shadow_monitor.detect_renewal_candidates() once and reconciling it against raw snapshot
+    counts -- never re-deriving the actual financial logic here."""
+    all_vpsids = [r[0] for r in conn.execute("SELECT DISTINCT vpsid FROM snapshots")]
+    detections = {d["vpsid"]: d for d in sm.detect_renewal_candidates(
+        conn, node_id=node_id, policy_config=policy_config)}
+    buckets = {}
+    for vpsid in all_vpsids:
+        count = conn.execute("SELECT COUNT(*) FROM snapshots WHERE vpsid=?", (vpsid,)).fetchone()[0]
+        d = detections.get(vpsid)
+        if d is None:
+            buckets[vpsid] = READINESS_MONITORING if count >= 2 else READINESS_COLLECTING_BASELINE
+        elif d["status"] == "MANUAL_ONLY_UNLIMITED":
+            buckets[vpsid] = READINESS_MANUAL_ONLY_UNLIMITED
+        elif d["status"] == "PLAUSIBLE_RESET_CANDIDATE_NEEDS_HUMAN_CONFIRMATION":
+            buckets[vpsid] = READINESS_RENEWAL_CANDIDATE_PENDING
+        elif "fewer than two observations" in d.get("reason", ""):
+            buckets[vpsid] = READINESS_COLLECTING_BASELINE
+        elif d.get("engine_kind") in ("NOT_A_RENEWAL", "DUPLICATE_RENEWAL_PERIOD"):
+            # NOT_A_RENEWAL: usage simply grew (or stayed flat) -- the single most common
+            # steady-state case in real production data, and not a financial-accounting
+            # concern. DUPLICATE_RENEWAL_PERIOD: the engine's own duplicate-renewal guard
+            # correctly rejected a second grant for an already-applied period -- this is the
+            # protection working exactly as intended, never something to flag for review.
+            buckets[vpsid] = READINESS_MONITORING
+        else:
+            # Covers UNVERIFIED_ELIGIBILITY (a genuinely reset-shaped pattern whose calendar
+            # eligibility could not be confirmed) and any identity-conflict/gap-detected
+            # case handled earlier in this same function's own direct checks -- these ARE
+            # worth a human glance, per the engine's own fail-closed design intent.
+            buckets[vpsid] = READINESS_REVIEW_REQUIRED
+    return buckets
+
+
+def cmd_readiness(args):
+    """Read-only operational-readiness summary, distinct from install-health-check's
+    service-level health: this answers 'is the financial engine actually ready to monitor/
+    renew correctly', not just 'did the files parse and are the timers running'. A node can
+    be perfectly healthy at the service level while every single VPS is still
+    COLLECTING_BASELINE (normal immediately after a fresh install) -- that must never be
+    confused with a service failure, and must never be silently hidden either."""
+    import installer as inst
+    overall = {"ok": True, "nodes": {}}
+
+    policy_config = None
+    if os.path.exists(_policy_config_path()):
+        try:
+            policy_config = pol.load_policy_config(_policy_config_path())
+        except pol.PolicyValidationError:
+            policy_config = None
+
+    write_approved = os.path.exists(WRITE_APPROVAL_MARKER)
+    auto_renewal_enabled = policy_config.global_defaults.auto_renewal_enabled if policy_config else False
+    overall["writer_approved"] = write_approved
+    overall["auto_renewal_enabled"] = auto_renewal_enabled
+    overall["legacy_bandwidth_automation"] = inst.detect_legacy_bandwidth_automation()
+
+    for node in nodes_mod.load_nodes(_node_config_path()):
+        db_path = node.db_path(STATE_DIR)
+        node_report = {"state": "INITIALIZING", "vps_total": 0, "buckets": {}, "vps": {}}
+        if os.path.exists(db_path):
+            conn = sm.open_db(db_path)
+            buckets = _per_vps_readiness(conn, node.node_id, policy_config)
+            conn.close()
+            node_report["vps"] = buckets
+            node_report["vps_total"] = len(buckets)
+            for bucket in buckets.values():
+                node_report["buckets"][bucket] = node_report["buckets"].get(bucket, 0) + 1
+            if not buckets:
+                node_report["state"] = "INITIALIZING"
+            elif node_report["buckets"].get(READINESS_REVIEW_REQUIRED, 0) > 0:
+                node_report["state"] = "REVIEW_REQUIRED"
+                overall["ok"] = False
+            elif node_report["buckets"].get(READINESS_COLLECTING_BASELINE, 0) > 0:
+                node_report["state"] = "COLLECTING_BASELINE"
+            else:
+                node_report["state"] = "MONITORING"
+        overall["nodes"][node.node_id] = node_report
+
+    print(json.dumps(overall, indent=2))
+    if not auto_renewal_enabled:
+        print("\nNOTE: auto_renewal_enabled is false -- no VPS above can be auto-renewed "
+              "regardless of its readiness bucket. This is the normal, safe default.")
+    elif not write_approved:
+        print("\nNOTE: auto_renewal_enabled is true but WRITE_APPROVED does not exist -- "
+              "the writer is still structurally blocked. Run 'enable-auto-renewal' to "
+              "grant both together, or this is an inconsistent state worth reviewing.")
+    return 0 if overall["ok"] else 1
+
+
+def cmd_doctor(args):
+    """Comprehensive, read-only self-diagnostic combining service health
+    (install-health-check), financial-engine readiness, legacy-automation conflicts,
+    credential presence, and backup freshness into ONE human-readable report -- the single
+    command an administrator should need to run before asking 'is something wrong', rather
+    than inspecting raw Python tracebacks, journalctl output, or multiple separate JSON
+    blobs by hand."""
+    import installer as inst
+    problems = []
+    notices = []
+
+    health = inst.health_check(CONFIG_DIR, STATE_DIR, check_systemd=True)
+    print("== Service health (install-health-check) ==")
+    print(f"  {'OK' if health['ok'] else 'PROBLEMS FOUND'}")
+    for p in health["problems"]:
+        print(f"  ! {p}")
+        problems.append(p)
+
+    legacy = health.get("legacy_bandwidth_automation", inst.detect_legacy_bandwidth_automation())
+    print("\n== Legacy bandwidth automation ==")
+    if legacy["found_active"] or legacy["found_disabled"]:
+        print(f"  Active:   {legacy['found_active']}")
+        print(f"  Disabled: {legacy['found_disabled']}")
+        if legacy["active_write_capable"]:
+            notices.append("an active, write-capable foreign bandwidth job is present -- "
+                            "enable-auto-renewal will refuse without an explicit override")
+    else:
+        print("  None detected.")
+
+    print("\n== Credentials ==")
+    try:
+        nodes = nodes_mod.load_nodes(_node_config_path())
+    except Exception as e:
+        nodes = []
+        problems.append(f"nodes.json did not load: {e}")
+    for node in nodes:
+        stored = os.path.exists(creds_mod.default_credentials_path(CONFIG_DIR, node.node_id))
+        print(f"  {node.node_id}: {'stored' if stored else 'NOT stored (store-credentials to enable unattended apply)'}")
+
+    print("\n== Backups ==")
+    try:
+        backups = backup_mod.list_backups(BACKUP_DIR)
+    except Exception:
+        backups = []
+    if backups:
+        print(f"  {len(backups)} backup(s) found, most recent: {sorted(backups)[-1]}")
+    else:
+        notices.append("no backups exist yet -- run 'backup' before enabling automatic renewal")
+        print("  None found.")
+
+    print("\n== Writer state ==")
+    write_approved = os.path.exists(WRITE_APPROVAL_MARKER)
+    print(f"  WRITE_APPROVED: {'present' if write_approved else 'absent (structurally blocked)'}")
+
+    print("\n== Summary ==")
+    if problems:
+        print(f"  {len(problems)} problem(s) require attention (see above).")
+    if notices:
+        print(f"  {len(notices)} notice(s):")
+        for n in notices:
+            print(f"    - {n}")
+    if not problems and not notices:
+        print("  Nothing to report.")
+    return 0 if not problems else 1
+
+
+def cmd_logs(args):
+    """Read-only: recent renewal operations (from the durable operations table -- real
+    attempts, never a guess) and the most recent backups, per node. Never prints credential
+    values; `api_response` is already redaction-safe at the point it was recorded (writer.py
+    sanitizes before ever calling record_operation_result)."""
+    limit = getattr(args, "limit", 20) or 20
+    for node in nodes_mod.load_nodes(_node_config_path()):
+        db_path = node.db_path(STATE_DIR)
+        print(f"=== {node.node_id} ===")
+        if not os.path.exists(db_path):
+            print("  No database yet.")
+            continue
+        conn = sm.open_db(db_path)
+        rows = conn.execute(
+            "SELECT created_at, vpsid, status, requested_new_quota_gb, verified_after_quota_gb "
+            "FROM operations ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        conn.close()
+        if not rows:
+            print("  No renewal operations recorded yet.")
+        for created_at, vpsid, status, requested, verified in rows:
+            print(f"  {created_at}  vpsid={vpsid}  {status}  requested={requested}  verified={verified}")
+    try:
+        backups = backup_mod.list_backups(BACKUP_DIR)
+    except Exception:
+        backups = []
+    print(f"\n=== Backups ({len(backups)}) ===")
+    for b in sorted(backups)[-limit:]:
+        print(f"  {b}")
+    return 0
+
+
 # ---------- automatic systemd activation of the READ-ONLY core timers (v1.10.3) ----------------
 
 def cmd_install_activate_core_timers(args):
@@ -2072,7 +2278,24 @@ def cmd_telegram_bot_run(args):
     return 0
 
 
+# Friendly public-CLI aliases (v1.10.6) -- rewritten to the real subcommand name BEFORE
+# argparse ever sees them, so there is exactly one implementation of each (never a
+# duplicated/divergent parser entry). `update` intentionally aliases to `update-apply`
+# (not `update-check`) because update-apply already requires --yes or an interactive
+# confirmation before doing anything -- `tixo-renewal update` run bare is exactly as safe
+# as running `update-apply` bare, it just checks first and still asks before applying.
+CLI_ALIASES = {"health-check": "install-health-check", "update": "update-apply"}
+
+
+def _apply_cli_aliases(argv):
+    if len(argv) > 1 and argv[1] in CLI_ALIASES:
+        argv = list(argv)
+        argv[1] = CLI_ALIASES[argv[1]]
+    return argv
+
+
 def main():
+    sys.argv = _apply_cli_aliases(sys.argv)
     ap = argparse.ArgumentParser(prog="renewal_cli.py")
     sub = ap.add_subparsers(dest="command", required=True)
 
@@ -2093,6 +2316,23 @@ def main():
 
     sub.add_parser("install-health-check", help="Read-only post-change sanity check"
                    ).set_defaults(func=cmd_install_health_check)
+
+    sub.add_parser(
+        "readiness",
+        help="Read-only: per-VPS operational-readiness summary (COLLECTING_BASELINE / "
+             "MONITORING / REVIEW_REQUIRED / etc.) -- distinct from install-health-check's "
+             "service-level health"
+    ).set_defaults(func=cmd_readiness)
+
+    sub.add_parser(
+        "doctor",
+        help="Read-only comprehensive self-diagnostic: service health, legacy-automation "
+             "conflicts, credentials, backups, writer state, all in one human-readable report"
+    ).set_defaults(func=cmd_doctor)
+
+    logs_p = sub.add_parser("logs", help="Read-only: recent renewal operations and backups")
+    logs_p.add_argument("--limit", type=int, default=20)
+    logs_p.set_defaults(func=cmd_logs)
 
     sub.add_parser(
         "install-activate-core-timers",

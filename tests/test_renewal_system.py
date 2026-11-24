@@ -610,6 +610,138 @@ def test_inventory_sync_exits_zero_when_credentials_not_yet_stored(cli_env, caps
     assert "NOT_CONFIGURED" in out
 
 
+def test_readiness_classifies_single_observation_as_collecting_baseline(cli_env, capsys):
+    """The real root cause behind a report of '57 VPS stuck in FROZEN_FOR_REVIEW' on a
+    freshly-installed production host: a VPS with only one recorded snapshot is NORMAL,
+    self-resolving first-run behavior (the next poll clears it), never a financial-
+    accounting anomaly -- readiness must label it COLLECTING_BASELINE, not a generic,
+    alarming-sounding status."""
+    renewal_cli.cmd_install(argparse_namespace())
+    capsys.readouterr()  # discard cmd_install's own print output
+    conn = sm.open_db(os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3"))
+    sm.ingest_poll(conn, [{"vpsid": 1, "created_epoch": 1700000000,
+                            "quota_gb": Decimal("100"), "used_gb": Decimal("10")}],
+                    sm.utcnow_iso())
+    conn.close()
+    rc = renewal_cli.cmd_readiness(argparse_namespace())
+    out, _ = json.JSONDecoder().raw_decode(capsys.readouterr().out)
+    assert out["nodes"]["test-node"]["state"] == "COLLECTING_BASELINE"
+    assert out["nodes"]["test-node"]["vps"]["1"] == "COLLECTING_BASELINE"
+    assert rc == 0  # collecting baseline is a normal state, never a failure exit
+
+
+def test_readiness_classifies_steady_state_vps_as_monitoring(cli_env, capsys):
+    """A VPS with two or more observations, no conflicts, not unlimited, and no anomalous
+    pattern (usage simply grew, the normal case) must be reported as MONITORING -- not
+    silently omitted, and never confused with COLLECTING_BASELINE or REVIEW_REQUIRED."""
+    renewal_cli.cmd_install(argparse_namespace())
+    capsys.readouterr()  # discard cmd_install's own print output
+    conn = sm.open_db(os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3"))
+    sm.ingest_poll(conn, [{"vpsid": 1, "created_epoch": 1700000000,
+                            "quota_gb": Decimal("100"), "used_gb": Decimal("10")}],
+                    "2026-11-01T00:00:00+00:00")
+    sm.ingest_poll(conn, [{"vpsid": 1, "created_epoch": 1700000000,
+                            "quota_gb": Decimal("100"), "used_gb": Decimal("20")}],
+                    "2026-11-01T00:05:00+00:00")
+    conn.close()
+    renewal_cli.cmd_readiness(argparse_namespace())
+    out, _ = json.JSONDecoder().raw_decode(capsys.readouterr().out)
+    assert out["nodes"]["test-node"]["vps"]["1"] == "MONITORING"
+    assert out["nodes"]["test-node"]["state"] == "MONITORING"
+
+
+def test_readiness_classifies_unlimited_vps_as_manual_only(cli_env, capsys):
+    renewal_cli.cmd_install(argparse_namespace())
+    capsys.readouterr()  # discard cmd_install's own print output
+    conn = sm.open_db(os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3"))
+    sm.ingest_poll(conn, [{"vpsid": 1, "created_epoch": 1700000000,
+                            "quota_gb": Decimal("0"), "used_gb": Decimal("500")}],
+                    "2026-11-01T00:00:00+00:00")
+    sm.ingest_poll(conn, [{"vpsid": 1, "created_epoch": 1700000000,
+                            "quota_gb": Decimal("0"), "used_gb": Decimal("600")}],
+                    "2026-11-01T00:05:00+00:00")
+    conn.close()
+    renewal_cli.cmd_readiness(argparse_namespace())
+    out, _ = json.JSONDecoder().raw_decode(capsys.readouterr().out)
+    assert out["nodes"]["test-node"]["vps"]["1"] == "MANUAL_ONLY_UNLIMITED"
+    # Permanently excluded by design -- never counted as something needing review.
+    assert out["nodes"]["test-node"]["state"] != "REVIEW_REQUIRED"
+
+
+def test_readiness_reports_review_required_for_identity_conflict(cli_env, capsys):
+    renewal_cli.cmd_install(argparse_namespace())
+    capsys.readouterr()  # discard cmd_install's own print output
+    conn = sm.open_db(os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3"))
+    sm.ingest_poll(conn, [{"vpsid": 1, "created_epoch": 1700000000,
+                            "quota_gb": Decimal("100"), "used_gb": Decimal("10")}],
+                    "2026-11-01T00:00:00+00:00")
+    # A second poll reporting a DIFFERENT created_epoch for the same vpsid -- a genuine
+    # identity conflict, which ingest_poll records rather than silently overwriting.
+    sm.ingest_poll(conn, [{"vpsid": 1, "created_epoch": 1700000099,
+                            "quota_gb": Decimal("100"), "used_gb": Decimal("20")}],
+                    "2026-11-01T00:05:00+00:00")
+    conn.close()
+    rc = renewal_cli.cmd_readiness(argparse_namespace())
+    out, _ = json.JSONDecoder().raw_decode(capsys.readouterr().out)
+    assert out["nodes"]["test-node"]["vps"]["1"] == "REVIEW_REQUIRED"
+    assert out["nodes"]["test-node"]["state"] == "REVIEW_REQUIRED"
+    assert rc == 1  # a genuine review case IS a nonzero exit, unlike baseline collection
+
+
+def test_doctor_runs_clean_on_a_fresh_install_with_no_backups_yet(cli_env, capsys):
+    """doctor must never crash on a freshly-installed system with no backups, no stored
+    credentials, and no legacy automation -- it should report those as clear notices, not
+    errors, and still exit 0 if there are no actual PROBLEMS (as opposed to notices)."""
+    renewal_cli.cmd_install(argparse_namespace())
+    rc = renewal_cli.cmd_doctor(argparse_namespace())
+    out = capsys.readouterr().out
+    assert "Service health" in out
+    assert "Writer state" in out
+    assert "WRITE_APPROVED: absent" in out
+
+
+def test_logs_runs_clean_on_fresh_install_with_no_operations_yet(cli_env, capsys):
+    renewal_cli.cmd_install(argparse_namespace())
+    rc = renewal_cli.cmd_logs(argparse_namespace(limit=20))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "No database yet." in out or "No renewal operations recorded yet." in out
+
+
+def test_logs_reports_real_recorded_operations(cli_env, capsys):
+    renewal_cli.cmd_install(argparse_namespace())
+    import writer as writer_mod
+    marker = renewal_cli.WRITE_APPROVAL_MARKER
+    os.makedirs(os.path.dirname(marker), exist_ok=True)
+    open(marker, "w").close()
+    conn = sm.open_db(os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3"))
+    writer_mod.apply_renewal(
+        conn, "test-node", 7, "7|p|1", Decimal("100"),
+        writer_mod.ApiCredentials(base_url="https://example.invalid", api_key="k", api_pass="p"),
+        marker, confirm=True, read_live_quota_fn=lambda v: Decimal("100"),
+        http_post=lambda *a, **k: '{"done":1}')
+    conn.close()
+    renewal_cli.cmd_logs(argparse_namespace(limit=20))
+    out = capsys.readouterr().out
+    assert "vpsid=7" in out
+    assert "APPLIED" in out
+
+
+def test_cli_alias_health_check_resolves_to_install_health_check():
+    assert renewal_cli._apply_cli_aliases(
+        ["renewal_cli.py", "health-check"]) == ["renewal_cli.py", "install-health-check"]
+
+
+def test_cli_alias_update_resolves_to_update_apply():
+    assert renewal_cli._apply_cli_aliases(
+        ["renewal_cli.py", "update", "--yes"]) == ["renewal_cli.py", "update-apply", "--yes"]
+
+
+def test_cli_alias_leaves_real_subcommands_untouched():
+    assert renewal_cli._apply_cli_aliases(
+        ["renewal_cli.py", "status"]) == ["renewal_cli.py", "status"]
+
+
 def test_apply_due_blocked_without_write_approval(cli_env):
     """Exit code 3 (not 1), deliberately: this is a by-design safety refusal, not a crash --
     see RENEWAL_SERVICE_UNIT_TEMPLATE's SuccessExitStatus=3 and cmd_apply_due's docstring."""

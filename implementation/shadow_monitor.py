@@ -347,10 +347,19 @@ def detect_renewal_candidates(conn: sqlite3.Connection, node_id: str = None,
         else:
             # Everything else -- unverified eligibility, duplicate renewal period, ambiguous
             # quota overlap, not-a-renewal, etc. -- is reported as FROZEN_FOR_REVIEW per the
-            # explicit task requirement. Never silently dropped.
+            # explicit task requirement. Never silently dropped. `engine_kind` (p.kind,
+            # added v1.10.6) exposes the real underlying Proposal.kind -- e.g. NOT_A_RENEWAL
+            # (usage simply grew; this is the single most common steady-state case and is
+            # NOT a financial-accounting concern) vs. UNVERIFIED_ELIGIBILITY (a genuinely
+            # reset-shaped pattern whose calendar eligibility could not be confirmed, which
+            # the engine deliberately keeps ambiguous rather than guessing) -- so a caller
+            # building a higher-level operational-readiness view (renewal_cli.cmd_readiness)
+            # can tell "nothing happened, don't worry" apart from "something worth a human
+            # glance" without re-deriving this engine's own classification logic.
             results.append({
                 "vpsid": p.vpsid, "status": "FROZEN_FOR_REVIEW",
                 "reason": p.reasons[0] if p.reasons else p.status, "engine_status": p.status,
+                "engine_kind": p.kind,
             })
 
     return results

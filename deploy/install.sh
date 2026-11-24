@@ -161,16 +161,36 @@ else
   echo "  sudo renewal_cli.py install-activate-core-timers"
 fi
 
-# Global `tixo-renewal` command -> launches the interactive management menu. Only attempted
-# if /usr/local/bin is writable (root, or a writable custom prefix); never fatal if not --
-# the operator can always run menu.py directly.
+# Global `tixo-renewal` command -> ONE unified entry point (v1.10.6+):
+#   - no arguments:  launches the interactive management menu (unchanged behavior)
+#   - any arguments: dispatched to renewal_cli.py's real scriptable subcommands, with
+#     PYTHONPATH/TIXO_RENEWAL_INSTALL_DIR already correctly set -- this is what makes
+#     `tixo-renewal status`/`tixo-renewal install-health-check`/`tixo-renewal backup`/etc.
+#     work as genuine global commands, instead of requiring the operator to manually
+#     export PYTHONPATH and invoke renewal_cli.py by its full path (a real, reported gap:
+#     every piece of this project's own documentation told operators to run
+#     `renewal_cli.py <command>` as if it were already a global command, when no such
+#     global binary existed at all before this fix).
+# Only attempted if /usr/local/bin is writable (root, or a writable custom prefix); never
+# fatal if not -- the operator can always run menu.py/renewal_cli.py directly.
 WRAPPER_PATH="/usr/local/bin/tixo-renewal"
 if [ -w "$(dirname "$WRAPPER_PATH")" ] || [ "$(id -u)" -eq 0 ]; then
   cat > "$WRAPPER_PATH" <<WRAPPER_EOF
 #!/bin/bash
 export TIXO_RENEWAL_INSTALL_DIR="$INSTALL_DIR"
 export PYTHONPATH="$INSTALL_DIR/lib:$INSTALL_DIR/bin"
-exec "$PYTHON_BIN" "$INSTALL_DIR/lib/menu.py" "\$@"
+# menu.py itself already handles --status/--version/--cli as special noninteractive flags
+# (documented, pre-existing, tested) -- those three, and the no-argument case, still go to
+# menu.py. Any OTHER argument is a real renewal_cli.py subcommand name (status, backup,
+# install-health-check, readiness, doctor, logs, enable-auto-renewal, ...).
+case "\${1:-}" in
+  ""|"--status"|"--version"|"--cli")
+    exec "$PYTHON_BIN" "$INSTALL_DIR/lib/menu.py" "\$@"
+    ;;
+  *)
+    exec "$PYTHON_BIN" "$INSTALL_DIR/bin/renewal_cli.py" "\$@"
+    ;;
+esac
 WRAPPER_EOF
   chmod +x "$WRAPPER_PATH"
   echo "Installed global command: $WRAPPER_PATH"

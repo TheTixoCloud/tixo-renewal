@@ -892,6 +892,63 @@ def _install_real_package(tmp_path):
     return str(install_dir)
 
 
+def test_global_wrapper_dispatches_subcommands_to_renewal_cli(tmp_path):
+    """Real, reported bug: every piece of this project's own documentation told operators
+    to run `renewal_cli.py <command>` as if it were a global command, but the installed
+    global `tixo-renewal` wrapper only ever launched the interactive menu -- any other
+    command genuinely failed with 'command not found' on a real production host. This
+    tests the REAL installed wrapper script (not a simulation of its logic) against
+    several real subcommands, including the brand-new readiness/doctor/logs and the
+    health-check/update friendly aliases."""
+    install_dir = _install_real_package(tmp_path)
+    wrapper = "/usr/local/bin/tixo-renewal"
+    assert os.path.exists(wrapper), "global wrapper was not installed (this sandbox runs as root)"
+
+    def run_wrapper(*args):
+        return subprocess.run([wrapper, *args], capture_output=True, text=True, timeout=30)
+
+    r = run_wrapper("status")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    # rc may be 1 here (core timers were never activated in this test install -- that's
+    # correctly reported as unhealthy, see test_install_activate_core_timers_real_systemd_
+    # round_trip for the activated-and-healthy case) -- what this test actually proves is
+    # that the wrapper dispatched to renewal_cli.py and got a real JSON report back at all.
+    r = run_wrapper("install-health-check")
+    assert '"ok"' in r.stdout, r.stdout + r.stderr
+
+    r = run_wrapper("health-check")  # friendly alias for install-health-check
+    assert '"ok"' in r.stdout, r.stdout + r.stderr
+
+    r = run_wrapper("readiness")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert '"nodes"' in r.stdout
+
+    r = run_wrapper("doctor")  # rc may be 1 for the same reason as install-health-check above
+    assert "Service health" in r.stdout, r.stdout + r.stderr
+
+    r = run_wrapper("logs")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    r = run_wrapper("backup")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_global_wrapper_still_routes_menu_flags_to_menu_py(tmp_path):
+    """--status/--version/--cli are pre-existing, documented menu.py flags -- the dispatch
+    fix must not break them by accidentally routing them to renewal_cli.py's argparse
+    (which would reject them outright, since they look like options, not subcommands)."""
+    install_dir = _install_real_package(tmp_path)
+    wrapper = "/usr/local/bin/tixo-renewal"
+
+    r = subprocess.run([wrapper, "--status"], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    r = subprocess.run([wrapper, "--version"], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert r.stdout.strip()  # prints the version number
+
+
 def _cli_env(install_dir):
     env = dict(os.environ)
     env["TIXO_RENEWAL_INSTALL_DIR"] = install_dir
