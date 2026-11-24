@@ -1065,6 +1065,75 @@ def test_retry_deferred_renewal_requires_write_approved(conn, tmp_path):
                                   read_live_quota_fn=lambda v: pytest.fail("unreachable"))
 
 
+def test_concurrent_retry_deferred_renewal_claim_is_atomic(tmp_path):
+    """Same class of real duplicate-renewal bug as apply_renewal's claim race (see
+    test_concurrent_claim_race_is_blocked_by_the_database_itself), but for the retry path:
+    find_deferred_operation_for_vpsid() is a plain SELECT, so two genuinely concurrent
+    processes could both see the same DEFERRED_LOCKED row and both proceed to retry it,
+    each independently calling the live Virtualizor API for the SAME operation. The fix
+    makes the claim an atomic `UPDATE ... WHERE status='DEFERRED_LOCKED'` that also flips
+    status away from DEFERRED_LOCKED -- only one of two racing UPDATEs can ever match, which
+    this test proves directly by running the exact claim UPDATE from two connections to the
+    SAME database file, both having already observed the row as DEFERRED_LOCKED (the real
+    race window -- a SEQUENTIAL pair of full retry_deferred_renewal() calls would not
+    exercise this at all, since the second call's own fresh SELECT would correctly see the
+    first call's already-changed status and cleanly return NO_DEFERRED_OPERATION instead)."""
+    db_path = str(tmp_path / "ops.sqlite3")
+    marker = approved_marker(tmp_path)
+
+    conn_a = sqlite3.connect(db_path)
+    w.ensure_operations_schema(conn_a)
+    w.apply_renewal(conn_a, "self", 55, "55|period|1", Decimal("500"), CREDS, marker, confirm=True,
+                     read_live_quota_fn=lambda v: Decimal("100"),
+                     http_post=lambda *a, **k: '{"done": 0, "error": "backup in progress"}',
+                     write_cooldown_seconds=0)
+    conn_b = sqlite3.connect(db_path)
+
+    # Both "processes" observe the same deferred row, correctly, before either claims it.
+    row_a = w.find_deferred_operation_for_vpsid(conn_a, "self", 55)
+    row_b = w.find_deferred_operation_for_vpsid(conn_b, "self", 55)
+    assert row_a is not None and row_b is not None
+    operation_id = row_a[0]
+
+    claim_sql = ("UPDATE operations SET retry_count = retry_count + 1, updated_at = ?, "
+                 "status = 'IN_PROGRESS' WHERE operation_id = ? AND status = 'DEFERRED_LOCKED'")
+    conn_a.execute("BEGIN")
+    cur_a = conn_a.execute(claim_sql, ("2026-11-24T00:00:00+00:00", operation_id))
+    conn_a.execute("COMMIT")
+    assert cur_a.rowcount == 1  # process A wins the claim
+
+    conn_b.execute("BEGIN")
+    cur_b = conn_b.execute(claim_sql, ("2026-11-24T00:00:01+00:00", operation_id))
+    conn_b.execute("COMMIT")
+    assert cur_b.rowcount == 0  # process B's identical claim attempt matches nothing -- it lost
+
+    conn_a.close()
+    conn_b.close()
+
+
+def test_retry_deferred_renewal_sequential_second_call_is_a_clean_no_op(conn, tmp_path):
+    """Integration-level companion to the atomic-claim proof above: calling
+    retry_deferred_renewal() a second time (sequentially, e.g. a restarted process or the
+    timer firing again) after the first call already resolved the deferred operation must
+    never call the live API again and must never raise -- it cleanly reports
+    NO_DEFERRED_OPERATION since the row is no longer in DEFERRED_LOCKED status."""
+    marker = approved_marker(tmp_path)
+    w.apply_renewal(conn, "self", 55, "55|period|1", Decimal("500"), CREDS, marker, confirm=True,
+                     read_live_quota_fn=lambda v: Decimal("100"),
+                     http_post=lambda *a, **k: '{"done": 0, "error": "backup in progress"}',
+                     write_cooldown_seconds=0)
+    reads = iter([Decimal("100"), Decimal("500"), Decimal("500")])
+    first = w.retry_deferred_renewal(conn, "self", 55, CREDS, marker,
+                                      read_live_quota_fn=lambda v: next(reads),
+                                      http_post=lambda *a, **k: '{"done":1}', sleep_fn=lambda s: None)
+    assert first["status"] == "APPLIED"
+
+    second = w.retry_deferred_renewal(
+        conn, "self", 55, CREDS, marker, read_live_quota_fn=lambda v: Decimal("500"),
+        http_post=lambda *a, **k: pytest.fail("must never call the API again for a resolved operation"))
+    assert second == {"status": "NO_DEFERRED_OPERATION"}
+
+
 def test_ensure_operations_schema_migration_is_idempotent(conn):
     """The ALTER TABLE ADD COLUMN migration must be safe to run on a brand-new table too
     (cli_env fixture already called it once via the conn fixture) and safe to call again."""

@@ -753,10 +753,34 @@ def retry_deferred_renewal(conn, node_id: str, vpsid: int, creds: ApiCredentials
         return {"status": "DEFERRED_EXPIRED_NEEDS_REVIEW", "operation_id": operation_id,
                 "period_key": period_key, "age_hours": age_hours}
 
+    # Same class of race as apply_renewal's claim step (see ensure_operations_schema's
+    # UNIQUE-index comment): find_deferred_operation_for_vpsid() above is a plain SELECT,
+    # so two genuinely concurrent processes could both see the SAME DEFERRED_LOCKED row and
+    # both proceed to retry it, both calling the live API for the same operation. The
+    # UPDATE's own WHERE clause is the atomic claim here (there is no separate row to
+    # insert, unlike apply_renewal, since this reuses an existing operation_id) -- it only
+    # succeeds, and only this process proceeds, if the row is STILL in DEFERRED_LOCKED
+    # status at the moment this UPDATE actually runs; SQLite serializes concurrent writers
+    # to the same row, so exactly one of two racing UPDATEs can match this WHERE clause
+    # before the other process's own prior UPDATE (if it reached here first) already moved
+    # the status away from DEFERRED_LOCKED.
+    # The status flip to 'IN_PROGRESS' (not just the retry_count bump) is what actually
+    # closes the race: it is what makes a second, concurrent UPDATE's own
+    # `WHERE status='DEFERRED_LOCKED'` fail to match once this one has committed. Without
+    # changing status here, status would still read 'DEFERRED_LOCKED' afterward (it is not
+    # otherwise touched until _execute_write_and_verify's eventual record_operation_result
+    # call), and a second racing UPDATE's WHERE clause would still match -- not a real fix.
     conn.execute("BEGIN")
-    conn.execute("UPDATE operations SET retry_count = retry_count + 1, updated_at = ? "
-                 "WHERE operation_id = ?", (now_fn().isoformat(), operation_id))
+    cur = conn.execute(
+        "UPDATE operations SET retry_count = retry_count + 1, updated_at = ?, status = 'IN_PROGRESS' "
+        "WHERE operation_id = ? AND status = 'DEFERRED_LOCKED'",
+        (now_fn().isoformat(), operation_id))
+    claimed = cur.rowcount == 1
     conn.execute("COMMIT")
+    if not claimed:
+        return {"status": "BLOCKED_UNRESOLVED_PRIOR_OPERATION", "operation_id": operation_id,
+                "period_key": period_key,
+                "detail": "lost a concurrent race to retry this deferred operation"}
 
     new_quota_gb = policy_mod.round_quota_for_virtualizor(Decimal(requested_quota_str))
     result = _execute_write_and_verify(conn, operation_id, vpsid, new_quota_gb, creds, http_post,
