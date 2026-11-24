@@ -1644,6 +1644,93 @@ def test_update_apply_regenerates_a_stale_global_wrapper(cli_env, monkeypatch, t
         "newly-downloaded release's code")
 
 
+# IMPORTANT CAVEAT, found the hard way (a real IR1 v1.10.6 -> v1.10.8 upgrade): the test
+# above proves updater.py's subprocess-based install step works correctly WHEN THE CODE
+# PERFORMING THE UPGRADE ALREADY CONTAINS THAT FIX. It can NEVER prove anything about an
+# upgrade FROM an older release, because `cli_env`/`renewal_cli.cmd_update_apply` here is
+# always running CURRENT code -- there is no genuine "old updater.py, as actually shipped
+# in an older release, executing this exact upgrade" represented by any same-process test,
+# no matter how realistic the fake downloaded package is. A real v1.10.6 install upgrading
+# to v1.10.8 runs v1.10.6's OWN updater.py in-process -- code which has no idea the new
+# release's updater.py was ever changed. Any fix placed inside updater.py/installer.py can
+# only help the upgrade AFTER the one that installs it. See
+# test_menu_self_heals_an_arbitrarily_stale_wrapper_regardless_of_which_updater_ran below
+# for the fix that actually closes this gap, and _self_heal_global_wrapper's docstring in
+# menu.py for why it has to live there instead.
+
+
+def test_menu_self_heals_an_arbitrarily_stale_wrapper_regardless_of_which_updater_ran(
+        cli_env, monkeypatch, tmp_path, capsys):
+    """The REAL fix for the confirmed IR1 production failure (v1.10.6 -> v1.10.8 completed,
+    VERSION correctly read 1.10.8, but `tixo-renewal doctor` still opened the interactive
+    menu): no fix inside updater.py/installer.py can ever repair THIS upgrade, because the
+    upgrade is driven by the OLD, already-running updater code, which has no way to know
+    about a fix that only exists in the release it is in the middle of downloading (the
+    bootstrap problem -- see the caveat above). What DOES reliably change on every single
+    upgrade, regardless of which version's (possibly completely broken) updater performed
+    it, is that lib/+bin/ get wholesale file-swapped to the new release's code -- that part
+    has never been broken; VERSION always ends up correct. So menu.py -- the file an
+    arbitrarily stale wrapper ALWAYS unconditionally execs for every argument -- is always
+    current code the instant it runs, no matter how old or broken the wrapper or the
+    updater that produced the current install state was. This test proves the fix by NEVER
+    invoking update-apply at all: it hand-constructs the exact broken state (a wrapper that
+    unconditionally execs menu.py, with zero dispatch logic -- this project's literal
+    original, pre-v1.10.7 form) and confirms that simply running ANY command through it
+    now (a) reaches the real subcommand instead of the interactive menu, and (b) self-heals
+    the wrapper on disk for every subsequent invocation -- using nothing but the CURRENT
+    menu.py, exactly as it would exist on disk after ANY successful upgrade no matter how
+    defective that upgrade's own updater code was."""
+    import subprocess
+    renewal_cli.cmd_install(argparse_namespace())
+
+    # cli_env only patches config/state dirs onto WORKSPACE_ROOT, not a full lib/+bin/
+    # package layout -- a real wrapper's exec target needs those to genuinely exist, exactly
+    # like a real install.sh-produced layout, so mirror that here.
+    shutil.copytree(IMPLEMENTATION_DIR, os.path.join(renewal_cli.WORKSPACE_ROOT, "lib"))
+    os.makedirs(os.path.join(renewal_cli.WORKSPACE_ROOT, "bin"), exist_ok=True)
+    shutil.copy2(os.path.join(IMPLEMENTATION_DIR, "renewal_cli.py"),
+                 os.path.join(renewal_cli.WORKSPACE_ROOT, "bin", "renewal_cli.py"))
+
+    disposable_wrapper = str(tmp_path / "fake-usr-local-bin" / "tixo-renewal")
+    os.makedirs(os.path.dirname(disposable_wrapper))
+    # This project's literal original wrapper form, before v1.10.7 ever introduced dispatch
+    # logic -- confirmed via read-only SSH inspection to be EXACTLY what was still on IR1's
+    # disk after a real, successful v1.10.6 -> v1.10.8 upgrade.
+    stale_content = (
+        "#!/bin/bash\n"
+        f'export TIXO_RENEWAL_INSTALL_DIR="{renewal_cli.WORKSPACE_ROOT}"\n'
+        f'export PYTHONPATH="{renewal_cli.WORKSPACE_ROOT}/lib:{renewal_cli.WORKSPACE_ROOT}/bin"\n'
+        f'exec "{sys.executable}" "{renewal_cli.WORKSPACE_ROOT}/lib/menu.py" "$@"\n'
+    )
+    Path(disposable_wrapper).write_text(stale_content)
+    os.chmod(disposable_wrapper, 0o755)
+
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_WRAPPER_PATH"] = disposable_wrapper
+    # TIXO_RENEWAL_INSTALL_DIR is already baked into the stale wrapper's own `export` line
+    # above -- exactly like the real one on IR1 -- so it does not need to be in env here.
+
+    proc = subprocess.run(["bash", disposable_wrapper, "install-detect"],
+                           capture_output=True, text=True, timeout=15, env=env,
+                           stdin=subprocess.DEVNULL)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # The decisive check: a BROKEN dispatch (the actual IR1 symptom) would have opened the
+    # interactive menu instead -- which, with no tty, prints the noninteractive fallback
+    # message instead of JSON. A real fix must produce the actual install-detect JSON.
+    parsed = json.loads(proc.stdout)
+    assert "existing" in parsed, (
+        "install-detect's real JSON output was not produced -- the stale wrapper almost "
+        "certainly opened the interactive menu instead of dispatching, exactly the "
+        "confirmed IR1 production symptom: " + proc.stdout + proc.stderr)
+
+    # Self-healing: after that ONE invocation, the wrapper itself must now be fixed, so
+    # every subsequent command (including ones menu.py does NOT special-case) dispatches
+    # correctly without needing any further operator action.
+    healed = Path(disposable_wrapper).read_text()
+    assert healed != stale_content, "wrapper was not self-healed by menu.py"
+    assert "case" in healed and '"${1:-}"' in healed
+
+
 def test_cmd_update_apply_refuses_without_yes_or_confirmation(cli_env, monkeypatch, capsys):
     import updater
 

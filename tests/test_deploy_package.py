@@ -91,11 +91,24 @@ def test_built_package_cli_end_to_end_staging_run(tmp_path):
     with tarfile.open(pkg) as tf:
         tf.extractall(extract_dir, filter="data")
 
+    # Mirrors the REAL install.sh layout: code (lib/+bin/) and data (config/state) live
+    # together under ONE install_dir -- install.sh's own `cp -f "$SCRIPT_DIR"/lib/*.py
+    # "$INSTALL_DIR/lib/"` (+ bin/) does this before ever invoking `renewal_cli.py install`.
+    # A prior version of this test ran renewal_cli.py straight out of extract_dir with
+    # TIXO_RENEWAL_INSTALL_DIR pointed at a SEPARATE, code-less directory -- a layout real
+    # production never produces, and one the global wrapper (which assumes install_dir/lib
+    # + install_dir/bin exist, exactly like install.sh's own layout) can never work with.
+    # That mismatch went unnoticed because nothing actually verified the wrapper worked;
+    # installer.verify_wrapper_dispatch() (v1.10.9) now does, and correctly flagged it.
     install_dir = tmp_path / "staging-install"
-    cli_path = str(extract_dir / "bin" / "renewal_cli.py")
+    shutil.copytree(extract_dir / "lib", install_dir / "lib")
+    shutil.copytree(extract_dir / "bin", install_dir / "bin")
+    cli_path = str(install_dir / "bin" / "renewal_cli.py")
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(extract_dir / "lib")
+    env["PYTHONPATH"] = str(install_dir / "lib") + ":" + str(install_dir / "bin")
     env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
+    env["TIXO_RENEWAL_WRAPPER_PATH"] = str(tmp_path / "fake-usr-local-bin" / "tixo-renewal")
+    os.makedirs(tmp_path / "fake-usr-local-bin", exist_ok=True)
 
     def run(*args):
         return subprocess.run([sys.executable, cli_path, *args], capture_output=True,
@@ -355,12 +368,19 @@ def test_built_package_web_control_center_real_http_staging_acceptance(tmp_path)
     with tarfile.open(pkg) as tf:
         tf.extractall(extract_dir, filter="data")
 
+    # Mirrors install.sh's real layout (code + data under one install_dir) -- see
+    # test_built_package_cli_end_to_end_staging_run's comment for why this matters: a
+    # code/data split is a layout the global wrapper can never dispatch correctly from.
     install_dir = tmp_path / "staging-install"
+    shutil.copytree(extract_dir / "lib", install_dir / "lib")
+    shutil.copytree(extract_dir / "bin", install_dir / "bin")
     config_dir = str(install_dir / "renewal-config")
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(extract_dir / "lib")
+    env["PYTHONPATH"] = str(install_dir / "lib") + ":" + str(install_dir / "bin")
     env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
-    cli_path = str(extract_dir / "bin" / "renewal_cli.py")
+    env["TIXO_RENEWAL_WRAPPER_PATH"] = str(tmp_path / "fake-usr-local-bin" / "tixo-renewal")
+    os.makedirs(tmp_path / "fake-usr-local-bin", exist_ok=True)
+    cli_path = str(install_dir / "bin" / "renewal_cli.py")
 
     r = subprocess.run([sys.executable, cli_path, "install"], capture_output=True,
                         text=True, timeout=30, env=env)
@@ -466,10 +486,14 @@ def test_built_package_optional_module_cli_registration_and_safe_defaults(tmp_pa
         tf.extractall(extract_dir, filter="data")
 
     install_dir = tmp_path / "staging-install"
+    shutil.copytree(extract_dir / "lib", install_dir / "lib")
+    shutil.copytree(extract_dir / "bin", install_dir / "bin")
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(extract_dir / "lib")
+    env["PYTHONPATH"] = str(install_dir / "lib") + ":" + str(install_dir / "bin")
     env["TIXO_RENEWAL_INSTALL_DIR"] = str(install_dir)
-    cli_path = str(extract_dir / "bin" / "renewal_cli.py")
+    env["TIXO_RENEWAL_WRAPPER_PATH"] = str(tmp_path / "fake-usr-local-bin" / "tixo-renewal")
+    os.makedirs(tmp_path / "fake-usr-local-bin", exist_ok=True)
+    cli_path = str(install_dir / "bin" / "renewal_cli.py")
 
     r = subprocess.run([sys.executable, cli_path, "install"], capture_output=True,
                         text=True, timeout=30, env=env)

@@ -20,7 +20,7 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.10.8"
+VERSION = "1.10.9"
 
 # Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
 # apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
@@ -524,9 +524,17 @@ def cmd_install(args):
     # is_host_local gate the node-config default above already uses) -- never for the
     # dev-server's own multi-node SSH setup.
     wrapper_result = {"written": False, "reason": "not a host-local deployment"}
+    wrapper_verify = None
     if is_host_local:
         import installer as inst
         wrapper_result = inst.write_global_wrapper(WORKSPACE_ROOT)
+        # v1.10.9: don't just WRITE the wrapper and trust it -- actually RUN it and confirm
+        # real command dispatch works, so this function can refuse to report success on the
+        # exact class of bug that shipped as "fixed" twice before (v1.10.7, v1.10.8) and was
+        # only ever caught by a real post-hoc production report, never by this installer
+        # itself.
+        if wrapper_result["written"]:
+            wrapper_verify = inst.verify_wrapper_dispatch(wrapper_result["path"], VERSION)
 
     print("Install complete (idempotent -- safe to re-run).")
     print(f"  State dir:   {STATE_DIR}")
@@ -546,11 +554,26 @@ def cmd_install(args):
     print("It still refuses to run without WRITE_APPROVED, and `store-credentials` must be run")
     print("by you first -- no credentials are ever created or stored automatically.")
 
+    install_ok = True
     if wrapper_result["written"]:
-        print(f"\nGlobal command (re)installed: {wrapper_result['path']}")
-        print("  tixo-renewal           -> interactive menu")
-        print("  tixo-renewal <command> -> any renewal_cli.py subcommand, e.g. 'status', "
-              "'doctor', 'backup' -- PYTHONPATH/TIXO_RENEWAL_INSTALL_DIR already set")
+        if wrapper_verify and wrapper_verify["ok"]:
+            print(f"\nGlobal command (re)installed and VERIFIED: {wrapper_result['path']}")
+            print("  tixo-renewal           -> interactive menu")
+            print("  tixo-renewal <command> -> any renewal_cli.py subcommand, e.g. 'status', "
+                  "'doctor', 'backup' -- PYTHONPATH/TIXO_RENEWAL_INSTALL_DIR already set")
+        else:
+            install_ok = False
+            print(f"\n! INSTALLATION FAILED: the global command at {wrapper_result['path']} "
+                  f"was written but does NOT actually dispatch commands correctly.")
+            print(f"  --version check: {'OK' if wrapper_verify and wrapper_verify.get('version_ok') else 'FAILED'}"
+                  f" ({wrapper_verify.get('version_output', '') if wrapper_verify else wrapper_verify})")
+            print(f"  install-detect check: "
+                  f"{'OK' if wrapper_verify and wrapper_verify.get('detect_ok') else 'FAILED'}"
+                  f" ({wrapper_verify.get('detect_output', '') if wrapper_verify else ''})")
+            print(f"  Use the full path directly instead until this is resolved:")
+            print(f"  TIXO_RENEWAL_INSTALL_DIR={WORKSPACE_ROOT} "
+                  f"PYTHONPATH={WORKSPACE_ROOT}/lib:{WORKSPACE_ROOT}/bin "
+                  f"python3 {WORKSPACE_ROOT}/bin/renewal_cli.py status")
     elif is_host_local:
         print(f"\nCould not (re)install the global 'tixo-renewal' command: "
               f"{wrapper_result['reason']}. Run every command with the full path and "
@@ -572,6 +595,8 @@ def cmd_install(args):
             print(f"  ! At least one ACTIVE job appears write-capable -- "
                   f"'enable-auto-renewal' will refuse to run alongside it unless you pass "
                   f"--override-legacy-write-conflict after confirming this is intentional.")
+
+    return 0 if install_ok else 1
 
 
 # ---------- policy ----------

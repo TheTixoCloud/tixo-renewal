@@ -94,6 +94,51 @@ def write_global_wrapper(install_dir: str, python_bin: str = None,
     return {"written": True, "path": wrapper_path}
 
 
+def verify_wrapper_dispatch(wrapper_path: str, expected_version: str, timeout: float = 15.0) -> dict:
+    """Actually RUNS the just-(re)written wrapper as a real subprocess -- never trusts the
+    file's content alone -- to prove public command dispatch genuinely works end-to-end.
+    This is what lets cmd_install() refuse to report success when the wrapper looks correct
+    on disk but something about argument forwarding, PYTHONPATH, or the interpreter it
+    points at is actually broken.
+
+    Checks TWO real commands, deliberately exercising BOTH of the wrapper's dispatch
+    branches, not just one: `--version` (the menu.py branch) and `install-detect` (a real
+    renewal_cli.py subcommand, read-only, chosen specifically because its JSON output is
+    unambiguous and can never be confused with the interactive menu's text). A wrapper that
+    still unconditionally execs menu.py for every argument -- the exact, confirmed IR1
+    regression across two prior "fixed" releases -- would make `install-detect` either hang
+    waiting on a tty (none here: stdin is explicitly /dev/null) or print the interactive
+    menu/its non-interactive fallback message instead of the expected JSON; this function
+    is what catches that instead of letting cmd_install claim success anyway."""
+    import subprocess as _subprocess
+    import json as _json
+    try:
+        version_proc = _subprocess.run(
+            [wrapper_path, "--version"], capture_output=True, text=True,
+            timeout=timeout, stdin=_subprocess.DEVNULL)
+        version_ok = (version_proc.returncode == 0
+                      and version_proc.stdout.strip() == expected_version)
+
+        detect_proc = _subprocess.run(
+            [wrapper_path, "install-detect"], capture_output=True, text=True,
+            timeout=timeout, stdin=_subprocess.DEVNULL)
+        detect_ok = False
+        if detect_proc.returncode == 0:
+            try:
+                detect_ok = "existing" in _json.loads(detect_proc.stdout)
+            except ValueError:
+                detect_ok = False
+
+        return {
+            "ok": version_ok and detect_ok,
+            "version_ok": version_ok, "detect_ok": detect_ok,
+            "version_output": version_proc.stdout.strip()[:200],
+            "detect_output": detect_proc.stdout.strip()[:200],
+        }
+    except Exception as e:
+        return {"ok": False, "version_ok": False, "detect_ok": False, "error": str(e)}
+
+
 # ---------- installation-state detection --------------------------------------------------------
 
 def detect_installation_state(config_dir: str, state_dir: str) -> dict:

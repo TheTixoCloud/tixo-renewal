@@ -2707,7 +2707,52 @@ def run_menu():
         return 0
 
 
+_MENU_ONLY_FLAGS = {"--status", "--version", "--cli"}
+
+
+def _self_heal_global_wrapper() -> None:
+    """Idempotent, best-effort: regenerates the global `tixo-renewal` wrapper on EVERY
+    menu.py invocation, if this looks like a host-local install.
+
+    Why this lives HERE and not only in installer.py/updater.py (v1.10.7/v1.10.8's prior,
+    INCOMPLETE fixes): an upgrade is executed by the updater code that is ALREADY RUNNING
+    at the moment the operator typed `update-apply` -- e.g. a real v1.10.6 install upgrading
+    to v1.10.8 runs v1.10.6's OWN updater.py, in-process, which has no idea v1.10.8's
+    updater.py contains a smarter post-update step. Any fix placed inside updater.py or
+    installer.py can only help an upgrade that is ALREADY running code containing that fix
+    -- never the upgrade that installs it for the first time. This is a bootstrap problem
+    that no amount of fixing the NEW updater's logic can solve by itself (confirmed on IR1:
+    v1.10.6 -> v1.10.8 completed successfully and VERSION correctly read "1.10.8", yet the
+    wrapper -- last written at the original fresh install, untouched by either upgrade --
+    was still the ancient unconditional `exec menu.py "$@"` form with no dispatch logic).
+
+    What DOES reliably change on every single successful upgrade, regardless of which
+    version's updater performed it, is lib/+bin/'s file-swap step -- that part has always
+    worked (VERSION always ends up correct). So THIS file -- menu.py -- is always current
+    code the moment it runs, even when invoked through an arbitrarily old, broken wrapper.
+    Self-healing here, rather than depending on any updater ever having called
+    write_global_wrapper(), means the wrapper repairs itself the very next time ANY command
+    runs post-upgrade -- no dependency on the upgrade mechanism's own correctness at all."""
+    install_dir = os.environ.get("TIXO_RENEWAL_INSTALL_DIR")
+    if not install_dir:
+        return
+    try:
+        import installer as _installer
+        _installer.write_global_wrapper(install_dir)
+    except Exception:
+        pass  # never let self-healing block normal operation
+
+
 def main():
+    _self_heal_global_wrapper()
+    if len(sys.argv) > 1 and sys.argv[1] not in _MENU_ONLY_FLAGS:
+        # A real renewal_cli.py subcommand (e.g. "doctor", "status", "readiness") reached
+        # menu.py -- this happens whenever the global wrapper is stale (pre-v1.10.8, or any
+        # future version whose upgrade hit the same bootstrap problem _self_heal_global_
+        # wrapper's docstring explains) and unconditionally exec'd menu.py for every
+        # argument. Dispatch straight to the real CLI instead of silently opening the
+        # interactive menu -- the single most-reported symptom of this entire bug class.
+        return renewal_cli.main()
     if "--status" in sys.argv:
         return renewal_cli.cmd_status(argparse.Namespace())
     if "--version" in sys.argv:
