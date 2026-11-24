@@ -26,6 +26,8 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.request
@@ -130,6 +132,50 @@ def _copy_tree_contents(src: str, dst: str) -> None:
             shutil.copy2(s, d)
 
 
+def _run_post_update_install_step(install_dir: str, config_dir: str, state_dir: str,
+                                    backup_root: str) -> dict:
+    """The DEFAULT run_install_upgrade_fn -- found necessary by a REAL subprocess-level
+    end-to-end upgrade test (a same-process unit test alone could never have caught this,
+    since it never represents a genuine before/after code-version split): the process
+    currently executing apply_update() was started BEFORE lib_dir/bin_dir were just
+    swapped to the new release's files a few lines above this call -- `import installer`/
+    `import renewal_cli` would return the ALREADY-CACHED, pre-update module objects from
+    `sys.modules`, not the new code just written to disk. Calling back into
+    `installer.upgrade()`/`cmd_install()` IN-PROCESS (the original implementation) would
+    therefore silently run the OLD release's install logic against the NEW release's
+    files -- any post-install behavior the new release added (e.g. v1.10.7's global
+    wrapper regeneration) would never actually execute during a real upgrade, even though
+    everything else about the upgrade correctly reported success. Confirmed directly: a
+    real v1.10.6->v1.10.7 upgrade, run as a genuine subprocess against the actual
+    published release, left the wrapper stale despite this exact function's then-current
+    in-process implementation supposedly fixing it.
+
+    The real fix: back up first (same discipline installer.upgrade() uses), then run the
+    NEWLY-SWAPPED-IN release's own bin/renewal_cli.py `install` subcommand as a genuine
+    SUBPROCESS -- guaranteed to execute the actual new code, with no dependency on this
+    process's module cache, now or for whatever a future release's install step adds."""
+    import installer as inst
+    try:
+        backup_path = inst.backup_before_change(config_dir, state_dir, backup_root,
+                                                   label="pre-upgrade")
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"pre-upgrade backup failed: {e}"}
+
+    new_cli = os.path.join(install_dir, "bin", "renewal_cli.py")
+    env = dict(os.environ)
+    env["TIXO_RENEWAL_INSTALL_DIR"] = install_dir
+    env["PYTHONPATH"] = os.path.join(install_dir, "lib")
+    try:
+        proc = subprocess.run([sys.executable, new_cli, "install"], env=env,
+                               capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"ok": False, "backup": backup_path, "error": f"install step failed to run: {e}"}
+    if proc.returncode != 0:
+        return {"ok": False, "backup": backup_path,
+                "error": f"install step exited {proc.returncode}: {proc.stderr or proc.stdout}"}
+    return {"ok": True, "backup": backup_path, "stdout": proc.stdout}
+
+
 def apply_update(install_dir: str, config_dir: str, state_dir: str, backup_root: str,
                   tag: str, download_fn=None, fetch_fn=None,
                   run_install_upgrade_fn=None, health_check_fn=None) -> dict:
@@ -228,8 +274,8 @@ def apply_update(install_dir: str, config_dir: str, state_dir: str, backup_root:
                 os.chmod(os.path.join(bin_dir, exe), 0o755)
 
             if run_install_upgrade_fn is None:
-                import installer as inst
-                run_install_upgrade_fn = lambda: inst.upgrade(config_dir, state_dir, backup_root)
+                run_install_upgrade_fn = lambda: _run_post_update_install_step(
+                    install_dir, config_dir, state_dir, backup_root)
             upgrade_result = run_install_upgrade_fn()
             if not upgrade_result.get("ok", False):
                 raise RuntimeError(f"post-update install step failed: {upgrade_result}")

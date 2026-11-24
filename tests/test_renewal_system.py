@@ -3,6 +3,7 @@ renewal_cli.py subcommands. All against tmp_path -- never the real workspace sta
 """
 import json
 import os
+import shutil
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -1390,6 +1391,63 @@ def test_optional_persistent_units_are_simple_restart_always_not_timers(cli_env,
     assert not os.path.exists(os.path.join(renewal_cli.SYSTEMD_OUT_DIR, timer_name))
 
 
+IMPLEMENTATION_DIR = os.path.join(os.path.dirname(__file__), "..", "implementation")
+
+
+def _build_real_fake_release_tarball(tmp_path, version: str, wrapper_marker: str = None):
+    """Builds a tar.gz 'new release' package using the ACTUAL CURRENT implementation/
+    source (a real, fully-functional renewal_cli.py/installer.py/etc., exactly like a
+    real published release), with only VERSION patched to simulate 'a newer version'.
+
+    Why this matters (found via a real, manual, subprocess-level upgrade test -- not
+    caught by any same-process unit test): updater.apply_update()'s default
+    run_install_upgrade_fn runs the NEWLY-SWAPPED-IN release's bin/renewal_cli.py as a
+    genuine SUBPROCESS, specifically so it executes that release's REAL install logic
+    rather than this test process's already-cached, possibly-stale module objects. A
+    package whose bin/renewal_cli.py is a non-functional stub (as this test used to build)
+    would make that subprocess do nothing at all -- not a faithful test of a real upgrade,
+    where the new code is always a complete, working release.
+
+    `wrapper_marker`, if given, is stamped into THIS PACKAGE's copy of
+    installer.GLOBAL_WRAPPER_TEMPLATE only -- never into whatever `installer` module is
+    already sitting in this test process's sys.modules. This is what makes a regression
+    test built from this helper actually falsifiable: since the rest of this package's
+    source is byte-identical to the currently-imported code, a caller that (bug!) invokes
+    the OLD, already-cached `installer` module in-process instead of genuinely running
+    THIS package's code would produce a wrapper with no marker -- indistinguishable from
+    correct behavior -- unless something forces a real difference between 'old loaded
+    code' and 'new on-disk code'. Without this, the two are accidentally identical and the
+    test can't tell a stale-module-cache bug from a correctly-applied upgrade."""
+    import tarfile as _tarfile
+    src = tmp_path / f"real-pkg-src-{version}"
+    shutil.copytree(IMPLEMENTATION_DIR, src / "lib")
+    (src / "bin").mkdir()
+    shutil.copy2(os.path.join(IMPLEMENTATION_DIR, "renewal_cli.py"), src / "bin" / "renewal_cli.py")
+    # Patch VERSION in BOTH copies -- bin/renewal_cli.py is what the subprocess actually
+    # runs; lib/renewal_cli.py is what gets imported if anything re-imports it afterward.
+    import re as _re
+    for p in (src / "lib" / "renewal_cli.py", src / "bin" / "renewal_cli.py"):
+        text = p.read_text()
+        text = _re.sub(r'VERSION = "[^"]*"', f'VERSION = "{version}"', text, count=1)
+        p.write_text(text)
+    if wrapper_marker:
+        installer_path = src / "lib" / "installer.py"
+        text = installer_path.read_text()
+        marked, n = _re.subn(
+            r'GLOBAL_WRAPPER_TEMPLATE = """#!/bin/bash\n',
+            f'GLOBAL_WRAPPER_TEMPLATE = """#!/bin/bash\n# {wrapper_marker}\n',
+            text, count=1)
+        assert n == 1, "GLOBAL_WRAPPER_TEMPLATE shape changed -- update this patch"
+        installer_path.write_text(marked)
+    for p in (src / "lib", src / "bin"):
+        shutil.rmtree(p / "__pycache__", ignore_errors=True)
+    tarball = tmp_path / f"tixo-renewal-package-{version}.tar.gz"
+    with _tarfile.open(tarball, "w:gz") as tf:
+        tf.add(src / "lib", arcname="lib")
+        tf.add(src / "bin", arcname="bin")
+    return str(tarball)
+
+
 # ---------- v1.10.2: cmd_update_check / cmd_update_apply -- real CLI update flow -----------
 
 def test_cmd_update_check_reports_up_to_date(cli_env, monkeypatch, capsys):
@@ -1490,12 +1548,19 @@ def test_update_apply_regenerates_a_stale_global_wrapper(cli_env, monkeypatch, t
     wrapper script -- it was still the ORIGINAL fresh-install wrapper (unconditionally
     exec'ing menu.py), untouched since the very first install.
 
-    Reproduces the exact stale-wrapper state found on ir1, then runs the REAL
-    `cmd_update_apply` CLI command (not a direct call to installer.upgrade(), to prove the
-    fix reaches all the way through the real upgrade entry point), and proves the wrapper
-    is regenerated with the current dispatch-aware content -- never left stale again."""
-    import hashlib
-    import tarfile
+    A FIRST version of this test (same shape, but using a non-functional stub package and
+    blanket-mocking subprocess.run) passed even though the real bug was still present --
+    it exercised the in-process `installer.upgrade()` call, which in a same-process unit
+    test is always "current code calling current code", never representing a genuine
+    stale-module situation. A REAL manual subprocess-level upgrade (old process, real
+    newly-downloaded files) exposed that updater.apply_update()'s default
+    run_install_upgrade_fn used to call back into THIS PROCESS's already-cached, pre-update
+    `installer`/`renewal_cli` modules -- so the wrapper regeneration never actually ran
+    during a genuine cross-version upgrade. This version uses a REAL, fully-functional fake
+    package (built from the actual current implementation/ source, see
+    _build_real_fake_release_tarball) and only mocks the SPECIFIC `systemctl is-active`
+    subprocess calls the service-restart-detection step makes -- letting the real install
+    subprocess (which is what the fix now genuinely depends on) actually run."""
     import updater
 
     # is_host_local inside cmd_install checks the REAL environment variable (not just
@@ -1505,7 +1570,11 @@ def test_update_apply_regenerates_a_stale_global_wrapper(cli_env, monkeypatch, t
     monkeypatch.setenv("TIXO_RENEWAL_INSTALL_DIR", renewal_cli.WORKSPACE_ROOT)
     disposable_wrapper = str(tmp_path / "fake-usr-local-bin" / "tixo-renewal")
     os.makedirs(os.path.dirname(disposable_wrapper))
-    monkeypatch.setattr(installer, "GLOBAL_WRAPPER_PATH", disposable_wrapper)
+    # An env var, not just monkeypatching installer.GLOBAL_WRAPPER_PATH: the post-update
+    # install step below runs in a GENUINELY SEPARATE subprocess, which a Python-level
+    # monkeypatch can never reach -- only an inherited environment variable can redirect
+    # it away from the real /usr/local/bin/tixo-renewal on this machine.
+    monkeypatch.setenv("TIXO_RENEWAL_WRAPPER_PATH", disposable_wrapper)
 
     renewal_cli.cmd_install(argparse_namespace())
     assert os.path.exists(disposable_wrapper), "a fresh install must write the wrapper"
@@ -1522,16 +1591,19 @@ def test_update_apply_regenerates_a_stale_global_wrapper(cli_env, monkeypatch, t
     Path(disposable_wrapper).write_text(stale_content)
     os.chmod(disposable_wrapper, 0o755)
 
-    src = tmp_path / "pkg-src"
-    (src / "lib" / "static").mkdir(parents=True)
-    (src / "bin").mkdir(parents=True)
-    (src / "lib" / "renewal_cli.py").write_text('VERSION = "99.0.0"\n')
-    (src / "bin" / "renewal_cli.py").write_text("# bin stub\n")
-    tarball = tmp_path / "tixo-renewal-package.tar.gz"
-    with tarfile.open(tarball, "w:gz") as tf:
-        tf.add(src / "lib", arcname="lib")
-        tf.add(src / "bin", arcname="bin")
-    digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
+    # The marker is stamped ONLY into this package's own on-disk copy of
+    # installer.GLOBAL_WRAPPER_TEMPLATE -- never into whatever `installer` module this
+    # test process already has cached in sys.modules (from the cmd_install() call above).
+    # So the final assertion below can only pass if the install step that regenerates the
+    # wrapper genuinely executed THIS package's fresh code -- a stale-module-cache bug
+    # (calling back into the already-imported, pre-update `installer` in-process) would
+    # produce a wrapper indistinguishable from "correctly upgraded" in every OTHER respect,
+    # but it would never contain this marker, since the cached module's template doesn't
+    # have it.
+    wrapper_marker = "FRESH-CODE-MARKER-99.0.0-9f3ab21c"
+    tarball = _build_real_fake_release_tarball(tmp_path, "99.0.0", wrapper_marker=wrapper_marker)
+    import hashlib
+    digest = hashlib.sha256(open(tarball, "rb").read()).hexdigest()
     sums = tmp_path / "SHA256SUMS"
     sums.write_text(f"{digest}  {updater.ASSET_NAME}\n")
 
@@ -1541,13 +1613,19 @@ def test_update_apply_regenerates_a_stale_global_wrapper(cli_env, monkeypatch, t
                 "error": None}
 
     def fake_download(url, dest_path, timeout=60.0, max_bytes=None):
-        import shutil as _shutil
-        _shutil.copy2(str(tarball) if "pkg" in url else str(sums), dest_path)
+        shutil.copy2(tarball if "pkg" in url else str(sums), dest_path)
 
     monkeypatch.setattr(updater, "fetch_release_info", fake_fetch)
     monkeypatch.setattr(updater, "download_file", fake_download)
-    monkeypatch.setattr(renewal_cli.subprocess, "run",
-                         lambda cmd, *a, **k: type("R", (), {"returncode": 0, "stdout": ""})())
+
+    real_subprocess_run = renewal_cli.subprocess.run
+
+    def selective_fake_run(cmd, *a, **k):
+        if cmd[:2] == ["systemctl", "is-active"]:
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        return real_subprocess_run(cmd, *a, **k)  # the real install-step subprocess call
+
+    monkeypatch.setattr(renewal_cli.subprocess, "run", selective_fake_run)
 
     rc = renewal_cli.cmd_update_apply(argparse_namespace(version=None, yes=True, force=False))
     assert rc == 0, capsys.readouterr().out
@@ -1556,6 +1634,14 @@ def test_update_apply_regenerates_a_stale_global_wrapper(cli_env, monkeypatch, t
     assert regenerated != stale_content, "wrapper was NOT regenerated -- the exact ir1 bug"
     assert "renewal_cli.py" in regenerated
     assert '"${1:-}"' in regenerated or "case" in regenerated  # real dispatch logic present
+    # The decisive check: proves the NEWLY-DOWNLOADED release's own code actually ran the
+    # wrapper-writing step, rather than a stale, already-cached `installer` module from
+    # before this upgrade (the deeper bug a real IR1-style upgrade exposed -- see
+    # _build_real_fake_release_tarball's docstring for why this is the only way to tell).
+    assert wrapper_marker in regenerated, (
+        "wrapper has no trace of the NEW release's own code -- it was almost certainly "
+        "regenerated by a stale, already-imported `installer` module instead of the "
+        "newly-downloaded release's code")
 
 
 def test_cmd_update_apply_refuses_without_yes_or_confirmation(cli_env, monkeypatch, capsys):

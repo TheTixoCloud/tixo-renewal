@@ -68,9 +68,18 @@ def write_global_wrapper(install_dir: str, python_bin: str = None,
     an upgrade can never leave a stale wrapper behind the way the real regression above did.
     Never fatal if the target directory isn't writable (e.g. not root) -- returns
     {"written": False, "reason": ...} instead of raising, matching this module's existing
-    convention for every other installer step that requires root."""
+    convention for every other installer step that requires root.
+
+    `wrapper_path`, if not given, falls back to the TIXO_RENEWAL_WRAPPER_PATH environment
+    variable (checked fresh here, every call -- not an early-bound default) before
+    GLOBAL_WRAPPER_PATH -- this is what lets a test (or an operator with a non-standard
+    prefix) redirect the real default WITHOUT touching the real host's
+    /usr/local/bin/tixo-renewal, including when this function runs inside a genuinely
+    separate subprocess (as updater.apply_update's post-update install step does) where an
+    in-process monkeypatch of GLOBAL_WRAPPER_PATH could never reach it -- only an inherited
+    environment variable can."""
     import sys as _sys
-    wrapper_path = wrapper_path or GLOBAL_WRAPPER_PATH
+    wrapper_path = wrapper_path or os.environ.get("TIXO_RENEWAL_WRAPPER_PATH") or GLOBAL_WRAPPER_PATH
     python_bin = python_bin or _sys.executable
     target_dir = os.path.dirname(wrapper_path)
     if not (os.access(target_dir, os.W_OK) or os.geteuid() == 0):
