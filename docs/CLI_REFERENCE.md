@@ -9,6 +9,14 @@ Two entry points exist: `renewal_cli.py <command>` (scriptable/automatable) and 
 interactive menu (`tixo-renewal`, i.e. `python3 lib/menu.py`, which wraps a subset of these
 same commands behind numbered screens — see `menu.py`'s `MENU_ITEMS`).
 
+**v1.10.6+: the installed global `tixo-renewal` command unifies both.** With no arguments
+(or `--status`/`--version`/`--cli`) it opens the menu; with any other argument it dispatches
+straight to `renewal_cli.py`'s real subcommands below, with `PYTHONPATH`/
+`TIXO_RENEWAL_INSTALL_DIR` already set — e.g. `tixo-renewal status` is exactly
+`renewal_cli.py status` with no manual environment setup needed. Two friendly aliases are
+rewritten before argparse ever sees them (one implementation each, never duplicated):
+`health-check` → `install-health-check`, `update` → `update-apply`.
+
 ## Install / upgrade / recovery (idempotent, config-preserving)
 
 ```
@@ -23,7 +31,22 @@ install-rollback --backup-file F --yes
 install-health-check        Read-only post-change sanity check (JSON). As of v1.10.3 this
                             ALSO verifies real systemd state (enabled/active/failed) for
                             every one of this project's own timers -- not just that config
-                            files parse.
+                            files parse. Friendly alias: `health-check`.
+readiness                   v1.10.6+: read-only per-VPS financial-engine readiness summary
+                            (JSON) -- COLLECTING_BASELINE (normal immediately after a fresh
+                            install, self-clears after the second observation, never an
+                            error), MONITORING (steady state), REVIEW_REQUIRED (a genuinely
+                            ambiguous pattern), RENEWAL_CANDIDATE_PENDING_REVIEW (awaiting
+                            confirmation), MANUAL_ONLY_UNLIMITED (permanently excluded).
+                            Distinct from install-health-check: a node can be fully healthy
+                            at the service level while every VPS is still
+                            COLLECTING_BASELINE. Exit 1 only for REVIEW_REQUIRED cases.
+doctor                      v1.10.6+: read-only, human-readable combination of
+                            install-health-check + legacy-automation detection +
+                            credential presence + backup freshness + writer state -- the
+                            one command to run before assuming something is broken.
+logs [--limit N]            v1.10.6+: read-only recent renewal operations (from the
+                            durable operations table) and recent backups, per node.
 install-activate-core-timers
                             Root-only, v1.10.3+: installs and enables the 4 READ-ONLY core
                             timers (monitor, inventory-sync, hostnet-sync,
@@ -57,7 +80,9 @@ update-apply [--version V] [--yes] [--force]
                             auto-rolls-back on any failure (bad checksum, failed download,
                             missing dependency, broken import, failed health check). Requires
                             --yes or interactive confirmation; --force applies even if the
-                            target isn't newer than the installed version.
+                            target isn't newer than the installed version. Friendly alias:
+                            `update` (rewritten to update-apply before argparse sees it --
+                            same confirmation requirement applies either way).
 uninstall-module --module {telegram,web,relay_worker,agent,backup_schedule} [--purge-secrets]
                             Disables ONE optional module without touching the core install.
 uninstall-preview [--purge]  Read-only: exactly what `uninstall`/`uninstall --purge` would do

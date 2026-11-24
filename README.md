@@ -9,10 +9,10 @@ them.
 ## One-command install (Ubuntu 24.04 + Virtualizor)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.5/deploy/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/TheTixoCloud/tixo-renewal/v1.10.6/deploy/bootstrap.sh | sudo bash
 ```
 
-This is pinned to the `v1.10.5` release tag (never a mutable branch), downloads the release
+This is pinned to the `v1.10.6` release tag (never a mutable branch), downloads the release
 tarball and its published `SHA256SUMS` from that *same* immutable release, verifies the
 checksum locally, then runs `install.sh`. When run from an interactive terminal (including a
 piped `curl | bash`, via `/dev/tty`), a successful install automatically opens the management
@@ -23,6 +23,34 @@ tixo-renewal           # interactive menu: dashboard, credentials, gift/interval
                         # enable/disable auto-renewal, logs, updates, backup/restore, uninstall
 tixo-renewal --status  # noninteractive status, for scripts/cron/monitoring
 ```
+
+**v1.10.6+: one unified global command.** `tixo-renewal` with no arguments (or `--status`/
+`--version`/`--cli`) opens the menu as above; `tixo-renewal <anything else>` dispatches
+directly to the full scriptable CLI, with `PYTHONPATH`/`TIXO_RENEWAL_INSTALL_DIR` already
+set correctly -- no manual environment setup or full-path invocation needed:
+
+```bash
+tixo-renewal status              # noninteractive status
+tixo-renewal health-check        # alias for install-health-check
+tixo-renewal doctor              # comprehensive self-diagnostic, one human-readable report
+tixo-renewal readiness           # per-VPS financial-engine readiness (see below)
+tixo-renewal backup              # quick ledger backup
+tixo-renewal update              # alias for update-apply (still asks for confirmation)
+tixo-renewal logs                # recent renewal operations + backups
+tixo-renewal enable-auto-renewal # grant production-write authorization
+tixo-renewal disable-auto-renewal
+tixo-renewal uninstall
+```
+
+**`readiness` vs. `install-health-check`/`doctor`:** a successful health check means the
+*service* is fine (config parses, timers are enabled and not failed) -- it does **not**
+mean automatic renewal is safe to rely on yet. `readiness` reports the actual financial-
+engine state per VPS: `COLLECTING_BASELINE` (normal immediately after a fresh install --
+every VPS needs two observations before anything can be evaluated, and this clears itself
+automatically within one monitor interval; it is never an error), `MONITORING` (steady
+state, nothing anomalous), `REVIEW_REQUIRED` (a genuinely ambiguous pattern worth a human
+glance), `RENEWAL_CANDIDATE_PENDING_REVIEW` (an actual candidate awaiting confirmation), or
+`MANUAL_ONLY_UNLIMITED` (permanently excluded by design).
 
 ## Why this exists
 
@@ -106,16 +134,16 @@ zero-vs-unset guarantees).
 `tixo-renewal` menu wraps the common ones (including "Enable/Disable automatic renewal",
 "Check for updates", and "Uninstall") in a guided interface.
 
-**One-command install also activates monitoring (v1.10.5+).** When run as root,
+**One-command install also activates monitoring (v1.10.6+).** When run as root,
 `install.sh` automatically installs and enables the 4 READ-ONLY core timers (monitor,
 inventory-sync, hostnet-sync, readiness-notifier) into real systemd — no manual
 `cp`/`systemctl` steps required. None of these four can write to Virtualizor by
 construction. Opt out with `TIXO_RENEWAL_NO_AUTO_SYSTEMD=1`, or run
 `install-activate-core-timers` yourself later (idempotent). Verify current state any time
-with `install-health-check`, which (as of v1.10.5) also reports real systemd
+with `install-health-check`, which (as of v1.10.6) also reports real systemd
 enabled/active/failed status, not just that config files parse.
 
-**Production-write authorization is one confirmed action (v1.10.5+).** `enable-auto-renewal`
+**Production-write authorization is one confirmed action (v1.10.6+).** `enable-auto-renewal`
 creates `WRITE_APPROVED`, sets `policy.json`'s `auto_renewal_enabled=true`, and installs the
 write-capable `apply` timer — all together, never partially. `disable-auto-renewal` always
 reverses all three together. The menu's "Enable/Disable automatic renewal" screens do the
