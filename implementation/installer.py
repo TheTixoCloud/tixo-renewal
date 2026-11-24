@@ -5,11 +5,15 @@ install-detect/install-upgrade/install-repair/install-rollback`), so there is ex
 implementation of each operation, never two to keep in sync -- the same discipline already
 used for `write_systemd_units()`.
 
-SAFETY: every function here operates purely on local files/sockets. Nothing here ever
-changes the host's actual system timezone, touches host networking, opens a firewall port,
-or restarts a running systemd unit -- generating/validating files and printing the exact
-manual commands an operator must run themselves is the limit of what this module does,
-matching every other optional-module config screen already built in this project.
+SAFETY: every function here operates purely on local files/sockets, except
+`write_global_wrapper`/`verify_wrapper_dispatch` (the global command wrapper, which must be
+real to be useful) and `uninstall_optional_module`'s `backup_schedule` case (v1.10.10 -- the
+one optional module menu.py's action_configure_backup_schedule can genuinely ACTIVATE in
+real systemd, so disabling it must be equally real; see service_activation.py). Nothing here
+ever changes the host's actual system timezone, touches host networking, opens a firewall
+port, or restarts a running systemd unit for any OTHER module -- generating/validating files
+and printing the exact manual commands an operator must run themselves remains the limit
+for telegram/web/relay_worker/agent, none of which this project auto-activates (yet).
 """
 from __future__ import annotations
 
@@ -489,6 +493,20 @@ def uninstall_optional_module(module_name: str, config_dir: str, systemd_out_dir
         if os.path.exists(unit_path):
             os.remove(unit_path)
             report["units_removed"].append(unit)
+
+    # backup_schedule is the one optional module whose unit pair menu.py's
+    # action_configure_backup_schedule can genuinely ACTIVATE in real systemd (see its
+    # v1.10.10 fix) -- so disabling it here must be equally real, not leave a live timer
+    # running against a config that now says disabled=False. The other optional modules
+    # (telegram/web/relay_worker/agent) only ever generate a plain .service TEMPLATE for the
+    # operator to install themselves; this project never auto-activates those, so there is
+    # no live systemd state for this function to real-disable on their behalf (yet).
+    if module_name == "backup_schedule":
+        import service_activation as sa
+        sa_result = sa.disable_and_remove_units([units])
+        report["systemd_disabled"] = sa_result["ok"]
+        if sa_result["problems"]:
+            report["systemd_problems"] = sa_result["problems"]
 
     return report
 

@@ -20,7 +20,7 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.10.9"
+VERSION = "1.10.10"
 
 # Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
 # apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
@@ -1042,6 +1042,14 @@ def cmd_uninstall_module(args):
         print("Secrets purged.")
     if result["units_removed"]:
         print(f"Removed generated systemd unit file(s): {result['units_removed']}")
+    if "systemd_disabled" in result:
+        if result["systemd_disabled"]:
+            print("Real systemd timer stopped and disabled (verified).")
+        else:
+            print(f"WARNING: could not stop/disable the real systemd timer: "
+                  f"{result.get('systemd_problems')} -- it may still be running. "
+                  f"Re-run as root.")
+    elif result["units_removed"]:
         print("If any were ever installed into /etc/systemd/system, disable/remove them "
               "there yourself (a separate explicit root action).")
     return 0

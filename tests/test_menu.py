@@ -1428,3 +1428,75 @@ def test_action_uninstall_unknown_entries_shown_in_preview(monkeypatch, capsys):
         menu.action_uninstall(menu.Style(enabled=False))
     out = capsys.readouterr().out
     assert "mystery.txt" in out
+
+
+# ---------- v1.10.10: backup-schedule activation must be REAL, not just a template ----------
+
+def test_action_configure_backup_schedule_enable_actually_activates_real_systemd(
+        monkeypatch, capsys, tmp_path):
+    """Confirmed usability defect, reported after real operator use (menu option 22): this
+    action used to only ever write the systemd unit TEMPLATE and print manual cp/
+    daemon-reload/enable instructions -- 'saved' was reported as if it meant 'running',
+    which it did not. Fixed (v1.10.10) to reuse service_activation's real
+    install_and_enable_units()/verify_units_status(), the same helpers the core timers
+    already use. Never touches the real host's /etc/systemd/system -- SYSTEMD_UNIT_DIR is
+    monkeypatched to a disposable path, the one safe way to test this (service_activation's
+    own module docstring, and _systemctl is the one chokepoint every systemd-aware test in
+    this project mocks through)."""
+    menu.renewal_cli.CONFIG_DIR = str(tmp_path / "renewal-config")
+    menu.renewal_cli.SYSTEMD_OUT_DIR = str(tmp_path / "systemd")
+    os.makedirs(menu.renewal_cli.CONFIG_DIR)
+    os.makedirs(menu.renewal_cli.SYSTEMD_OUT_DIR)
+
+    import service_activation as sa
+    disposable_systemd_dir = tmp_path / "fake-etc-systemd-system"
+    disposable_systemd_dir.mkdir()
+    monkeypatch.setattr(sa, "SYSTEMD_UNIT_DIR", str(disposable_systemd_dir))
+    monkeypatch.setattr(sa, "_systemctl",
+                         lambda *a, **k: {"ok": True,
+                                           "stdout": "enabled" if a and a[0] == "is-enabled"
+                                           else ("active" if a and a[0] == "is-active" else ""),
+                                           "stderr": ""})
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    # interval, keep, encrypt?, enable-timer?, save-confirm -- in that exact prompt order.
+    answers = iter(["", "", "n", "y", "y"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+
+    menu.action_configure_backup_schedule(menu.Style(enabled=False))
+
+    out = capsys.readouterr().out
+    assert "activated" in out.lower()
+    # The decisive check: the unit files must have genuinely landed in the (disposable)
+    # systemd directory -- a regression back to template-only would never copy them there.
+    assert (disposable_systemd_dir / "virt-renewal-backup.service").exists()
+    assert (disposable_systemd_dir / "virt-renewal-backup.timer").exists()
+    import backup_config as bcfg
+    assert bcfg.load_backup_schedule_settings(menu.renewal_cli.CONFIG_DIR).enabled is True
+
+
+def test_action_configure_backup_schedule_activation_failure_is_reported_not_hidden(
+        monkeypatch, capsys, tmp_path):
+    """If real activation fails (e.g. systemctl rejects it), this must be reported as a
+    failure -- never silently treated as 'saved' success, the exact class of bug this
+    whole fix exists to close."""
+    menu.renewal_cli.CONFIG_DIR = str(tmp_path / "renewal-config")
+    menu.renewal_cli.SYSTEMD_OUT_DIR = str(tmp_path / "systemd")
+    os.makedirs(menu.renewal_cli.CONFIG_DIR)
+    os.makedirs(menu.renewal_cli.SYSTEMD_OUT_DIR)
+
+    import service_activation as sa
+    monkeypatch.setattr(sa, "SYSTEMD_UNIT_DIR", str(tmp_path / "fake-etc-systemd-system"))
+    os.makedirs(str(tmp_path / "fake-etc-systemd-system"))
+    monkeypatch.setattr(sa, "_systemctl",
+                         lambda *a, **k: {"ok": False, "stdout": "", "stderr": "nope"})
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+
+    answers = iter(["", "", "n", "y", "y"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(answers))
+
+    menu.action_configure_backup_schedule(menu.Style(enabled=False))
+
+    out = capsys.readouterr().out
+    assert "FAILED" in out
+    assert "NOT actually running" in out

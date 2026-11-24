@@ -619,6 +619,52 @@ def test_cmd_uninstall_module_cli_rejects_unknown_module(cli_env, capsys):
     assert "unknown module" in out
 
 
+def test_uninstall_optional_module_backup_schedule_really_disables_real_systemd_timer(
+        cli_env, monkeypatch, tmp_path):
+    """backup_schedule is the one optional module menu.py's action_configure_backup_schedule
+    can genuinely ACTIVATE in real systemd (v1.10.10 fix) -- disabling it here must be
+    equally real, never leave a live timer running against disabled=True config. Mocks the
+    same service_activation._systemctl chokepoint every other systemd-aware test in this
+    project uses, and redirects SYSTEMD_UNIT_DIR to a disposable path -- never the real
+    host's /etc/systemd/system."""
+    renewal_cli.cmd_install(argparse_namespace())
+    import service_activation as sa
+    disposable_systemd_dir = tmp_path / "fake-etc-systemd-system"
+    disposable_systemd_dir.mkdir()
+    # disable_and_remove_units() only calls `systemctl disable` for a timer it finds
+    # actually present in SYSTEMD_UNIT_DIR -- simulate the real prior-activation state
+    # (see the enable-path test above) so this test genuinely exercises the disable call,
+    # not a vacuous no-op over an already-empty directory.
+    (disposable_systemd_dir / "virt-renewal-backup.service").write_text("# fake unit\n")
+    (disposable_systemd_dir / "virt-renewal-backup.timer").write_text("# fake unit\n")
+    monkeypatch.setattr(sa, "SYSTEMD_UNIT_DIR", str(disposable_systemd_dir))
+    calls = []
+    def fake_systemctl(*a, **k):
+        calls.append(a)
+        return {"ok": True, "stdout": "", "stderr": ""}
+    monkeypatch.setattr(sa, "_systemctl", fake_systemctl)
+
+    result = installer.uninstall_optional_module("backup_schedule", cli_env["config_dir"],
+                                                    renewal_cli.SYSTEMD_OUT_DIR)
+    assert result["systemd_disabled"] is True
+    assert ("disable", "--now", "virt-renewal-backup.timer") in calls
+
+
+def test_uninstall_optional_module_backup_schedule_reports_systemd_failure(
+        cli_env, monkeypatch, tmp_path):
+    import service_activation as sa
+    disposable_systemd_dir = tmp_path / "fake-etc-systemd-system"
+    disposable_systemd_dir.mkdir()
+    (disposable_systemd_dir / "virt-renewal-backup.timer").write_text("# fake unit\n")
+    monkeypatch.setattr(sa, "SYSTEMD_UNIT_DIR", str(disposable_systemd_dir))
+    monkeypatch.setattr(sa, "_systemctl",
+                         lambda *a, **k: {"ok": False, "stdout": "", "stderr": "denied"})
+    result = installer.uninstall_optional_module("backup_schedule", cli_env["config_dir"],
+                                                    renewal_cli.SYSTEMD_OUT_DIR)
+    assert result["systemd_disabled"] is False
+    assert result["systemd_problems"]
+
+
 def test_action_install_cancel_does_nothing(cli_env, monkeypatch, capsys):
     import menu
     renewal_cli.cmd_install(argparse_namespace())

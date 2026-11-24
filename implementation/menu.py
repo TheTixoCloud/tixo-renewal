@@ -2505,7 +2505,15 @@ def action_configure_backup_schedule(style: Style):
     """Configures the optional scheduled-backup timer -- DISABLED by default. An unattended
     encrypted backup needs its passphrase available without an interactive prompt, so this
     screen is the ONLY place that passphrase is stored (0600-enforced, same discipline as
-    every other secret). Never installs/enables the generated systemd unit itself."""
+    every other secret).
+
+    v1.10.10: a confirmed usability defect (reported after real operator use) -- this used
+    to only ever write the systemd unit TEMPLATE and print manual cp/daemon-reload/enable
+    instructions, exactly like install.sh's pre-v1.10.3 core-timer behavior did (see
+    service_activation.py's module docstring for that same history). Now reuses the same
+    install_and_enable_units()/disable_and_remove_units() real-activation helpers the core
+    timers already use, and VERIFIES the result via systemctl before claiming success --
+    never reports "saved" as if it meant "running."""
     import backup_config as bcfg
     settings = bcfg.load_backup_schedule_settings(renewal_cli.CONFIG_DIR)
     print(f"Enabled: {settings.enabled}")
@@ -2559,14 +2567,39 @@ def action_configure_backup_schedule(style: Style):
         return
     bcfg.save_backup_schedule_settings(renewal_cli.CONFIG_DIR, new_settings)
     renewal_cli.write_backup_systemd_unit(new_settings.interval_hours)
-    print(f"Saved. Regenerated {os.path.join(renewal_cli.SYSTEMD_OUT_DIR, 'virt-renewal-backup.service')} "
-          f"and .timer -- install/enable them yourself (as root, a separate explicit step):")
-    print("  sudo cp " + os.path.join(renewal_cli.SYSTEMD_OUT_DIR,
-                                        "virt-renewal-backup.service") +
-          " " + os.path.join(renewal_cli.SYSTEMD_OUT_DIR, "virt-renewal-backup.timer") +
-          " /etc/systemd/system/")
-    print("  sudo systemctl daemon-reload")
-    print("  sudo systemctl enable --now virt-renewal-backup.timer")
+
+    unit_pair = ("virt-renewal-backup.service", "virt-renewal-backup.timer")
+    import service_activation as sa
+    if new_settings.enabled:
+        if os.geteuid() != 0:
+            print(f"{style.YELLOW}Saved, but activating the real systemd timer requires "
+                  f"root -- re-run as root (or sudo) to actually enable it. Until then "
+                  f"this is config-only and no backup will run.{style.RESET}")
+            return
+        result = sa.install_and_enable_units(renewal_cli.SYSTEMD_OUT_DIR, [unit_pair])
+        if not result["ok"]:
+            print(f"{style.RED}FAILED to activate the backup timer:{style.RESET}")
+            for p in result["problems"]:
+                print(f"  - {p}")
+            print("Settings were saved, but the scheduled backup is NOT actually running.")
+            return
+        status = sa.verify_units_status([unit_pair])[unit_pair[1]]
+        if status["is_enabled"] != "enabled" or status["is_active"] not in ("active", "waiting"):
+            print(f"{style.RED}Activation command succeeded but verification shows the "
+                  f"timer is not genuinely enabled/active (enabled={status['is_enabled']}, "
+                  f"active={status['is_active']}) -- treating this as FAILED, not "
+                  f"success.{style.RESET}")
+            return
+        print(f"Saved AND activated: {unit_pair[1]} is enabled and running "
+              f"(verified via systemctl, not just a generated template).")
+    else:
+        result = sa.disable_and_remove_units([unit_pair])
+        if not result["ok"]:
+            print(f"{style.RED}FAILED to disable the backup timer:{style.RESET}")
+            for p in result["problems"]:
+                print(f"  - {p}")
+            return
+        print("Saved. Scheduled backup timer stopped and disabled.")
 
 
 MENU_ITEMS = [
