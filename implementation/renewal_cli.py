@@ -20,7 +20,7 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.10.4"
+VERSION = "1.10.5"
 
 # Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
 # apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
@@ -533,6 +533,20 @@ def cmd_install(args):
     print("It still refuses to run without WRITE_APPROVED, and `store-credentials` must be run")
     print("by you first -- no credentials are ever created or stored automatically.")
 
+    import installer as inst
+    legacy = inst.detect_legacy_bandwidth_automation()
+    if legacy["found_active"] or legacy["found_disabled"]:
+        print(f"\nNOTE: found existing, foreign bandwidth-automation cron job(s) on this "
+              f"host, NOT installed by this project and NOT touched by this installer:")
+        if legacy["found_active"]:
+            print(f"  Active:   {legacy['found_active']}")
+        if legacy["found_disabled"]:
+            print(f"  Disabled: {legacy['found_disabled']}")
+        if legacy["active_write_capable"]:
+            print(f"  ! At least one ACTIVE job appears write-capable -- "
+                  f"'enable-auto-renewal' will refuse to run alongside it unless you pass "
+                  f"--override-legacy-write-conflict after confirming this is intentional.")
+
 
 # ---------- policy ----------
 
@@ -1033,7 +1047,9 @@ def cmd_enable_auto_renewal(args):
     AND (if root) installs/enables the write-capable apply timer -- all three together, in
     one confirmed action, via installer.enable_auto_renewal(). Requires --yes (scripted) or
     interactive confirmation; this is the single most consequential switch in the whole
-    product and must never flip silently."""
+    product and must never flip silently. Also refuses (see installer.enable_auto_renewal's
+    docstring) if a foreign, write-capable bandwidth automation job is detected already
+    active on this host, unless --override-legacy-write-conflict is explicitly passed."""
     if not getattr(args, "yes", False):
         print("This will:")
         print("  1. Create renewal-config/WRITE_APPROVED (production write capability).")
@@ -1043,7 +1059,9 @@ def cmd_enable_auto_renewal(args):
               "Virtualizor for any VPS its policy marks eligible. Re-run with --yes to confirm.")
         return 1
     import installer as inst
-    result = inst.enable_auto_renewal(CONFIG_DIR, SYSTEMD_OUT_DIR)
+    result = inst.enable_auto_renewal(
+        CONFIG_DIR, SYSTEMD_OUT_DIR,
+        override_legacy_write_conflict=getattr(args, "override_legacy_write_conflict", False))
     for step in result["steps"]:
         print(f"  - {step}")
     for problem in result["problems"]:
@@ -2088,6 +2106,10 @@ def main():
              "install+enable the write-capable apply timer -- all together")
     enable_auto_p.add_argument("--yes", action="store_true",
                                 help="Skip the interactive confirmation (for scripted use)")
+    enable_auto_p.add_argument(
+        "--override-legacy-write-conflict", action="store_true",
+        help="Proceed even if a foreign, write-capable bandwidth automation cron job is "
+             "detected already active on this host (never disables/modifies that job)")
     enable_auto_p.set_defaults(func=cmd_enable_auto_renewal)
 
     sub.add_parser(

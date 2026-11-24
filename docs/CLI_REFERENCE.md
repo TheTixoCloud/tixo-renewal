@@ -32,11 +32,19 @@ install-activate-core-timers
                             automatically by install.sh when run as root (opt out with
                             TIXO_RENEWAL_NO_AUTO_SYSTEMD=1). Idempotent; never touches the
                             write-capable apply timer.
-enable-auto-renewal [--yes]  v1.10.3+: the single, unified production-write authorization
+enable-auto-renewal [--yes] [--override-legacy-write-conflict]
+                            v1.10.3+: the single, unified production-write authorization
                             step -- creates renewal-config/WRITE_APPROVED, sets
                             policy.json's auto_renewal_enabled=true, AND (if root)
                             installs+enables the write-capable virt-renewal-apply timer,
                             all together. Requires --yes or interactive confirmation.
+                            v1.10.5+: refuses by default if a foreign, write-capable
+                            bandwidth-automation cron job (e.g. a pre-existing
+                            script-based carry-over system installed independently of
+                            this project) is detected active on the host --
+                            --override-legacy-write-conflict proceeds anyway, without
+                            touching that job. See `install-health-check`'s
+                            `legacy_bandwidth_automation` field to inspect what was found.
 disable-auto-renewal         v1.10.3+: always reverses all three of the above together --
                             removes WRITE_APPROVED, sets auto_renewal_enabled=false, and
                             (if root) stops/disables/removes the apply timer. There is no

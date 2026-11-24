@@ -287,6 +287,81 @@ def test_rollback_refuses_corrupt_archive(cli_env, tmp_path):
         installer.rollback(str(bad_archive), cli_env["config_dir"], cli_env["state_dir"])
 
 
+# ---------- detect_legacy_bandwidth_automation (v1.10.5) -------------------------------------------
+# Found during a real production audit (ir1/ir2, 2026-11-24): a standalone, pre-existing
+# script-based bandwidth carry-over system was already installed via /etc/cron.d on both
+# hosts. These tests use a disposable tmp_path as cron_dir -- NEVER the real /etc/cron.d.
+
+def test_detect_legacy_bandwidth_automation_empty_dir_finds_nothing(tmp_path):
+    result = installer.detect_legacy_bandwidth_automation(cron_dir=str(tmp_path))
+    assert result == {"found_active": [], "found_disabled": [], "active_write_capable": False}
+
+
+def test_detect_legacy_bandwidth_automation_missing_dir_finds_nothing(tmp_path):
+    result = installer.detect_legacy_bandwidth_automation(cron_dir=str(tmp_path / "does-not-exist"))
+    assert result == {"found_active": [], "found_disabled": [], "active_write_capable": False}
+
+
+def test_detect_legacy_bandwidth_automation_ignores_unrelated_cron_files(tmp_path):
+    (tmp_path / "logrotate").write_text("0 0 * * * root /usr/sbin/logrotate\n")
+    (tmp_path / "certbot").write_text("0 */12 * * * root certbot renew\n")
+    result = installer.detect_legacy_bandwidth_automation(cron_dir=str(tmp_path))
+    assert result["found_active"] == []
+    assert result["active_write_capable"] is False
+
+
+def test_detect_legacy_bandwidth_automation_finds_readonly_monitor_as_non_write_capable(tmp_path):
+    (tmp_path / "virt-carryover-monitor").write_text("*/5 * * * * root /root/virt-all-vps-check.py\n")
+    (tmp_path / "virt-carryover-ledger").write_text("2-59/5 * * * * root /root/virt-carryover-ledger.py\n")
+    (tmp_path / "virt-carryover-guard").write_text("4-59/5 * * * * root /root/virt-carryover-guard.py\n")
+    result = installer.detect_legacy_bandwidth_automation(cron_dir=str(tmp_path))
+    assert sorted(result["found_active"]) == [
+        "virt-carryover-guard", "virt-carryover-ledger", "virt-carryover-monitor"]
+    assert result["active_write_capable"] is False  # none of these names match a write-capable pattern
+
+
+def test_detect_legacy_bandwidth_automation_finds_active_write_capable_job(tmp_path):
+    (tmp_path / "virt-carryover-auto").write_text("0 * * * * root /root/virt-carryover-auto.py\n")
+    result = installer.detect_legacy_bandwidth_automation(cron_dir=str(tmp_path))
+    assert result["found_active"] == ["virt-carryover-auto"]
+    assert result["active_write_capable"] is True
+
+
+def test_detect_legacy_bandwidth_automation_disabled_job_is_not_active(tmp_path):
+    """Matches the real, observed convention on ir1: a write-capable legacy job that was
+    deliberately turned off by renaming its cron.d file with a .disabled suffix."""
+    (tmp_path / "virt-carryover-auto.cron.disabled").write_text("0 * * * * root /root/virt-carryover-auto.py\n")
+    result = installer.detect_legacy_bandwidth_automation(cron_dir=str(tmp_path))
+    assert result["found_active"] == []
+    assert result["found_disabled"] == ["virt-carryover-auto.cron.disabled"]
+    assert result["active_write_capable"] is False
+
+
+def test_enable_auto_renewal_refuses_when_legacy_write_capable_job_active(cli_env, monkeypatch, tmp_path):
+    (tmp_path / "virt-bandwidth-topup").write_text("0 * * * * root /root/virt-bandwidth-topup.py\n")
+    monkeypatch.setattr(installer, "LEGACY_CRON_DIR", str(tmp_path))
+    renewal_cli.cmd_install(argparse_namespace())
+    result = installer.enable_auto_renewal(cli_env["config_dir"], renewal_cli.SYSTEMD_OUT_DIR)
+    assert result["ok"] is False
+    assert any("foreign" in p for p in result["problems"])
+    # Never touched the legacy file itself.
+    assert (tmp_path / "virt-bandwidth-topup").read_text() == "0 * * * * root /root/virt-bandwidth-topup.py\n"
+    # Never granted write capability despite the refusal.
+    assert not os.path.exists(os.path.join(cli_env["config_dir"], "WRITE_APPROVED"))
+
+
+def test_enable_auto_renewal_proceeds_with_explicit_override(cli_env, monkeypatch, tmp_path):
+    (tmp_path / "virt-bandwidth-topup").write_text("0 * * * * root /root/virt-bandwidth-topup.py\n")
+    monkeypatch.setattr(installer, "LEGACY_CRON_DIR", str(tmp_path))
+    renewal_cli.cmd_install(argparse_namespace())
+    result = installer.enable_auto_renewal(cli_env["config_dir"], renewal_cli.SYSTEMD_OUT_DIR,
+                                             activate_timer=False,
+                                             override_legacy_write_conflict=True)
+    assert result["ok"] is True
+    assert os.path.exists(os.path.join(cli_env["config_dir"], "WRITE_APPROVED"))
+    assert any("proceeded despite" in s for s in result["steps"])
+
+
 # ---------- health_check --------------------------------------------------------------------------
 
 def test_health_check_ok_after_fresh_install(cli_env):

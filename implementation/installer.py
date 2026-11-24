@@ -44,6 +44,61 @@ def detect_installation_state(config_dir: str, state_dir: str) -> dict:
     }
 
 
+# ---------- legacy / foreign bandwidth-automation detection (v1.10.5) ---------------------------
+
+# Found during a real production audit (ir1/ir2, 2026-11-24): a standalone, pre-existing
+# script-based bandwidth carry-over system (NOT part of this project) was already installed
+# via /etc/cron.d on both hosts during prior troubleshooting -- monitor/ledger/guard scripts
+# that are read-only (never write to Virtualizor), plus one script, matching the "auto"
+# pattern below, that CAN write directly to Virtualizor's MySQL `vps.bandwidth` column. This
+# project must never silently assume it is the only thing managing bandwidth on a host, and
+# must never let an operator enable ITS OWN write-capable timer while a foreign write-capable
+# one might also be active -- that is exactly how a renewal could be double-applied by two
+# independent, mutually-unaware systems. Per explicit instruction, this project NEVER
+# disables, deletes, or modifies anything matching these patterns -- detection only.
+LEGACY_CRON_DIR = "/etc/cron.d"
+LEGACY_CARRYOVER_PATTERNS = ("virt-carryover-monitor", "virt-carryover-ledger",
+                              "virt-carryover-guard", "virt-carryover-auto",
+                              "virt-bandwidth-topup", "virt-customer-topup")
+# A legacy cron filename containing any of these substrings is treated as write-capable for
+# the purposes of this detector's "active_write_capable" flag -- read-only monitor/ledger/
+# guard scripts are reported too, but do not themselves trigger the stronger warning.
+LEGACY_WRITE_CAPABLE_SUBSTRINGS = ("auto", "topup", "apply", "fix")
+
+
+def detect_legacy_bandwidth_automation(cron_dir: str = None) -> dict:
+    """Read-only scan of `cron_dir` (default: the current value of module-level
+    LEGACY_CRON_DIR, resolved HERE at call time rather than bound as an early default
+    parameter value -- a `cron_dir=LEGACY_CRON_DIR` default would bind to whatever
+    LEGACY_CRON_DIR was at function-DEFINITION time, so a test monkeypatching the module
+    attribute afterward would have no effect on calls relying on the default; see
+    updater.apply_update's identical fix earlier in this project's history for the exact
+    same gotcha) for any file whose name matches a known legacy/foreign bandwidth-automation
+    pattern -- never reads file CONTENTS (that would require trusting arbitrary foreign
+    script text), never modifies anything found. A cron.d entry is considered genuinely
+    active if the file exists and its name does not end in `.disabled` (the convention this
+    project observed the real legacy `virt-carryover-auto` job using when it was
+    deliberately turned off) -- a `.disabled`-suffixed file is reported as `found_disabled`,
+    not `found_active`, so an operator can tell at a glance whether a write-capable legacy
+    job is currently armed."""
+    if cron_dir is None:
+        cron_dir = LEGACY_CRON_DIR
+    report = {"found_active": [], "found_disabled": [], "active_write_capable": False}
+    if not os.path.isdir(cron_dir):
+        return report
+    for name in sorted(os.listdir(cron_dir)):
+        base = name[:-len(".disabled")] if name.endswith(".disabled") else name
+        if not any(pattern in base for pattern in LEGACY_CARRYOVER_PATTERNS):
+            continue
+        if name.endswith(".disabled"):
+            report["found_disabled"].append(name)
+        else:
+            report["found_active"].append(name)
+            if any(s in name for s in LEGACY_WRITE_CAPABLE_SUBSTRINGS):
+                report["active_write_capable"] = True
+    return report
+
+
 # ---------- port-conflict detection ---------------------------------------------------------------
 
 def check_port_available(host: str, port: int) -> bool:
@@ -325,7 +380,8 @@ def uninstall_optional_module(module_name: str, config_dir: str, systemd_out_dir
 WRITE_APPROVAL_MARKER_NAME = "WRITE_APPROVED"
 
 
-def enable_auto_renewal(config_dir: str, systemd_src_dir: str, activate_timer: bool = True) -> dict:
+def enable_auto_renewal(config_dir: str, systemd_src_dir: str, activate_timer: bool = True,
+                         override_legacy_write_conflict: bool = False) -> dict:
     """The single, real implementation behind BOTH `renewal_cli.cmd_enable_auto_renewal` and
     `menu.action_toggle_auto_renewal(True)` -- confirmation is always the CALLER's job (this
     function performs no interactive prompting itself, matching every other
@@ -341,6 +397,15 @@ def enable_auto_renewal(config_dir: str, systemd_src_dir: str, activate_timer: b
     confirmation). This function now does all three required steps together:
       1. Validates nodes.json/policy.json load cleanly (refuses -- returns ok=False --
          rather than enabling writes against a config known to be broken).
+      1.5. (v1.10.5) Refuses -- returns ok=False -- if detect_legacy_bandwidth_automation()
+         finds an ACTIVE, write-capable, foreign cron job already managing bandwidth on this
+         host (found during a real production audit: a standalone script-based carry-over
+         system, installed independently of this project, that CAN write directly to
+         Virtualizor's database). Two independently-unaware automatic writers is exactly how
+         a renewal gets double-applied. This project never touches that foreign job itself
+         -- the operator must either confirm it is safe to proceed anyway
+         (`override_legacy_write_conflict=True`, e.g. because the foreign job is being
+         retired deliberately) or resolve the conflict out-of-band first.
       2. Creates WRITE_APPROVAL_MARKER_NAME if not already present.
       3. Sets policy.json's auto_renewal_enabled = True.
       4. If `activate_timer` and running as root: installs+enables the real, write-capable
@@ -354,6 +419,19 @@ def enable_auto_renewal(config_dir: str, systemd_src_dir: str, activate_timer: b
     Returns a report dict; never raises for an expected failure."""
     report = {"ok": True, "steps": [], "problems": [], "write_approved_created": False,
               "timer_activated": False, "manual_command": None}
+
+    legacy = detect_legacy_bandwidth_automation()
+    if legacy["active_write_capable"] and not override_legacy_write_conflict:
+        report["ok"] = False
+        report["problems"].append(
+            f"refusing to enable automatic renewal: a foreign, write-capable bandwidth "
+            f"automation job is already active on this host ({legacy['found_active']}). "
+            f"This was NOT disabled or modified -- resolve the conflict yourself (retire "
+            f"the foreign job, or confirm it is safe to run alongside this one), then "
+            f"re-run with override_legacy_write_conflict=True (CLI: "
+            f"--override-legacy-write-conflict) if you are certain.")
+        report["legacy_bandwidth_automation"] = legacy
+        return report
 
     nodes_path = os.path.join(config_dir, "nodes.json")
     policy_path = os.path.join(config_dir, "policy.json")
@@ -409,6 +487,13 @@ def enable_auto_renewal(config_dir: str, systemd_src_dir: str, activate_timer: b
                 "not running as root -- the apply timer was NOT installed/enabled; "
                 f"run this yourself: {report['manual_command']}")
 
+    report["legacy_bandwidth_automation"] = legacy
+    if legacy["active_write_capable"]:
+        report["steps"].append(
+            f"NOTE: proceeded despite a detected foreign write-capable bandwidth job "
+            f"({legacy['found_active']}) per override_legacy_write_conflict=True -- that "
+            f"job was NOT touched; both are now capable of writing to Virtualizor "
+            f"independently.")
     return report
 
 
@@ -508,6 +593,13 @@ def health_check(config_dir: str, state_dir: str, check_systemd: bool = False) -
         except Exception as e:
             report["ok"] = False
             report["problems"].append(f"{optional} settings did not load: {e}")
+
+    # Purely informational, never affects `ok` -- the presence of a foreign bandwidth
+    # automation job is not itself unhealthy (see detect_legacy_bandwidth_automation's
+    # docstring); it only matters at the moment enable_auto_renewal() is actually called,
+    # where it IS enforced. Surfaced here so an operator checking general health has
+    # visibility into it without needing to know to look.
+    report["legacy_bandwidth_automation"] = detect_legacy_bandwidth_automation()
 
     if check_systemd and shutil.which("systemctl"):
         import service_activation as sa

@@ -1338,10 +1338,26 @@ def action_toggle_auto_renewal(enable: bool, style: "Style" = None):
         print("\nAfter this, VPS instances whose policy marks them eligible will have "
               "their bandwidth renewal actually WRITTEN to Virtualizor by the timer, "
               "unattended.")
+
+        legacy = inst.detect_legacy_bandwidth_automation()
+        override_legacy = False
+        if legacy["active_write_capable"]:
+            print(f"\n{style.RED}WARNING: a foreign, write-capable bandwidth automation "
+                  f"cron job is already active on this host: "
+                  f"{legacy['found_active']}{style.RESET}")
+            print("Running two independent, mutually-unaware automatic writers is exactly "
+                  "how a renewal can be double-applied. This screen will NOT disable or "
+                  "modify that job -- only you can confirm it is safe to proceed anyway.")
+            if not _confirm("Proceed anyway, acknowledging this exact risk?"):
+                print("Cancelled -- no changes made.")
+                return
+            override_legacy = True
+
         if not _confirm("Grant production-write authorization and enable automatic renewal now?"):
             print("Cancelled -- no changes made.")
             return
-        result = inst.enable_auto_renewal(renewal_cli.CONFIG_DIR, renewal_cli.SYSTEMD_OUT_DIR)
+        result = inst.enable_auto_renewal(renewal_cli.CONFIG_DIR, renewal_cli.SYSTEMD_OUT_DIR,
+                                           override_legacy_write_conflict=override_legacy)
     else:
         print("Disabling automatic renewal will remove WRITE_APPROVED (production write "
               "capability), set auto_renewal_enabled=false, and stop/disable the apply "
