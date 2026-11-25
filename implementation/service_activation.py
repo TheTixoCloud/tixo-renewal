@@ -223,3 +223,37 @@ def verify_units_status(unit_pairs) -> dict:
             "service_is_failed": failed["stdout"] or failed["stderr"],
         }
     return report
+
+
+# ---------- v1.10.13: independent watchdog for the readiness notifier itself -----------------
+
+NOTIFIER_UNIT = ("virt-renewal-readiness-notifier.service", "virt-renewal-readiness-notifier.timer")
+
+
+def notifier_disabled_by_operator_marker_path(config_dir: str) -> str:
+    return os.path.join(config_dir, "NOTIFIER_DISABLED_BY_OPERATOR")
+
+
+def watchdog_check_readiness_notifier(config_dir: str, systemd_out_dir: str) -> dict:
+    """Independent watchdog for the readiness notifier itself -- closes the one real gap
+    in readiness_notifier.py's own self-heal (v1.10.11): that self-heal check runs INSIDE
+    the notifier's own scheduled execution, so it can heal every OTHER core timer but can
+    never detect or heal its OWN disablement -- a disabled timer never fires, so it can
+    never run the code that would re-enable it. This function is called from a DIFFERENT
+    timer's execution (cmd_dry_run, the monitor's own ExecStart) instead, so the two
+    provide mutual coverage: the notifier watches the other three core timers, the monitor
+    watches the notifier.
+
+    Respects intentional operator shutdown, explicitly: if
+    NOTIFIER_DISABLED_BY_OPERATOR exists in config_dir (created only by
+    cmd_disable_readiness_notifier, an explicit operator action), this function does
+    NOTHING -- a deliberate disable must never be silently reversed. Never touches the
+    write-capable apply timer and never authorizes a financial write -- this function's
+    entire scope is the enabled/active state of ONE specific read-only timer."""
+    if os.path.exists(notifier_disabled_by_operator_marker_path(config_dir)):
+        return {"action": "none", "reason": "intentionally disabled by operator"}
+    status = verify_units_status([NOTIFIER_UNIT])[NOTIFIER_UNIT[1]]
+    if status["is_enabled"] == "enabled" and status["is_active"] in ("active", "waiting"):
+        return {"action": "none", "reason": "already healthy"}
+    result = install_and_enable_units(systemd_out_dir, [NOTIFIER_UNIT])
+    return {"action": "re-enabled" if result["ok"] else "re-enable-failed", "result": result}

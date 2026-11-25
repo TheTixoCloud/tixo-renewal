@@ -78,7 +78,7 @@ After=network-online.target
 Type=oneshot
 Environment=PYTHONPATH={libdir}
 Environment=TIXO_RENEWAL_INSTALL_DIR={workdir}
-ExecStart=/usr/bin/flock -n {lockpath} {python} {cli} dry-run
+ExecStart=/usr/bin/flock -n {lockpath} {python} {cli} dry-run --check-notifier-watchdog
 WorkingDirectory={workdir}
 User={user}
 """
@@ -799,6 +799,27 @@ def cmd_dry_run(args):
         conn.close()
         print()
 
+    # v1.10.13: independent watchdog for the readiness notifier -- see
+    # service_activation.watchdog_check_readiness_notifier's docstring for why this must
+    # run from a DIFFERENT timer's execution (this is the monitor's own ExecStart) rather
+    # than inside the notifier's own self-heal, which can never detect its own
+    # disablement. OFF by default (matches install_health_check's own check_systemd=False
+    # default, same reasoning) -- only the real monitor systemd unit's ExecStart passes
+    # --check-notifier-watchdog; a plain `dry-run` (manual, or any existing/future test)
+    # must never touch real systemd as an unexpected side effect. Best-effort, never
+    # raises -- a watchdog failure must never break the monitor's own real polling work.
+    if getattr(args, "check_notifier_watchdog", False):
+        try:
+            import service_activation as sa
+            watchdog_result = sa.watchdog_check_readiness_notifier(CONFIG_DIR, SYSTEMD_OUT_DIR)
+            if watchdog_result["action"] == "re-enabled":
+                print(f"Watchdog: readiness notifier was disabled/inactive -- re-enabled.")
+            elif watchdog_result["action"] == "re-enable-failed":
+                print(f"Watchdog: readiness notifier is disabled/inactive and could not be "
+                      f"automatically re-enabled: {watchdog_result['result']['problems']}")
+        except Exception as e:
+            print(f"Watchdog check failed (non-fatal): {e}")
+
 
 # ---------- verify ----------
 
@@ -1412,6 +1433,42 @@ def cmd_disable_auto_renewal(args):
         print(f"  ! {problem}")
     print(f"\nAutomatic renewal {'DISABLED' if result['ok'] else 'disable reported problems'}.")
     return 0 if result["ok"] else 1
+
+
+def cmd_disable_readiness_notifier(args):
+    """v1.10.13: the explicit, supported way to intentionally stop the readiness notifier
+    (e.g. for planned maintenance) WITHOUT the new watchdog (service_activation.
+    watchdog_check_readiness_notifier, run from the monitor's own dry-run cycle) silently
+    re-enabling it again. Creates NOTIFIER_DISABLED_BY_OPERATOR -- the watchdog checks for
+    exactly this marker and does nothing while it exists. Never touches the write-capable
+    apply timer or any financial authorization."""
+    import service_activation as sa
+    if os.geteuid() == 0:
+        result = sa.disable_and_remove_units([sa.NOTIFIER_UNIT])
+        if not result["ok"]:
+            print(f"! Problems stopping the real timer: {result['problems']}")
+    Path(sa.notifier_disabled_by_operator_marker_path(CONFIG_DIR)).write_text(
+        "Created by disable-readiness-notifier -- the watchdog will not re-enable this "
+        "timer while this file exists. Run enable-readiness-notifier to resume.\n")
+    print("Readiness notifier disabled. The watchdog will respect this until "
+          "enable-readiness-notifier is run.")
+    return 0
+
+
+def cmd_enable_readiness_notifier(args):
+    """v1.10.13: reverses cmd_disable_readiness_notifier -- removes the marker and
+    re-installs/re-enables the real timer (if root)."""
+    import service_activation as sa
+    marker = sa.notifier_disabled_by_operator_marker_path(CONFIG_DIR)
+    if os.path.exists(marker):
+        os.remove(marker)
+    if os.geteuid() == 0:
+        result = sa.install_and_enable_units(SYSTEMD_OUT_DIR, [sa.NOTIFIER_UNIT])
+        if not result["ok"]:
+            print(f"! Problems re-enabling the real timer: {result['problems']}")
+            return 1
+    print("Readiness notifier enabled.")
+    return 0
 
 
 # ---------- update (real download/verify/apply, v1.10.2) ----------------------------------------
@@ -2614,6 +2671,16 @@ def main():
              "stop+disable+remove the apply timer -- always all together"
     ).set_defaults(func=cmd_disable_auto_renewal)
 
+    sub.add_parser(
+        "disable-readiness-notifier",
+        help="Intentionally stop the readiness notifier and mark it so the watchdog "
+             "(run from the monitor's own cycle) will not re-enable it"
+    ).set_defaults(func=cmd_disable_readiness_notifier)
+    sub.add_parser(
+        "enable-readiness-notifier",
+        help="Reverse disable-readiness-notifier -- clears the marker and re-enables the timer"
+    ).set_defaults(func=cmd_enable_readiness_notifier)
+
     sub.add_parser("update-check", help="Read-only: current vs. latest GitHub release"
                    ).set_defaults(func=cmd_update_check)
 
@@ -2637,7 +2704,12 @@ def main():
     uninstall_module_p.add_argument("--purge-secrets", action="store_true")
     uninstall_module_p.set_defaults(func=cmd_uninstall_module)
     sub.add_parser("status").set_defaults(func=cmd_status)
-    sub.add_parser("dry-run").set_defaults(func=cmd_dry_run)
+    dry_run_p = sub.add_parser("dry-run")
+    dry_run_p.add_argument(
+        "--check-notifier-watchdog", action="store_true",
+        help="also run the readiness-notifier watchdog check (OFF by default -- only the "
+             "real monitor systemd unit passes this; see cmd_dry_run's docstring)")
+    dry_run_p.set_defaults(func=cmd_dry_run)
     sub.add_parser("verify").set_defaults(func=cmd_verify)
     sub.add_parser("backup").set_defaults(func=cmd_backup)
 

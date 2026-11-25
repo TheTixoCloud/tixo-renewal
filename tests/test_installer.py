@@ -699,3 +699,117 @@ def test_action_install_cancel_does_nothing(cli_env, monkeypatch, capsys):
     menu.action_install(style)
     out = capsys.readouterr().out
     assert "Cancelled" in out
+
+
+# ---------- v1.10.13: independent watchdog for the readiness notifier itself ----------
+
+def _mock_watchdog_systemctl(monkeypatch, tmp_path, pre_existing_state=None):
+    """pre_existing_state: None (no unit files at all -- simulates never-installed),
+    'disabled' (files present, but is-enabled/is-active report disabled/inactive), or
+    'healthy' (enabled/active)."""
+    import service_activation as sa
+    disposable = tmp_path / "fake-etc-systemd-system"
+    disposable.mkdir(exist_ok=True)
+    if pre_existing_state in ("disabled", "healthy"):
+        (disposable / "virt-renewal-readiness-notifier.service").write_text("# fake\n")
+        (disposable / "virt-renewal-readiness-notifier.timer").write_text("# fake\n")
+    monkeypatch.setattr(sa, "SYSTEMD_UNIT_DIR", str(disposable))
+
+    state = {"enabled": pre_existing_state == "healthy"}
+
+    def fake_systemctl(*args, **kwargs):
+        if args and args[0] == "is-enabled":
+            return {"ok": state["enabled"], "stdout": "enabled" if state["enabled"] else "disabled", "stderr": ""}
+        if args and args[0] == "is-active":
+            return {"ok": state["enabled"], "stdout": "active" if state["enabled"] else "inactive", "stderr": ""}
+        if args and args[0] == "is-failed":
+            return {"ok": True, "stdout": "inactive", "stderr": ""}
+        if args and args[0] == "enable":
+            state["enabled"] = True
+            return {"ok": True, "stdout": "", "stderr": ""}
+        if args and args[0] == "daemon-reload":
+            return {"ok": True, "stdout": "", "stderr": ""}
+        return {"ok": True, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(sa, "_systemctl", fake_systemctl)
+    return disposable
+
+
+def test_watchdog_reenables_a_disabled_notifier_timer(monkeypatch, tmp_path):
+    import service_activation as sa
+    _mock_watchdog_systemctl(monkeypatch, tmp_path, pre_existing_state="disabled")
+    systemd_out_dir = tmp_path / "systemd-out"
+    systemd_out_dir.mkdir()
+    (systemd_out_dir / "virt-renewal-readiness-notifier.service").write_text("# generated\n")
+    (systemd_out_dir / "virt-renewal-readiness-notifier.timer").write_text("# generated\n")
+
+    result = sa.watchdog_check_readiness_notifier(str(tmp_path / "config"), str(systemd_out_dir))
+    assert result["action"] == "re-enabled"
+
+
+def test_watchdog_noop_when_already_healthy(monkeypatch, tmp_path):
+    import service_activation as sa
+    _mock_watchdog_systemctl(monkeypatch, tmp_path, pre_existing_state="healthy")
+    result = sa.watchdog_check_readiness_notifier(str(tmp_path / "config"), str(tmp_path / "systemd-out"))
+    assert result["action"] == "none"
+    assert result["reason"] == "already healthy"
+
+
+def test_watchdog_respects_intentional_operator_disable_marker(monkeypatch, tmp_path):
+    """CORE requirement: the watchdog must NEVER reverse a deliberate operator shutdown."""
+    import service_activation as sa
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "NOTIFIER_DISABLED_BY_OPERATOR").write_text("intentional\n")
+    _mock_watchdog_systemctl(monkeypatch, tmp_path, pre_existing_state="disabled")
+    called = []
+    monkeypatch.setattr(sa, "install_and_enable_units", lambda *a, **k: called.append(1))
+
+    result = sa.watchdog_check_readiness_notifier(str(config_dir), str(tmp_path / "systemd-out"))
+    assert result["action"] == "none"
+    assert "operator" in result["reason"]
+    assert called == []  # never even attempted
+
+
+def test_cmd_dry_run_without_flag_never_touches_systemd(cli_env, monkeypatch, tmp_path):
+    """Default behavior (no --check-notifier-watchdog): a plain `dry-run` must never touch
+    systemd at all -- this is what used to leak real systemd writes during an ordinary
+    test run before this flag existed."""
+    import service_activation as sa
+    # cli_env's fake node defaults to mode="ssh" -- mock the fetch so this test doesn't
+    # waste 30s on a real, doomed connection attempt to a TEST-NET-3 address, same
+    # convention every other fast dry-run test in this project already uses.
+    monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [])
+    called = []
+    monkeypatch.setattr(sa, "watchdog_check_readiness_notifier", lambda *a, **k: called.append(1))
+    renewal_cli.cmd_install(argparse_namespace())
+    renewal_cli.cmd_dry_run(argparse_namespace())
+    assert called == []
+
+
+def test_cmd_dry_run_with_flag_runs_the_watchdog(cli_env, monkeypatch, tmp_path):
+    import service_activation as sa
+    monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [])
+    called = []
+    monkeypatch.setattr(sa, "watchdog_check_readiness_notifier",
+                         lambda *a, **k: (called.append(1), {"action": "none", "reason": "already healthy"})[1])
+    renewal_cli.cmd_install(argparse_namespace())
+    renewal_cli.cmd_dry_run(argparse_namespace(check_notifier_watchdog=True))
+    assert called == [1]
+
+
+def test_cmd_disable_readiness_notifier_creates_marker_and_cmd_enable_removes_it(
+        cli_env, monkeypatch, tmp_path):
+    import service_activation as sa
+    _mock_watchdog_systemctl(monkeypatch, tmp_path, pre_existing_state="healthy")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    renewal_cli.cmd_install(argparse_namespace())
+
+    rc = renewal_cli.cmd_disable_readiness_notifier(argparse_namespace())
+    assert rc == 0
+    marker = sa.notifier_disabled_by_operator_marker_path(renewal_cli.CONFIG_DIR)
+    assert os.path.exists(marker)
+
+    rc2 = renewal_cli.cmd_enable_readiness_notifier(argparse_namespace())
+    assert rc2 == 0
+    assert not os.path.exists(marker)
