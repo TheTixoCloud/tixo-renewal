@@ -1362,6 +1362,55 @@ def test_render_vps_table_wide_tier_unlimited_shows_textual_limit_not_bytes(monk
     assert "500.00 GB" in out  # actual usage still shown, never hidden just because unlimited
 
 
+def test_render_vps_table_shows_created_column_only_at_extra_wide_width(monkeypatch):
+    """v1.10.13: 'Created' is deliberately NOT part of the base wide tier (100-119 cols)
+    -- only genuinely extra-wide terminals (>=120) gain it, so the existing, already-
+    tested 100-119 column set/widths never shift for anyone at exactly 100 cols."""
+    import shutil
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+    record = _vps_record()
+    record["verified_created_epoch"] = created_epoch
+
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback=None: os.terminal_size((100, 24)))
+    out_100 = menu.render_vps_table([record], menu.Style(enabled=False), display_tz="UTC")
+    assert "Created" not in out_100
+
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback=None: os.terminal_size((120, 24)))
+    out_120 = menu.render_vps_table([record], menu.Style(enabled=False), display_tz="UTC")
+    assert "Created" in out_120
+    assert "2026-09-15" in out_120
+
+
+def test_render_vps_table_created_column_honest_when_unverified(monkeypatch):
+    import shutil
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback=None: os.terminal_size((120, 24)))
+    record = _vps_record()  # no verified_created_epoch set at all
+    out = menu.render_vps_table([record], menu.Style(enabled=False), display_tz="UTC")
+    assert "unknown" in out  # never a fabricated date
+
+
+def test_render_vps_table_created_column_stays_aligned_with_colored_progress_bar(monkeypatch):
+    """The progress bar (used for the Usage %% column) embeds ANSI color codes, which
+    _display_width would otherwise miscount, silently misaligning every subsequent
+    column. Build two rows with different percentages (different rendered-text widths
+    once colored) and confirm the Created column still lines up in both."""
+    import shutil
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda fallback=None: os.terminal_size((120, 24)))
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+    records = [
+        _vps_record(vpsid=1, used_gb="5", quota_gb="100"),   # 5.0%
+        _vps_record(vpsid=2, used_gb="99", quota_gb="100"),  # 99.0%
+    ]
+    for r in records:
+        r["verified_created_epoch"] = created_epoch
+    out = menu.render_vps_table(records, menu.Style(enabled=True), display_tz="UTC")
+    lines = [l for l in out.splitlines() if "2026-09-15" in l]
+    assert len(lines) == 2
+    # Both rows' "Created" text must start at the SAME column position.
+    positions = [l.index("2026-09-15") for l in lines]
+    assert positions[0] == positions[1]
+
+
 def test_render_vps_table_progress_bar_stays_compact(monkeypatch):
     import shutil
     monkeypatch.setattr(shutil, "get_terminal_size",

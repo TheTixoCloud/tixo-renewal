@@ -816,6 +816,10 @@ def _char_display_width(ch: str) -> int:
     return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
 
 
+import re as _re_module
+_ANSI_ESCAPE_RE = _re_module.compile(r"\x1b\[[0-9;]*m")
+
+
 def _display_width(s: str) -> int:
     return sum(_char_display_width(c) for c in s)
 
@@ -874,7 +878,27 @@ def _format_gb_display(value) -> str:
         return "unavailable"
 
 
-def render_vps_table(records: list[dict], style: Style) -> str:
+def _format_short_created_date(created_epoch, tz_name: str) -> str:
+    """Compact, date-only (no time) rendering for the inventory LIST's optional 'Created'
+    column -- Gregorian or Jalali per the SAME Tehran-switch convention format_local_time
+    already uses, just without the time-of-day portion (there's no room for it in a table
+    column). Returns 'unknown' honestly, never a fabricated date, when no verified
+    creation epoch is available for this VPS yet (e.g. inventory-synced but never polled
+    by the monitor)."""
+    if created_epoch is None:
+        return "unknown"
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromtimestamp(created_epoch, tz=timezone.utc).astimezone(ZoneInfo(tz_name))
+        if tz_name == "Asia/Tehran":
+            import jalali
+            return jalali.format_jalali_date(dt)
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return "unknown"
+
+
+def render_vps_table(records: list[dict], style: Style, display_tz: str = "UTC") -> str:
     """Adapts to the terminal width across three tiers -- wide (>=100 cols): the full
     VPS ID / Name / IP / Status / Used / Limit / Usage %% column set from the spec, in that
     exact order; medium (70-99): VPS ID / Name / Status / Used / Limit / Usage %%, IP
@@ -903,9 +927,19 @@ def render_vps_table(records: list[dict], style: Style) -> str:
 
     if tier == "wide":
         name_w, ip_w, used_w, limit_w = 20, 15, 10, 10
+        # v1.10.13: an EXTRA-wide terminal (>=120 cols) also shows a 'Created' column --
+        # deliberately NOT part of the base wide tier (100-119 cols) so the existing,
+        # already-tested column set/widths never shift for anyone at exactly 100 cols.
+        # Honors 'unknown' honestly (never fabricated) via
+        # _format_short_created_date/record['verified_created_epoch'], which the caller
+        # (action_inventory_view) populates from shadow_monitor's identities table --
+        # never a second, parallel source of truth for creation dates.
+        show_created = term_width >= 120
+        created_w = 11
         header = (f"  {_pad_display('VPS ID', 7, '>')}  {_pad_display('Name', name_w)}  "
                   f"{_pad_display('IP', ip_w)}  {_pad_display('Status', 10)}  "
-                  f"{_pad_display('Used', used_w, '>')}  {_pad_display('Limit', limit_w, '>')}  Usage %")
+                  f"{_pad_display('Used', used_w, '>')}  {_pad_display('Limit', limit_w, '>')}  Usage %"
+                  + (f"  {_pad_display('Created', created_w)}" if show_created else ""))
         lines.append(style.BOLD + style.ACCENT + header + style.RESET)
         for r in records:
             is_unlimited, pct = _vps_usage_fraction(r)
@@ -920,12 +954,28 @@ def render_vps_table(records: list[dict], style: Style) -> str:
             ip = _truncate_display(str(r.get("ip_primary", "unavailable")), ip_w)
             name = _truncate_display(str(r.get("hostname")), name_w)
             limit_display = "UNLIMITED" if is_unlimited else _format_gb_display(r.get("quota_gb"))
+            created_suffix = ""
+            if show_created:
+                # usage_display's own rendered width varies (progress-bar percentage is
+                # 4-6 chars depending on digit count, "UNLIMITED" is 9, "?" is 1) AND may
+                # contain embedded ANSI color codes (render_progress_bar colors the bar
+                # itself) -- _pad_display/_display_width count escape-sequence bytes as
+                # visible characters, so padding the already-colored string directly
+                # would under-pad and misalign. Strip ANSI before measuring, pad the
+                # plain width, then append the (still-colored) string plus the needed
+                # spaces -- never alters the colored content itself, only the trailing
+                # whitespace. This drift was invisible before: Usage % used to be the
+                # last column with nothing after it to misalign against.
+                created_display = _format_short_created_date(r.get("verified_created_epoch"), display_tz)
+                created_suffix = f"  {_pad_display(created_display, created_w)}"
+                plain_usage = _ANSI_ESCAPE_RE.sub("", usage_display)
+                usage_display = usage_display + " " * max(0, 17 - _display_width(plain_usage))
             lines.append(
                 f"  {_pad_display(str(r['vpsid']), 7, '>')}  {_pad_display(name, name_w)}  "
                 f"{_pad_display(ip, ip_w)}  "
                 f"{color}{_pad_display(_truncate_display(str(runtime_status), 10), 10)}{style.RESET}  "
                 f"{_pad_display(_format_gb_display(r.get('used_gb')), used_w, '>')}  "
-                f"{_pad_display(limit_display, limit_w, '>')}  {usage_display}")
+                f"{_pad_display(limit_display, limit_w, '>')}  {usage_display}{created_suffix}")
 
     elif tier == "medium":
         name_w, used_w, limit_w = 16, 10, 10
@@ -1839,9 +1889,33 @@ def _render_coverage_banner(sync_info: dict, style: Style) -> str:
     return f"{style.GREEN}Snapshot complete{style.RESET}{coverage}"
 
 
+def _merge_verified_created_epochs(records: list, node_id: str) -> None:
+    """v1.10.13: merges each VPS's verified creation epoch (shadow_monitor's identities
+    table) into its inventory record IN PLACE, so render_vps_table can show it in
+    extra-wide terminals -- the SAME source of truth render_vps_detail's enrichment
+    already uses (_vps_renewal_detail_info), never a second, divergent source. Best
+    effort -- a missing/unreadable monitor database just leaves verified_created_epoch
+    unset (rendered honestly as 'unknown'), never crashes the inventory screen."""
+    try:
+        monitor_db_path = os.path.join(renewal_cli.STATE_DIR, f"{node_id}.sqlite3")
+        if not os.path.exists(monitor_db_path):
+            return
+        monitor_conn = sm.open_db(monitor_db_path)
+        try:
+            created_by_vpsid = dict(monitor_conn.execute("SELECT vpsid, created_epoch FROM identities"))
+        finally:
+            monitor_conn.close()
+        for r in records:
+            r["verified_created_epoch"] = created_by_vpsid.get(r["vpsid"])
+    except Exception:
+        pass
+
+
 def action_inventory_view(style: Style, node_id: str = "self"):
     conn = inv.open_db(_inventory_db_path())
     records = inv.latest_records(conn, node_id)
+    _merge_verified_created_epochs(records, node_id)
+    display_tz = load_display_tz(renewal_cli.CONFIG_DIR)
     settings = load_dashboard_settings(renewal_cli.CONFIG_DIR)
     threshold = Decimal(settings["usage_threshold_percent"])
     sync_info = inv.last_sync_info(conn, node_id)
@@ -1871,7 +1945,7 @@ def action_inventory_view(style: Style, node_id: str = "self"):
 
         filtered = filter_and_sort_vps(records, search=search, status_filter=status_filter, sort_by=sort_by)
         page_records, page, total_pages = paginate(filtered, page=page, page_size=page_size)
-        print(render_vps_table(page_records, style))
+        print(render_vps_table(page_records, style, display_tz=display_tz))
         print(f"\n  Page {page}/{total_pages}  ({len(filtered)} matching of {len(records)} total)  "
               f"sorted by: {sort_by}")
         print(f"  {style.GRAY}[n]ext page  [p]rev page  [s]earch  [f]ilter status  [o]rder/sort  "
@@ -1903,6 +1977,7 @@ def action_inventory_view(style: Style, node_id: str = "self"):
                   f"schedule -- this forces one extra read-only sync right now.{style.RESET}")
             action_inventory_sync(node_id, style=style)
             records = inv.latest_records(conn, node_id)
+            _merge_verified_created_epochs(records, node_id)
             sync_info = inv.last_sync_info(conn, node_id)
             state = isync.load_sync_state(renewal_cli.STATE_DIR)
             freshness = isync.classify_freshness(

@@ -94,14 +94,16 @@ def build_app(renewal_cli_mod, menu_mod):
         BINDINGS = [Binding("escape", "dismiss_detail", "Back"),
                     Binding("0", "dismiss_detail", "Back")]
 
-        def __init__(self, record: dict, style):
+        def __init__(self, record: dict, style, node_id: str = "self"):
             super().__init__()
             self.record = record
             self.style = style
+            self.node_id = node_id
 
         def compose(self) -> ComposeResult:
             yield Container(
-                Static(menu_mod.render_vps_detail(self.record, self.style), id="vps-detail-body"),
+                Static(menu_mod.render_vps_detail(self.record, self.style, node_id=self.node_id),
+                       id="vps-detail-body"),
                 Label("[0 / esc] Back to inventory", id="vps-detail-hint"),
                 id="vps-detail-dialog",
             )
@@ -137,7 +139,20 @@ def build_app(renewal_cli_mod, menu_mod):
 
         def __init__(self):
             super().__init__()
-            self._node_id = "self"
+            # v1.10.13: derive the real configured node_id instead of hardcoding "self" --
+            # every real host-local install only ever has one node and it IS "self" (see
+            # nodes.LOCAL_DEPLOYMENT_NODE_TEMPLATE), so this makes no observable difference
+            # today, but it means this screen stays correct rather than silently assuming
+            # a specific id if that ever changes, instead of a second place that could
+            # drift from whatever renewal_cli/menu.py actually resolve. Never raises --
+            # falls back to "self" exactly like every other screen's own default.
+            try:
+                import nodes as nodes_mod
+                import renewal_cli as _rc
+                configured = nodes_mod.load_nodes(_rc._node_config_path())
+                self._node_id = configured[0].node_id if configured else "self"
+            except Exception:
+                self._node_id = "self"
             self._inventory_records = []
 
         def compose(self) -> ComposeResult:
@@ -190,7 +205,7 @@ def build_app(renewal_cli_mod, menu_mod):
                 return
             record = next((r for r in self._inventory_records if r["vpsid"] == vpsid), None)
             if record is not None:
-                self.push_screen(VpsDetailScreen(record, self._plain_style()))
+                self.push_screen(VpsDetailScreen(record, self._plain_style(), node_id=self._node_id))
 
         def _plain_style(self):
             return menu_mod.Style(enabled=False)
