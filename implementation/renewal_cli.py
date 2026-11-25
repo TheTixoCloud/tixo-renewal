@@ -20,7 +20,7 @@ Commands:
 """
 from __future__ import annotations
 
-VERSION = "1.10.12"
+VERSION = "1.10.13"
 
 # Minimal spacing between consecutive real API calls across DIFFERENT VPS within one
 # apply-due run -- a basic, sensible rate-limit control so a host with many eligible VPS at
@@ -993,8 +993,17 @@ def cmd_rollback(args):
         return 1
     backup_path = os.path.join(BACKUP_DIR, args.backup_file)
     target = node.db_path(STATE_DIR)
-    backup_mod.restore_db(backup_path, target)
+    try:
+        backup_mod.restore_db(backup_path, target, allow_replay_risk=getattr(args, "allow_replay_risk", False))
+    except backup_mod.ReplayRiskError as e:
+        print(f"BLOCKED: {e}")
+        print("\nThis restore would make the system forget renewal(s) that Virtualizor "
+              "has ALREADY received -- the next apply cycle could write them again. If "
+              "you have independently verified this is safe, re-run with "
+              "--allow-replay-risk.")
+        return 1
     print(f"Restored {args.backup_file} -> {target} (previous state saved as {target}.pre-restore.sqlite3)")
+    return 0
 
 
 # ---------- unified installer: detect / upgrade / repair / rollback -----------------------------
@@ -2648,6 +2657,10 @@ def main():
     rollback_p.add_argument("--node")
     rollback_p.add_argument("--backup-file")
     rollback_p.add_argument("--yes", action="store_true")
+    rollback_p.add_argument("--allow-replay-risk", action="store_true",
+                             help="override the refusal to restore a backup that would "
+                                  "resurrect an already-APPLIED renewal for possible "
+                                  "re-write -- only after independently verifying it's safe")
     rollback_p.set_defaults(func=cmd_rollback)
 
     uninstall_preview_p = sub.add_parser(

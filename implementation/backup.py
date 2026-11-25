@@ -43,6 +43,12 @@ class BackupEncryptionUnavailable(Exception):
     pass
 
 
+class ReplayRiskError(Exception):
+    """Raised by restore_db() when restoring would resurrect an already-APPLIED renewal --
+    see find_applied_operations_at_risk_of_replay's docstring."""
+    pass
+
+
 def backup_db(db_path: str, backup_root: str, label: str = None) -> str:
     """Creates a consistent snapshot of db_path under backup_root/<timestamp>-<label>.sqlite3.
     Returns the backup file path. Safe to call while the source DB is open elsewhere (WAL)."""
@@ -68,11 +74,80 @@ def list_backups(backup_root: str) -> list[str]:
     return sorted(f for f in os.listdir(backup_root) if f.endswith(".sqlite3"))
 
 
-def restore_db(backup_path: str, target_db_path: str) -> None:
+def find_applied_operations_at_risk_of_replay(current_db_path: str, backup_path: str) -> list[dict]:
+    """CRITICAL financial-safety check (v1.10.13 -- found during a full audit, not a
+    reported incident): restoring a backup taken BEFORE a renewal was applied resurrects
+    the OLDER, pre-write local state -- the renewal_checkpoints row goes back to FLAGGED
+    and the `operations` row recording the completed write simply doesn't exist in that
+    older snapshot. Nothing in apply_due's own duplicate-protection can see this, because
+    it is a purely LOCAL-state check (find_any_prior_operation) -- it has no way to know
+    Virtualizor's live quota was already changed by a write this restored database has
+    never heard of. The result: the next apply_due cycle would re-compute a proposal from
+    the stale pre-reset baseline and call the REAL managevps API again -- a genuine
+    duplicate write, not merely a confusing report.
+
+    Returns every operation that is APPLIED in `current_db_path` but would NOT be (missing,
+    or a different/non-terminal status) in `backup_path` -- i.e., every completed financial
+    operation this restore would make the system forget ever happened. An empty list means
+    the restore is safe with respect to this specific risk (it may still not be what the
+    operator wants for other reasons, but it cannot cause a duplicate write)."""
+    if not os.path.exists(current_db_path) or not os.path.exists(backup_path):
+        return []  # nothing to compare against -- caller's existing FileNotFoundError path handles this
+    at_risk = []
+    current_conn = sqlite3.connect(f"file:{current_db_path}?mode=ro", uri=True)
+    try:
+        current_applied = {
+            row[0]: row for row in current_conn.execute(
+                "SELECT period_key, vpsid, requested_new_quota_gb, verified_after_quota_gb, "
+                "created_at FROM operations WHERE status='APPLIED'")
+        }
+    except sqlite3.OperationalError:
+        current_applied = {}  # no operations table yet -- nothing to lose
+    finally:
+        current_conn.close()
+    if not current_applied:
+        return []
+
+    backup_conn = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
+    try:
+        backup_statuses = {
+            row[0]: row[1] for row in backup_conn.execute(
+                "SELECT period_key, status FROM operations")
+        }
+    except sqlite3.OperationalError:
+        backup_statuses = {}
+    finally:
+        backup_conn.close()
+
+    for period_key, row in current_applied.items():
+        if backup_statuses.get(period_key) != "APPLIED":
+            at_risk.append({
+                "period_key": period_key, "vpsid": row[1],
+                "requested_new_quota_gb": row[2], "verified_after_quota_gb": row[3],
+                "applied_at": row[4],
+            })
+    return at_risk
+
+
+def restore_db(backup_path: str, target_db_path: str, allow_replay_risk: bool = False) -> None:
     """Restores a backup over the live database file. The CURRENT state is itself backed up
-    first (to `<target>.pre-restore.sqlite3`) so a bad rollback choice is never unrecoverable."""
+    first (to `<target>.pre-restore.sqlite3`) so a bad rollback choice is never unrecoverable.
+
+    Refuses by default (raises ReplayRiskError, never silently proceeds) if this would
+    resurrect a renewal that was already genuinely APPLIED -- see
+    find_applied_operations_at_risk_of_replay's docstring for exactly why that is a real
+    duplicate-write risk, not a hypothetical one. `allow_replay_risk=True` is the explicit,
+    deliberate override for an operator who has independently verified this is safe (e.g.
+    restoring unrelated history on a node where the at-risk VPS no longer exists)."""
     if not os.path.exists(backup_path):
         raise FileNotFoundError(f"no backup at {backup_path}")
+    at_risk = find_applied_operations_at_risk_of_replay(target_db_path, backup_path)
+    if at_risk and not allow_replay_risk:
+        raise ReplayRiskError(
+            f"refusing to restore: {len(at_risk)} already-APPLIED renewal(s) would be "
+            f"forgotten by this restore and could be WRITTEN AGAIN by the next apply "
+            f"cycle: {at_risk}. Pass allow_replay_risk=True only after independently "
+            f"confirming this is safe.")
     if os.path.exists(target_db_path):
         safety_copy = target_db_path + ".pre-restore.sqlite3"
         shutil.copy2(target_db_path, safety_copy)

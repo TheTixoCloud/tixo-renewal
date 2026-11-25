@@ -960,7 +960,75 @@ def render_vps_table(records: list[dict], style: Style) -> str:
     return "\n".join(lines)
 
 
-def render_vps_detail(record: dict, style: Style) -> str:
+def _next_anniversary_from_epoch(anchor_epoch: int, now: datetime = None) -> datetime:
+    """Same calendar arithmetic as shadow_monitor.next_anniversary_report, but
+    parameterized by the already-RESOLVED billing anchor epoch, not the raw verified
+    creation epoch directly -- the two differ whenever an operator has configured an
+    EXPLICIT per-host/per-VPS billing_anchor override (policy.py's billing_anchor_epoch
+    already resolves this correctly; this must never silently fall back to using creation
+    date alone, or the inventory screen would show a renewal date inconsistent with what
+    the real engine actually uses)."""
+    anchor_dt = datetime.fromtimestamp(anchor_epoch, tz=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    year, month = now.year, now.month
+    import calendar as _cal
+    day = min(anchor_dt.day, _cal.monthrange(year, month)[1])
+    candidate = datetime(year, month, day, anchor_dt.hour, anchor_dt.minute, tzinfo=timezone.utc)
+    if candidate <= now:
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+        day = min(anchor_dt.day, _cal.monthrange(year, month)[1])
+        candidate = datetime(year, month, day, anchor_dt.hour, anchor_dt.minute, tzinfo=timezone.utc)
+    return candidate
+
+
+def _vps_renewal_detail_info(node_id: str, vpsid: int) -> dict:
+    """Read-only enrichment for render_vps_detail: verified creation date, resolved
+    billing-cycle anchor, next expected renewal date, and renewal eligibility state --
+    reusing the EXACT SAME underlying data and classification logic `readiness`/`dry-run`
+    already use (shadow_monitor's identities table, policy.resolve_policy,
+    renewal_cli._per_vps_readiness), never a second, parallel computation that could
+    silently drift out of sync with what the real engine actually does. Every field stays
+    None/'UNKNOWN' -- never fabricated -- if the underlying data doesn't exist yet (e.g. a
+    VPS inventory-synced but never seen by the monitor poll, which tracks identity
+    separately from inventory)."""
+    info = {"verified_created_epoch": None, "billing_anchor_epoch": None,
+            "next_expected_renewal": None, "renewal_state": "UNKNOWN (never polled by the monitor)"}
+    try:
+        db_path = os.path.join(renewal_cli.STATE_DIR, f"{node_id}.sqlite3")
+        if not os.path.exists(db_path):
+            return info
+        conn = sm.open_db(db_path)
+        try:
+            row = conn.execute("SELECT created_epoch FROM identities WHERE vpsid=?", (vpsid,)).fetchone()
+            if row is None:
+                return info
+            info["verified_created_epoch"] = row[0]
+
+            policy_config = None
+            try:
+                policy_config = pol.load_policy_config(renewal_cli._policy_config_path())
+            except Exception:
+                pass
+            if policy_config is None:
+                return info
+            import policy_integration as pi
+            resolved = pol.resolve_policy(policy_config, node_id, vpsid)
+            anchor = pi.billing_anchor_epoch(resolved, row[0])
+            info["billing_anchor_epoch"] = anchor
+            if anchor is not None:
+                info["next_expected_renewal"] = _next_anniversary_from_epoch(anchor).isoformat()
+            buckets = renewal_cli._per_vps_readiness(conn, node_id, policy_config)
+            info["renewal_state"] = buckets.get(vpsid, "UNKNOWN")
+        finally:
+            conn.close()
+    except Exception:
+        pass  # a display enrichment must never crash the inventory screen
+    return info
+
+
+def render_vps_detail(record: dict, style: Style, node_id: str = "self") -> str:
     """STATUS FIELDS ARE DELIBERATELY SPLIT (v1.7.2) into three distinct concepts, per the
     real-world confusion this is designed to avoid: Runtime Status (is the VM actually
     powered on right now -- from virtualizor_info.fetch_vs_status_bulk's authoritative bulk
@@ -982,6 +1050,17 @@ def render_vps_detail(record: dict, style: Style) -> str:
         lines.append(f"  Network Suspended: no")
     lines.append(f"  Quota:          {record.get('quota_gb')} GB")
     lines.append(f"  Used:           {record.get('used_gb')} GB")
+    is_unlimited, pct = _vps_usage_fraction(record)
+    if is_unlimited:
+        lines.append(f"  Remaining:      UNLIMITED")
+        lines.append(f"  Usage %:        -- (unlimited)")
+    else:
+        try:
+            remaining = max(Decimal(0), Decimal(str(record.get("quota_gb"))) - Decimal(str(record.get("used_gb"))))
+            lines.append(f"  Remaining:      {remaining} GB")
+        except Exception:
+            lines.append(f"  Remaining:      unknown")
+        lines.append(f"  Usage %:        {f'{float(pct):.1f}%' if pct is not None else 'unknown'}")
     lines.append(f"  RAM:            {record.get('ram_mb')} MB")
     lines.append(f"  Cores:          {record.get('cores')}")
     lines.append(f"  Disk:           {record.get('disk_gb')} GB")
@@ -993,6 +1072,42 @@ def render_vps_detail(record: dict, style: Style) -> str:
     ip_list = record.get("ip_list")
     if isinstance(ip_list, list) and ip_list:
         lines.append(f"  All assigned IPs: {', '.join(str(ip) for ip in ip_list)}")
+
+    # v1.10.13: VPS creation date / billing-cycle / renewal info -- deliberately a SEPARATE
+    # section, never merged with the fields above, because creation date, bandwidth
+    # renewal date, and commercial service expiration date are three genuinely different
+    # concepts this project must never conflate (Virtualizor exposes no reliable
+    # "commercial expiration" field this project can read at all -- that's reported
+    # honestly as unavailable, never guessed from the renewal anchor).
+    lines.append("")
+    lines.append(f"{style.BOLD}{style.ACCENT}  Bandwidth renewal{style.RESET}")
+    renewal_info = _vps_renewal_detail_info(node_id, record["vpsid"])
+    tz_name = load_display_tz(renewal_cli.CONFIG_DIR)
+    created_epoch = renewal_info["verified_created_epoch"]
+    if created_epoch is None:
+        lines.append(f"  Creation date (verified): {style.GRAY}unknown -- this VPS has not "
+                      f"yet been observed by the monitor{style.RESET}")
+    else:
+        created_iso = datetime.fromtimestamp(created_epoch, tz=timezone.utc).isoformat()
+        lines.append(f"  Creation date (verified): {format_local_time(created_iso, tz_name)}")
+    anchor_epoch = renewal_info["billing_anchor_epoch"]
+    if anchor_epoch is not None:
+        anchor_iso = datetime.fromtimestamp(anchor_epoch, tz=timezone.utc).isoformat()
+        same_as_creation = anchor_epoch == created_epoch
+        lines.append(f"  Billing-cycle anchor:     {format_local_time(anchor_iso, tz_name)}"
+                      + ("" if same_as_creation else "  (explicit override, differs from creation date)"))
+    else:
+        lines.append(f"  Billing-cycle anchor:     {style.GRAY}unknown{style.RESET}")
+    next_renewal = renewal_info["next_expected_renewal"]
+    if next_renewal is not None:
+        lines.append(f"  Next expected renewal:    {format_local_time(next_renewal, tz_name)}")
+    else:
+        lines.append(f"  Next expected renewal:    {style.GRAY}unknown -- no verified anchor "
+                      f"to compute it from yet{style.RESET}")
+    lines.append(f"  Renewal state:            {renewal_info['renewal_state']}")
+    lines.append(f"  {style.GRAY}Commercial service expiration date: not available -- "
+                  f"Virtualizor's API does not expose this to this project; never inferred "
+                  f"from the renewal anchor.{style.RESET}")
     return "\n".join(lines)
 
 
@@ -1804,7 +1919,7 @@ def action_inventory_view(style: Style, node_id: str = "self"):
             if detail is None:
                 print(f"{style.RED}No VPS with id {vpsid_raw!r} in the current snapshot.{style.RESET}")
             else:
-                print(render_vps_detail(detail, style))
+                print(render_vps_detail(detail, style, node_id=node_id))
         else:
             print("Unrecognized option.")
 

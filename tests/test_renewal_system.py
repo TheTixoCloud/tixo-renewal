@@ -446,6 +446,49 @@ def test_backup_and_rollback_cli_roundtrip(cli_env, monkeypatch):
     assert sqlite3.connect(db_path).execute("SELECT COUNT(*) FROM identities").fetchone()[0] == 1
 
 
+def test_rollback_refuses_to_resurrect_an_already_applied_renewal_for_replay(cli_env, monkeypatch):
+    """CRITICAL financial-safety regression, found during a full product audit (not a
+    reported incident): restoring a backup taken BEFORE a renewal was APPLIED makes the
+    local ledger forget it ever happened -- renewal_checkpoints reverts to FLAGGED and the
+    operations row recording the completed write simply isn't in that older snapshot.
+    Nothing in apply_due's own duplicate-protection (a purely LOCAL check) can see that
+    Virtualizor's live quota was already changed by a write this restored database has
+    never heard of -- the next apply cycle would compute a fresh proposal from the stale
+    baseline and call the real API AGAIN. `rollback` must refuse this by default."""
+    renewal_cli.cmd_install(argparse_namespace())
+    db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
+
+    # A backup taken BEFORE any renewal was ever applied.
+    renewal_cli.cmd_backup(argparse_namespace())
+    backups = backup_mod.list_backups(renewal_cli.BACKUP_DIR)
+    pre_application_backup = backups[0]
+
+    # Now a renewal genuinely gets APPLIED (exactly like the real IR1 incident's outcome).
+    import writer as writer_mod
+    conn = sqlite3.connect(db_path)
+    writer_mod.record_operation_start(conn, "op1", "test-node", 62, "62|123|1", Decimal("1065"))
+    writer_mod.record_operation_result(conn, "op1", "APPLIED", api_response="ok",
+                                         verified_after_quota_gb=Decimal("1065"))
+    conn.close()
+
+    # Restoring the pre-application backup must be BLOCKED by default.
+    ns = argparse_namespace(node="test-node", backup_file=pre_application_backup, yes=True,
+                             allow_replay_risk=False)
+    rc = renewal_cli.cmd_rollback(ns)
+    assert rc == 1
+    # The live database must be UNTOUCHED -- the APPLIED record must still be there.
+    conn = sqlite3.connect(db_path)
+    op = conn.execute("SELECT status FROM operations WHERE vpsid=62").fetchone()
+    conn.close()
+    assert op == ("APPLIED",), "the restore must not have proceeded -- the record must survive"
+
+    # With the explicit override, it's the operator's deliberate choice.
+    ns2 = argparse_namespace(node="test-node", backup_file=pre_application_backup, yes=True,
+                              allow_replay_risk=True)
+    rc2 = renewal_cli.cmd_rollback(ns2)
+    assert rc2 == 0
+
+
 def test_rollback_without_yes_refuses(cli_env):
     renewal_cli.cmd_install(argparse_namespace())
     ns = argparse_namespace(node="test-node", backup_file="whatever.sqlite3", yes=False)
@@ -2130,3 +2173,72 @@ def test_status_distinguishes_ordinary_from_genuinely_ambiguous_frozen_entries(
     assert "1 total" in out
     assert "1 ordinary/no-action-needed" in out
     assert "0 genuinely ambiguous" in out
+
+
+def test_crash_between_applied_write_and_backlog_consumption_never_duplicates(cli_env, monkeypatch):
+    """Crash-safety audit of the v1.10.12 durable backlog, explicitly requested: if the
+    process crashes AFTER writer.apply_renewal() durably commits an APPLIED operation row
+    but BEFORE sm.mark_renewal_consumed() runs, the backlog entry stays FLAGGED and will be
+    offered again on the next apply_due cycle. This must NEVER cause a second real write --
+    writer.apply_renewal()'s own find_any_prior_operation() check (an independent,
+    unconditional guard, not something the backlog relies on) must see the existing
+    operation row and refuse before ever touching the API again."""
+    renewal_cli.cmd_install(argparse_namespace())
+    os.makedirs(renewal_cli.CONFIG_DIR, exist_ok=True)
+    import credentials as creds_mod
+    creds_mod.store_credentials(
+        creds_mod.default_credentials_path(renewal_cli.CONFIG_DIR, "test-node"),
+        "https://example.invalid", "k", "p")
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+
+    def poll_at(ts, used):
+        monkeypatch.setattr(renewal_cli.sm, "utcnow_iso", lambda: ts.isoformat())
+        monkeypatch.setattr(renewal_cli.sm, "fetch_live_rows", lambda ssh_cmd=None: [
+            {"vpsid": 88, "created_epoch": created_epoch, "quota_gb": Decimal("1000"),
+             "used_gb": Decimal(str(used))}])
+        renewal_cli.cmd_dry_run(argparse_namespace())
+
+    poll_at(datetime(2026, 10, 15, 9, 58, tzinfo=timezone.utc), "900")
+    poll_at(datetime(2026, 10, 15, 10, 3, tzinfo=timezone.utc), "1")
+
+    policy_path = renewal_cli._policy_config_path()
+    data = json.loads(open(policy_path).read())
+    data["global_defaults"]["auto_renewal_enabled"] = True
+    open(policy_path, "w").write(json.dumps(data))
+    open(renewal_cli.WRITE_APPROVAL_MARKER, "w").write("approved")
+
+    import writer as writer_mod, time as time_mod, local_source as ls
+    monkeypatch.setattr(writer_mod, "call_managevps_api", lambda *a, **k: {"raw": "ok"})
+    monkeypatch.setattr(time_mod, "sleep", lambda s: None)
+    reads = iter([Decimal("1"), Decimal("100"), Decimal("100")])
+    monkeypatch.setattr(ls, "fetch_single_vps_quota", lambda vpsid: next(reads))
+
+    # Simulate the crash: patch mark_renewal_consumed to raise AFTER apply_renewal has
+    # already durably committed -- i.e. exactly the window between a successful write and
+    # the backlog bookkeeping update.
+    real_mark_consumed = sm.mark_renewal_consumed
+    def crashing_mark_consumed(*a, **k):
+        raise RuntimeError("simulated crash before backlog bookkeeping update")
+    monkeypatch.setattr(renewal_cli.sm, "mark_renewal_consumed", crashing_mark_consumed)
+
+    db_path = os.path.join(renewal_cli.STATE_DIR, "test-node.sqlite3")
+    try:
+        renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
+    except RuntimeError:
+        pass  # the simulated crash itself -- exactly what we're testing recovery from
+
+    conn = sqlite3.connect(db_path)
+    applied_count = conn.execute("SELECT COUNT(*) FROM operations WHERE vpsid=88 AND status='APPLIED'").fetchone()[0]
+    conn.close()
+    assert applied_count == 1, "the write itself must have durably committed before the crash"
+
+    # Restore the real function -- the "process restarts" and runs apply_due again.
+    monkeypatch.setattr(renewal_cli.sm, "mark_renewal_consumed", real_mark_consumed)
+    reads2 = iter([Decimal("100"), Decimal("100"), Decimal("100")])
+    monkeypatch.setattr(ls, "fetch_single_vps_quota", lambda vpsid: next(reads2))
+    renewal_cli.cmd_apply_due(argparse_namespace(node="test-node", non_interactive=True))
+
+    conn = sqlite3.connect(db_path)
+    total_ops = conn.execute("SELECT COUNT(*) FROM operations WHERE vpsid=88").fetchone()[0]
+    conn.close()
+    assert total_ops == 1, "the crash-recovery re-attempt must NEVER create a second write"

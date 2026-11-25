@@ -6,6 +6,7 @@ assembles data before any of it reaches a subprocess call or a template.
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
@@ -819,6 +820,62 @@ def test_render_vps_detail_shows_all_fields():
     assert "Runtime Status:" in out
     assert "running" in out
     assert "Billing Suspended: yes" in out
+
+
+def test_render_vps_detail_reports_unknown_renewal_info_honestly_when_never_polled(
+        monkeypatch, tmp_path):
+    """v1.10.13: a VPS that inventory has synced but the monitor has never polled (no
+    verified identity yet) must show 'unknown', never a fabricated creation date or
+    renewal date."""
+    menu.renewal_cli.CONFIG_DIR = str(tmp_path / "renewal-config")
+    menu.renewal_cli.STATE_DIR = str(tmp_path / "shadow-monitor-state")
+    os.makedirs(menu.renewal_cli.CONFIG_DIR)
+    os.makedirs(menu.renewal_cli.STATE_DIR)
+    record = {"vpsid": 42, "hostname": "web1", "status": "running", "runtime_status": "running",
+              "quota_gb": "100", "used_gb": "50", "ram_mb": "2048", "cores": "2", "disk_gb": "40",
+              "virtualization": "kvm", "locked": False, "node_serid": 1}
+    out = menu.render_vps_detail(record, menu.Style(enabled=False), node_id="self")
+    assert "Creation date (verified): " in out
+    assert "unknown" in out
+    assert "Next expected renewal:" in out
+    assert "Commercial service expiration date: not available" in out
+
+
+def test_render_vps_detail_shows_real_creation_date_and_renewal_state(monkeypatch, tmp_path):
+    """v1.10.13: when the monitor HAS verified this VPS's identity and a policy exists,
+    the detail view must show the real creation date, the resolved billing anchor, the
+    computed next-renewal date, and the SAME renewal-state classification `readiness`
+    already reports for this exact vpsid -- never a second, divergent computation."""
+    menu.renewal_cli.CONFIG_DIR = str(tmp_path / "renewal-config")
+    menu.renewal_cli.STATE_DIR = str(tmp_path / "shadow-monitor-state")
+    os.makedirs(menu.renewal_cli.CONFIG_DIR)
+    os.makedirs(menu.renewal_cli.STATE_DIR)
+    pol.write_default_policy_config(menu.renewal_cli._policy_config_path())
+
+    created_epoch = int(datetime(2026, 9, 15, 10, 0, tzinfo=timezone.utc).timestamp())
+    db_path = os.path.join(menu.renewal_cli.STATE_DIR, "self.sqlite3")
+    conn = menu.sm.open_db(db_path)
+    # Real ingestion path (ingest_poll), not a hand-crafted row -- this is what actually
+    # populates identities AND snapshots together in production, and _per_vps_readiness
+    # (reused by render_vps_detail) needs both.
+    menu.sm.ingest_poll(conn, [{"vpsid": 42, "created_epoch": created_epoch,
+                                 "quota_gb": Decimal("100"), "used_gb": Decimal("50")}],
+                        "2026-09-15T10:05:00+00:00")
+    conn.close()
+
+    record = {"vpsid": 42, "hostname": "web1", "status": "running", "runtime_status": "running",
+              "quota_gb": "100", "used_gb": "50", "ram_mb": "2048", "cores": "2", "disk_gb": "40",
+              "virtualization": "kvm", "locked": False, "node_serid": 1}
+    out = menu.render_vps_detail(record, menu.Style(enabled=False), node_id="self")
+    # Default display timezone is Asia/Tehran -- dates render Jalali by default, matching
+    # every other date display in this project; 2026-09-15 UTC is Jalali year 1405.
+    assert "1405" in out  # the real verified creation date, not fabricated
+    assert "Billing-cycle anchor:" in out
+    assert "Next expected renewal:" in out
+    assert "unknown" not in out.split("Bandwidth renewal")[1]  # fully resolved this time
+    # Only ONE observation exists -- this exact vpsid is correctly COLLECTING_BASELINE,
+    # the SAME bucket readiness would report for it (no second classification scheme).
+    assert "COLLECTING_BASELINE" in out
 
 
 def test_render_vps_table_marks_unlimited_quota():
